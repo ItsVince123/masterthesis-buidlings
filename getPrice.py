@@ -1,12 +1,19 @@
-"""
-Fetch next 24h day-ahead electricity prices from ENTSO-E and export to CSV.
-Usage: python fetch_prices.py --domain 10YBE----------2 --output prices.csv
+"""Fetch day-ahead electricity prices from ENTSO-E and export to CSV.
+
+Usage::
+
+    python getPrice.py --domain 10YBE----------2 --output prices.csv
+
+The API key is read from the ``ENTSOE_API_KEY`` environment variable (with a
+fallback in ``settings.py``).
 """
 
+from __future__ import annotations
+
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import csv
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -14,38 +21,47 @@ from zoneinfo import ZoneInfo
 import requests
 import xmltodict
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from settings import (
+    DASHBOARD_DIR, ENTSOE_API_KEY, ENTSOE_BASE_URL, ENTSOE_DOMAIN, LOCAL_TZ,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-API_KEY = "a13c900f-96f6-4fdf-ba15-4ce38bdd651b"
-BASE_URL = "https://web-api.tp.entsoe.eu/api"
+# ENTSO-E switched to 15-minute resolution on this date.
+_RESOLUTION_CHANGE = datetime(2025, 10, 1)
 
-# Resolution changed to 15-min intervals on 2025-10-01
-RESOLUTION_CHANGE_DATE = datetime(2025, 10, 1)
 
+# ---------------------------------------------------------------------------
+# API interaction
+# ---------------------------------------------------------------------------
 
 def fetch_prices(domain: str, period_start: str, period_end: str) -> str:
-    """Fetch day-ahead prices XML from ENTSO-E API."""
+    """Fetch day-ahead prices XML from the ENTSO-E Transparency Platform."""
     params = {
-        "securityToken": API_KEY,
+        "securityToken": ENTSOE_API_KEY,
         "documentType": "A44",
         "out_Domain": domain,
         "in_Domain": domain,
         "periodStart": period_start,
         "periodEnd": period_end,
-        "contract_MarketAgreement.type": "A01",  # Day-ahead
+        "contract_MarketAgreement.type": "A01",
     }
-    response = requests.get(BASE_URL, params=params, timeout=30)
-    response.raise_for_status()
-    return response.text
+    resp = requests.get(ENTSOE_BASE_URL, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.text
 
+
+# ---------------------------------------------------------------------------
+# XML parsing
+# ---------------------------------------------------------------------------
 
 def parse_prices(xml_text: str) -> list[tuple[datetime, float]]:
-    """Parse XML response into a list of (timestamp, price) tuples."""
+    """Parse the ENTSO-E XML response into ``(timestamp, price)`` tuples."""
     data = xmltodict.parse(xml_text)
-
-    # ENTSO-E can return different root tags depending on endpoint/version.
-    # Prefer known market document roots, then fall back to the first key.
     doc = (
         data.get("Publication_MarketDocument")
         or data.get("GL_MarketDocument")
@@ -53,158 +69,167 @@ def parse_prices(xml_text: str) -> list[tuple[datetime, float]]:
         or next(iter(data.values()), {})
     )
 
-    # Navigate to TimeSeries (handle both single and multiple)
     timeseries = doc.get("TimeSeries", [])
     if isinstance(timeseries, dict):
         timeseries = [timeseries]
 
-    results = []
-
+    results: list[tuple[datetime, float]] = []
     for ts in timeseries:
         period = ts.get("Period", {})
-        if isinstance(period, list):
-            periods = period
-        else:
-            periods = [period]
+        periods = period if isinstance(period, list) else [period]
 
         for p in periods:
-            # Parse start time
             start_str = p.get("timeInterval", {}).get("start", "")
             if start_str.endswith("Z"):
                 start_str = start_str[:-1] + "+00:00"
             start_dt = datetime.fromisoformat(start_str)
 
-            # Determine interval length based on date
-            naive_start = start_dt.replace(tzinfo=None)
-            minutes = 15 if naive_start >= RESOLUTION_CHANGE_DATE else 60
+            # Determine interval length based on the resolution-change date.
+            naive = start_dt.replace(tzinfo=None)
+            minutes = 15 if naive >= _RESOLUTION_CHANGE else 60
 
-            # Parse price points
             points = p.get("Point", [])
             if isinstance(points, dict):
                 points = [points]
 
             for point in points:
-                position = int(point.get("position", 1))
+                pos = int(point.get("position", 1))
                 price = float(point.get("price.amount", 0))
-                timestamp = start_dt + timedelta(minutes=minutes * (position - 1))
-                results.append((timestamp, price))
+                ts_out = start_dt + timedelta(minutes=minutes * (pos - 1))
+                results.append((ts_out, price))
 
     return sorted(results, key=lambda x: x[0])
 
 
-def export_csv_with_flag(data: list[tuple[datetime, float, bool]], output_path: Path) -> Path:
-    """Write price data to CSV, overwriting the target file if it exists."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+# ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
 
-    def _write_csv(target_path: Path) -> None:
-        with target_path.open("w", newline="", encoding="utf-8") as f:
+def export_csv_with_flag(
+    data: list[tuple[datetime, float, bool]],
+    output_path: Path,
+) -> Path:
+    """Write price data to a semicolon-delimited CSV."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with output_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f, delimiter=";")
-            writer.writerow(["Timestamp (Brussels)", "Price (EUR/MWh)", "Below 48h Avg"])
-            brussels = ZoneInfo("Europe/Brussels")
+            writer.writerow([
+                "Timestamp (Brussels)", "Price (EUR/MWh)", "Below 48h Avg",
+            ])
             for ts, price, is_below in data:
-                ts_local = ts.astimezone(brussels) if ts.tzinfo else ts.replace(tzinfo=ZoneInfo("UTC")).astimezone(brussels)
+                ts_local = (
+                    ts.astimezone(LOCAL_TZ) if ts.tzinfo
+                    else ts.replace(tzinfo=ZoneInfo("UTC")).astimezone(LOCAL_TZ)
+                )
                 writer.writerow([
                     ts_local.strftime("%Y-%m-%d %H:%M:%S"),
                     f"{price:.2f}".replace(".", ","),
-                    "true" if is_below else "false"
+                    "true" if is_below else "false",
                 ])
-
-    try:
-        _write_csv(output_path)
     except PermissionError as exc:
         raise PermissionError(
-            f"Cannot overwrite '{output_path}'. The file is likely open in another program (e.g. Excel). "
-            "Close it and run again."
+            f"Cannot overwrite '{output_path}'. Close the file in other "
+            "programs and try again."
         ) from exc
 
-    logger.info(f"Exported {len(data)} rows to {output_path}")
+    logger.info("Exported %d rows to %s", len(data), output_path)
     return output_path
 
 
+# ---------------------------------------------------------------------------
+# High-level helpers
+# ---------------------------------------------------------------------------
+
 def get_flagged_next_day_prices(
-    domain: str = "10YBE----------2",
+    domain: str = ENTSOE_DOMAIN,
     reference_time: datetime | None = None,
 ) -> tuple[list[tuple[datetime, float, bool]], float]:
-    """Return previous+next day 15min prices with a below-48h-average flag.
+    """Return 48 h prices with a *below-average* flag.
 
-    Uses Brussels local days:
-    - previous day (today local)
-    - next day (tomorrow local)
+    Fetches today + tomorrow (Brussels local) and flags entries whose price
+    falls below the combined 48 h average.
     """
-    brussels = ZoneInfo("Europe/Brussels")
-    now = reference_time.astimezone(brussels) if reference_time else datetime.now(brussels)
+    now = (
+        reference_time.astimezone(LOCAL_TZ) if reference_time
+        else datetime.now(LOCAL_TZ)
+    )
 
-    today_local = datetime(now.year, now.month, now.day, tzinfo=brussels)
-    next_start = today_local + timedelta(days=1)
-    next_end = next_start + timedelta(days=1)
-    prev_start = today_local
-    prev_end = next_start
+    today = datetime(now.year, now.month, now.day, tzinfo=LOCAL_TZ)
+    tomorrow = today + timedelta(days=1)
+    day_after = tomorrow + timedelta(days=1)
 
-    logger.info(f"Fetching prices for previous day: {prev_start.date()} | Domain: {domain}")
-    logger.info(f"Fetching prices for next day: {next_start.date()} | Domain: {domain}")
+    logger.info(
+        "Fetching prices: %s and %s | Domain: %s",
+        today.date(), tomorrow.date(), domain,
+    )
 
-    prev_start_utc = prev_start.astimezone(ZoneInfo("UTC")).strftime("%Y%m%d%H%M")
-    prev_end_utc = prev_end.astimezone(ZoneInfo("UTC")).strftime("%Y%m%d%H%M")
-    next_start_utc = next_start.astimezone(ZoneInfo("UTC")).strftime("%Y%m%d%H%M")
-    next_end_utc = next_end.astimezone(ZoneInfo("UTC")).strftime("%Y%m%d%H%M")
+    utc = ZoneInfo("UTC")
+    prev_s = today.astimezone(utc).strftime("%Y%m%d%H%M")
+    prev_e = tomorrow.astimezone(utc).strftime("%Y%m%d%H%M")
+    next_s = prev_e
+    next_e = day_after.astimezone(utc).strftime("%Y%m%d%H%M")
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        prev_future = executor.submit(fetch_prices, domain, prev_start_utc, prev_end_utc)
-        next_future = executor.submit(fetch_prices, domain, next_start_utc, next_end_utc)
-        prev_xml = prev_future.result()
-        next_xml = next_future.result()
-
-    prev_data = parse_prices(prev_xml)
-    next_data = parse_prices(next_xml)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(fetch_prices, domain, prev_s, prev_e)
+        f2 = pool.submit(fetch_prices, domain, next_s, next_e)
+        prev_data = parse_prices(f1.result())
+        next_data = parse_prices(f2.result())
 
     if not prev_data or not next_data:
-        raise ValueError("No complete 48h price data found in the response.")
+        raise ValueError("No complete 48 h price data found in the response.")
 
-    all_data = sorted(prev_data + next_data, key=lambda x: x[0])
-    all_prices = [price for _, price in all_data]
-    avg_48h = sum(all_prices) / len(all_prices)
+    combined = sorted(prev_data + next_data, key=lambda x: x[0])
+    avg = sum(p for _, p in combined) / len(combined)
+    flagged = [(ts, price, price < avg) for ts, price in combined]
 
-    flagged_48h = []
-    for ts, price in all_data:
-        flagged_48h.append((ts, price, price < avg_48h))
-
-    return flagged_48h, avg_48h
+    return flagged, avg
 
 
 def fetch_and_save_prices(
-    domain: str = "10YBE----------2",
+    domain: str = ENTSOE_DOMAIN,
     output_filename: str = "prices.csv",
     output_dir: Path | None = None,
     reference_time: datetime | None = None,
 ) -> tuple[Path, float]:
-    """Convenience function for other modules: fetch, flag, and save CSV."""
-    data, avg_48h = get_flagged_next_day_prices(domain=domain, reference_time=reference_time)
+    """Convenience wrapper: fetch, flag, and save day-ahead prices to CSV."""
+    data, avg = get_flagged_next_day_prices(
+        domain=domain, reference_time=reference_time,
+    )
+    out_dir = output_dir if output_dir is not None else DASHBOARD_DIR
+    path = out_dir / Path(output_filename).name
+    saved = export_csv_with_flag(data, path)
+    return saved, avg
 
-    if output_dir is None:
-        output_dir = Path(r"C:/Users/32488/Documents/4de jaar/Masterproef/Dashboard")
 
-    output_path = output_dir / Path(output_filename).name
-    saved_path = export_csv_with_flag(data, output_path)
-    return saved_path, avg_48h
-
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Fetch next 24h electricity prices from ENTSO-E.")
-    parser.add_argument("--domain", default="10YBE----------2", help="EIC bidding zone code (default: Belgium)")
-    parser.add_argument("--output", default="prices.csv", help="Output CSV file name (default: prices.csv)")
+    parser = argparse.ArgumentParser(
+        description="Fetch next-day electricity prices from ENTSO-E.",
+    )
+    parser.add_argument(
+        "--domain", default=ENTSOE_DOMAIN,
+        help="EIC bidding zone code (default: Belgium)",
+    )
+    parser.add_argument(
+        "--output", default="prices.csv",
+        help="Output CSV file name",
+    )
     args = parser.parse_args()
 
     try:
-        saved_path, avg_48h = fetch_and_save_prices(domain=args.domain, output_filename=args.output)
-    except ValueError as exc:
-        logger.error(str(exc))
-        return
-    except PermissionError as exc:
+        saved, avg = fetch_and_save_prices(
+            domain=args.domain, output_filename=args.output,
+        )
+    except (ValueError, PermissionError) as exc:
         logger.error(str(exc))
         return
 
-    logger.info(f"48h average price: {avg_48h:.2f} EUR/MWh")
-    print(f"\nDone! Saved to: {saved_path}")
+    logger.info("48 h average price: %.2f EUR/MWh", avg)
+    print(f"\nDone! Saved to: {saved}")
 
 
 if __name__ == "__main__":

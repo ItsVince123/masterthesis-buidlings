@@ -2,7 +2,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-DEFAULT_CONFIG_PATH = Path(__file__).with_name("dashboard_config.json")
+from settings import CONFIG_JSON
+
+DEFAULT_CONFIG_PATH = CONFIG_JSON
 
 
 def load_dashboard_config(config_path: str | Path | None = None) -> dict[str, Any]:

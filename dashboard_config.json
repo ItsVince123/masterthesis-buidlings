@@ -3,12 +3,12 @@
   "smpc": {
     "horizon": {"steps": 96},
     "ice_bank": {
-      "capacity_kwh": 500,
-      "min_kwh": 20,
-      "charge_max_kwh": 25,
-      "discharge_max_kwh": 25,
+      "capacity_kwh": 5000,
+      "min_kwh": 100,
+      "charge_max_kwh": 180,
+      "discharge_max_kwh": 180,
       "charge_efficiency": 0.85,
-      "initial_kwh": 200,
+      "initial_kwh": 1000,
       "target_soc_fraction": 0.30
     },
     "wkk": {
@@ -16,13 +16,14 @@
       "gas_energy_kwh_m3": 9.8,
       "elec_efficiency": 0.40,
       "heat_efficiency": 0.45,
-      "heat_buffer_capacity_kwh": 1000,
-      "heat_buffer_initial_kwh": 300,
+      "heat_buffer_capacity_kwh": 8000,
+      "heat_buffer_initial_kwh": 2000,
       "spark_spread_threshold": 0.01
     },
     "grid": {
-      "peak_limit_kwh": 50,
-      "peak_tariff_eur_kw_month": 8.0
+      "peak_limit_kwh": 750,
+      "peak_tariff_eur_kw_month": 8.0,
+      "fee_eur_kwh": 0.05
     },
     "objective_weights": {
       "energy": 1.0,
@@ -40,10 +41,10 @@
       "winter_months": [11, 12, 1, 2, 3]
     },
     "building": {
-      "base_load_kw": 80,
-      "peak_load_kw": 200,
-      "wkk_max_gas_m3": 9.0,
-      "heat_demand_base_kwh": 20
+      "base_load_kw": 1850,
+      "peak_load_kw": 2900,
+      "wkk_max_gas_m3": 89,
+      "heat_demand_base_kwh": 350
     }
   },
   "inputs": [
@@ -170,9 +171,9 @@
       "icon": "snowflake",
       "properties": {
         "energy_storage_kwh": {
-          "capacity": 500,
+          "capacity": 5000,
           "min": 0,
-          "max": 500
+          "max": 5000
         }
       },
       "simulation": {

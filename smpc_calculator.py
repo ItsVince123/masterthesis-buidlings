@@ -97,6 +97,7 @@ class SMPCConfig:
     # --- Grid connection ----------------------------------------------------
     peak_limit_kwh:             float = 3_250.0   # Per 15-min step = 13 MW peak
     peak_tariff_eur_kw_month:   float =     8.0   # Monthly capacity tariff
+    grid_fee_eur_kwh:           float =     0.05  # Grid/distribution charges [€/kWh] (50 €/MWh)
 
     # --- Objective weights --------------------------------------------------
     w_energy:       float = 1.0    # Weight on energy cost term
@@ -165,6 +166,7 @@ class SMPCConfig:
         # grid
         d.peak_limit_kwh            = float(_get("grid", "peak_limit_kwh",             d.peak_limit_kwh))
         d.peak_tariff_eur_kw_month  = float(_get("grid", "peak_tariff_eur_kw_month",   d.peak_tariff_eur_kw_month))
+        d.grid_fee_eur_kwh          = float(_get("grid", "fee_eur_kwh",               d.grid_fee_eur_kwh))
 
         # objective weights
         d.w_energy      = float(_get("objective_weights", "energy",       d.w_energy))
@@ -370,8 +372,11 @@ def _optimise_summer_cvxpy(
     p_net  = consumption + u_charge - u_discharge
     target = cfg.ice_bank_capacity_kwh * cfg.ice_bank_target_soc
 
+    # Total cost per kWh = spot price + grid/distribution fee
+    total_price = mean_price + cfg.grid_fee_eur_kwh
+
     objective = (
-        cfg.w_energy    * cp.sum(cp.multiply(mean_price, p_net))
+        cfg.w_energy    * cp.sum(cp.multiply(total_price, p_net))
         + cfg.w_peak    * cp.sum_squares(slack)
         + cfg.w_buffer_end * cp.square(buffer[-1] - target)
     )
@@ -502,7 +507,9 @@ def _optimise_winter_cvxpy(
         buffer.append(buffer[t] + heat_prod[t] - heat_demand[t] + heat_slack[t])
 
     gas_cost         = cp.sum(u_gas) * cfg.gas_price_eur_m3
-    electricity_rev  = cp.sum(cp.multiply(mean_price, elec_prod))
+    # WKK electricity avoids grid import → value includes avoided grid fee
+    avoided_price    = mean_price + cfg.grid_fee_eur_kwh
+    electricity_rev  = cp.sum(cp.multiply(avoided_price, elec_prod))
     comfort_penalty  = cfg.w_heat_comfort * cp.sum_squares(heat_slack)
 
     objective = gas_cost - electricity_rev + comfort_penalty
@@ -551,8 +558,11 @@ def _optimise_winter_heuristic(
         price          = mean_price[t]
         heat_needed    = heat_demand[t]
 
-        # Spark spread: revenue from 1 m³ gas minus the gas cost
-        electricity_rev_per_m3 = cfg.gas_energy_kwh_m3 * cfg.wkk_elec_efficiency * price
+        # Spark spread: revenue from 1 m³ gas minus the gas cost.
+        # WKK electricity avoids grid import, so its value includes the
+        # avoided grid fee (distribution/network charges), not just spot.
+        effective_price = price + cfg.grid_fee_eur_kwh
+        electricity_rev_per_m3 = cfg.gas_energy_kwh_m3 * cfg.wkk_elec_efficiency * effective_price
         spark_spread   = electricity_rev_per_m3 - cfg.gas_price_eur_m3
 
         if spark_spread > cfg.spark_spread_threshold and buf < cfg.heat_buffer_capacity_kwh:
@@ -683,12 +693,15 @@ class SMPCCalculator:
         season = _get_season(inputs.month, cfg)
 
         # 3. Price scenarios
+        # Seed varies by month and current price level so scenarios are not
+        # identical across every solve in the same month.
+        seed = abs(hash((inputs.month, int(price_fc[0] * 10_000)))) % (2**31)
         scenarios = _generate_price_scenarios(
             base_forecast  = price_fc,
             n_scenarios    = cfg.n_scenarios,
             volatility     = cfg.price_volatility,
             autocorrelation= cfg.autocorrelation,
-            seed           = inputs.month,   # Reproducible per month
+            seed           = seed,
         )
 
         # 4. Solve
@@ -741,7 +754,9 @@ class SMPCCalculator:
         wkk_heat = u_gas * cfg.gas_energy_kwh_m3 * cfg.wkk_heat_efficiency
         net_power = inputs.consumption_kwh + u_charge - u_discharge - wkk_elec
 
-        smpc_elec_cost = net_power * inputs.electricity_price_eur_kwh
+        # Total electricity cost includes spot price + grid/distribution fee
+        total_price = inputs.electricity_price_eur_kwh + cfg.grid_fee_eur_kwh
+        smpc_elec_cost = net_power * total_price
         smpc_gas_cost  = u_gas     * cfg.gas_price_eur_m3
         smpc_cost      = smpc_elec_cost + smpc_gas_cost
 
@@ -749,7 +764,7 @@ class SMPCCalculator:
             baseline_cost = inputs.baseline_cost_eur
         else:
             # Estimate: building draws full consumption from grid, no optimisation
-            baseline_cost = inputs.consumption_kwh * inputs.electricity_price_eur_kwh
+            baseline_cost = inputs.consumption_kwh * total_price
 
         saving = baseline_cost - smpc_cost
 

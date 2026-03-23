@@ -26,3 +26,9 @@ Desktop.ini
 
 # Test scripts
 _test_*.py
+
+# Environment / secrets
+.env
+
+# Backup files from refactoring
+*.bak
