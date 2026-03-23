@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Data files (regenerated at runtime)
+prices.csv
+predict.csv
+weather.csv
+
+# Open-Meteo cache
+.cache/
+
+# IDE / editor
+.vscode/
+*.code-workspace
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Test scripts
+_test_*.py

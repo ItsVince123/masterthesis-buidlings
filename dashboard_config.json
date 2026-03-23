@@ -1,0 +1,234 @@
+{
+  "version": 1,
+  "smpc": {
+    "horizon": {"steps": 96},
+    "ice_bank": {
+      "capacity_kwh": 500,
+      "min_kwh": 20,
+      "charge_max_kwh": 25,
+      "discharge_max_kwh": 25,
+      "charge_efficiency": 0.85,
+      "initial_kwh": 200,
+      "target_soc_fraction": 0.30
+    },
+    "wkk": {
+      "gas_price_eur_m3": 0.35,
+      "gas_energy_kwh_m3": 9.8,
+      "elec_efficiency": 0.40,
+      "heat_efficiency": 0.45,
+      "heat_buffer_capacity_kwh": 1000,
+      "heat_buffer_initial_kwh": 300,
+      "spark_spread_threshold": 0.01
+    },
+    "grid": {
+      "peak_limit_kwh": 50,
+      "peak_tariff_eur_kw_month": 8.0
+    },
+    "objective_weights": {
+      "energy": 1.0,
+      "peak": 50.0,
+      "heat_comfort": 5.0,
+      "buffer_end": 0.05
+    },
+    "scenarios": {
+      "count": 10,
+      "volatility": 0.15,
+      "autocorrelation": 0.70
+    },
+    "seasons": {
+      "summer_months": [5, 6, 7, 8, 9],
+      "winter_months": [11, 12, 1, 2, 3]
+    },
+    "building": {
+      "base_load_kw": 80,
+      "peak_load_kw": 200,
+      "wkk_max_gas_m3": 9.0,
+      "heat_demand_base_kwh": 20
+    }
+  },
+  "inputs": [
+    {
+      "id": "grid_input",
+      "name": "GRID",
+      "section": "ENERGY SOURCES",
+      "icon": "plug",
+      "properties": {
+        "power_kw": {
+          "min": 10,
+          "max": 180
+        }
+      },
+      "simulation": {
+        "mode": "smpc",
+        "field": "net_power_kwh",
+        "unit": "kW",
+        "decimals": 1,
+        "multiplier": 4,
+        "color": "#0e7490"
+      }
+    },
+    {
+      "id": "solar_input",
+      "name": "Solar Panels",
+      "section": "ENERGY SOURCES",
+      "icon": "sun",
+      "properties": {
+        "power_kw": {
+          "source": "predict.csv"
+        }
+      },
+      "simulation": {
+        "mode": "predicted_solar",
+        "unit": "kW",
+        "decimals": 1,
+        "color": "#0e7490"
+      }
+    },
+    {
+      "id": "chp_input",
+      "name": "CHP",
+      "section": "ENERGY SOURCES",
+      "icon": "fire",
+      "properties": {
+        "power_kw": {
+          "min": 20,
+          "max": 140
+        }
+      },
+      "simulation": {
+        "mode": "smpc",
+        "field": "wkk_elec_kwh",
+        "unit": "kW",
+        "decimals": 1,
+        "multiplier": 4,
+        "color": "#0e7490"
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "id": "chp_output",
+      "name": "CHP",
+      "section": "OPERATION",
+      "icon": "fire",
+      "properties": {
+        "status": ["RUN", "OFF"]
+      },
+      "simulation": {
+        "mode": "smpc_state",
+        "field": "wkk_gas_setpoint_m3",
+        "threshold": 0.01,
+        "above": "RUN",
+        "below": "OFF",
+        "colors": {
+          "RUN": "#16a34a",
+          "OFF": "#dc2626"
+        }
+      }
+    },
+    {
+      "id": "heat_pump_output",
+      "name": "Heat Pump",
+      "section": "OPERATION",
+      "icon": "heat",
+      "properties": {
+        "status": ["RUN", "OFF"]
+      },
+      "simulation": {
+        "mode": "smpc_state",
+        "field": "ice_bank_discharge_kwh",
+        "threshold": 0.1,
+        "above": "RUN",
+        "below": "OFF",
+        "colors": {
+          "RUN": "#16a34a",
+          "OFF": "#dc2626"
+        }
+      }
+    },
+    {
+      "id": "setpoint_output",
+      "name": "Setpoint",
+      "section": "OPERATION",
+      "icon": "target",
+      "properties": {
+        "control_levels": ["Lowered", "Normal", "Higher"]
+      },
+      "simulation": {
+        "mode": "smpc_setpoint",
+        "colors": {
+          "Lowered": "#16a34a",
+          "Normal": "#0e7490",
+          "Higher": "#dc2626"
+        }
+      }
+    },
+    {
+      "id": "ice_banks_output",
+      "name": "Ice Banks",
+      "section": "THERMAL STORAGE",
+      "icon": "snowflake",
+      "properties": {
+        "energy_storage_kwh": {
+          "capacity": 500,
+          "min": 0,
+          "max": 500
+        }
+      },
+      "simulation": {
+        "mode": "smpc_ice_status",
+        "colors": {
+          "CHARGE": "#0e7490",
+          "DISCHARGE": "#f59e0b",
+          "IDLE": "#16a34a"
+        }
+      }
+    },
+    {
+      "id": "evs_output",
+      "name": "EVs",
+      "section": "MOBILITY",
+      "icon": "car",
+      "properties": {
+        "energy_storage_kwh": {
+          "capacity": 300,
+          "min": 0,
+          "max": 300
+        }
+      },
+      "simulation": {
+        "mode": "state_options",
+        "options": [
+          "CHARGING",
+          "IDLE",
+          "OFF"
+        ],
+        "colors": {
+          "CHARGING": "#16a34a",
+          "IDLE": "#0e7490",
+          "OFF": "#dc2626"
+        }
+      }
+    },
+    {
+      "id": "beo_output",
+      "name": "BEO",
+      "section": "GEOTHERMAL",
+      "icon": "globe",
+      "properties": {
+        "power_kw": {
+          "min": 10,
+          "max": 120
+        }
+      },
+      "simulation": {
+        "mode": "random_range",
+        "min": 10,
+        "max": 120,
+        "unit": "kW",
+        "decimals": 1,
+        "color": "#0e7490"
+      }
+    }
+  ]
+}
