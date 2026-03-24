@@ -28,6 +28,8 @@ import getPrice
 import getWeather
 import predict
 from dashboard_config import load_dashboard_config
+from energy_assets import ensure_defaults
+from asset_dialogs import AssetManagerDialog
 from graph_renderer import draw_price_graph, draw_solar_graph
 from historical_dialog import HistoricalAnalysisDialog
 from settings import (
@@ -168,7 +170,20 @@ class ScadaWindow(QMainWindow):
         self.output_col.setMinimumWidth(SIDE_COL_MIN_W)
         cols.addWidget(self.output_col, stretch=1)
 
-        # Populate from config
+        # Populate from config — merge energy_assets into tag lists
+        from energy_assets import load_assets as _load_ea, SHIFTABLE_LOAD as _SL
+        for asset in _load_ea():
+            tag = {
+                "id": asset.uid,
+                "name": asset.name,
+                "icon": asset.icon,
+                "section": "CONTROLLABLE" if asset.asset_type == _SL else "GENERATION",
+            }
+            target = input_tags if asset.category == "input" else output_tags
+            existing_ids = {self._tag_id(t) for t in target}
+            if asset.uid not in existing_ids:
+                target.append(tag)
+
         norm_in = self._normalise_tags(input_tags)
         norm_out = self._normalise_tags(output_tags)
         self._register_definitions("input", norm_in)
@@ -917,22 +932,62 @@ class ScadaWindow(QMainWindow):
         HistoricalAnalysisDialog(self).exec()
 
     def _open_popup(self, key):
-        w = max(280, self.width() // 4)
-        h = max(180, self.height() // 2)
-        if key not in self.small_windows:
-            dlg = QDialog(self)
-            dlg.setWindowTitle(f"{key.capitalize()} Small Window")
-            lay = QVBoxLayout(dlg)
-            lay.addWidget(QLabel(
-                "Placeholder window. Add your custom UI here.",
-                alignment=Qt.AlignmentFlag.AlignCenter,
-            ))
-            self.small_windows[key] = dlg
-        win = self.small_windows[key]
-        win.resize(w, h)
-        win.show()
-        win.raise_()
-        win.activateWindow()
+        dlg = AssetManagerDialog(category=key, parent=self)
+        dlg.exec()
+        if dlg.changed:
+            self._rebuild_columns()
+
+    def _rebuild_columns(self):
+        """Clear and re-populate both side columns after asset changes."""
+        config = load_dashboard_config()
+        input_tags = config.get("inputs", [])
+        output_tags = config.get("outputs", [])
+
+        # Merge energy_assets into the tag lists so they appear in the columns
+        from energy_assets import load_assets, SHIFTABLE_LOAD, GENERATOR
+        assets = load_assets()
+        for asset in assets:
+            tag = {
+                "id": asset.uid,
+                "name": asset.name,
+                "icon": asset.icon,
+                "section": "CONTROLLABLE" if asset.asset_type == SHIFTABLE_LOAD else "GENERATION",
+            }
+            # Avoid duplicates: skip if an asset with same id already exists
+            target = input_tags if asset.category == "input" else output_tags
+            existing_ids = {self._tag_id(t) for t in target}
+            if asset.uid not in existing_ids:
+                target.append(tag)
+
+        # Clear content widgets (everything except the header and add-button)
+        for content in (self.input_content, self.output_content):
+            layout = content.layout()
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+
+        # Clear stale value-label references
+        self.value_labels.clear()
+        self.tag_definitions = {"input": {}, "output": {}}
+
+        norm_in = self._normalise_tags(input_tags)
+        norm_out = self._normalise_tags(output_tags)
+        self._register_definitions("input", norm_in)
+        self._register_definitions("output", norm_out)
+
+        self._add_price_widgets(self.input_content)
+        self._add_grouped_tags(
+            self.input_content,
+            self._group_by_section(norm_in, "INPUTS"),
+            "input",
+        )
+        self._add_grouped_tags(
+            self.output_content,
+            self._group_by_section(norm_out, "OUTPUTS"),
+            "output",
+        )
 
     # ------------------------------------------------------------------
     # Utility

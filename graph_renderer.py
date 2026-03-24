@@ -144,10 +144,7 @@ def draw_comparison_graph(
     width: int = 700,
     height: int = 260,
 ) -> QPixmap:
-    """Draw baseline (red) vs optimised (green) cost series.
-
-    The area where baseline > optimised is shaded green to visualise savings.
-    """
+    """Draw baseline (red) vs optimised (green) cost series as step blocks."""
     pixmap = QPixmap(width, height)
     pixmap.fill(QColor("#f8fbff"))
 
@@ -160,9 +157,10 @@ def draw_comparison_graph(
     max_val = float(np.max(all_vals))
     spread = max(max_val - min_val, 1e-6)
     n = len(baseline)
+    slot_w = draw_w / max(n, 1)
 
     def x_pos(i: int) -> float:
-        return pad_l + i * draw_w / max(n - 1, 1)
+        return pad_l + i * slot_w
 
     def y_pos(v: float) -> float:
         return height - pad_b - ((v - min_val) / spread) * draw_h
@@ -178,39 +176,45 @@ def draw_comparison_graph(
         y = pad_t + i * draw_h / 4
         painter.drawLine(pad_l, int(y), width - pad_r, int(y))
 
+    y_zero = int(y_pos(0)) if min_val < 0 else height - pad_b
+
     # Savings shading (where baseline > optimised)
-    for i in range(n - 1):
-        if baseline[i] > optimised[i] or baseline[i + 1] > optimised[i + 1]:
+    for i in range(n):
+        if baseline[i] > optimised[i]:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(QColor(22, 163, 74, 40)))
-            poly = QPolygon([
-                QPoint(int(x_pos(i)),     int(y_pos(baseline[i]))),
-                QPoint(int(x_pos(i + 1)), int(y_pos(baseline[i + 1]))),
-                QPoint(int(x_pos(i + 1)), int(y_pos(optimised[i + 1]))),
-                QPoint(int(x_pos(i)),     int(y_pos(optimised[i]))),
-            ])
-            painter.drawPolygon(poly)
+            x0 = int(x_pos(i))
+            x1 = int(x_pos(i + 1))
+            y_bl = int(y_pos(baseline[i]))
+            y_op = int(y_pos(optimised[i]))
+            painter.drawRect(x0, min(y_bl, y_op), x1 - x0, abs(y_bl - y_op))
             painter.setBrush(Qt.BrushStyle.NoBrush)
 
-    # Baseline line (red)
+    # Baseline step blocks (red)
     pen_base = QPen(QColor("#dc2626"))
     pen_base.setWidth(2)
     painter.setPen(pen_base)
-    for i in range(n - 1):
-        painter.drawLine(
-            int(x_pos(i)), int(y_pos(baseline[i])),
-            int(x_pos(i + 1)), int(y_pos(baseline[i + 1])),
-        )
+    for i in range(n):
+        x0 = int(x_pos(i))
+        x1 = int(x_pos(i + 1))
+        y = int(y_pos(baseline[i]))
+        painter.drawLine(x0, y, x1, y)
+        if i > 0:
+            y_prev = int(y_pos(baseline[i - 1]))
+            painter.drawLine(x0, y_prev, x0, y)
 
-    # Optimised line (green)
+    # Optimised step blocks (green)
     pen_opt = QPen(QColor("#16a34a"))
     pen_opt.setWidth(2)
     painter.setPen(pen_opt)
-    for i in range(n - 1):
-        painter.drawLine(
-            int(x_pos(i)), int(y_pos(optimised[i])),
-            int(x_pos(i + 1)), int(y_pos(optimised[i + 1])),
-        )
+    for i in range(n):
+        x0 = int(x_pos(i))
+        x1 = int(x_pos(i + 1))
+        y = int(y_pos(optimised[i]))
+        painter.drawLine(x0, y, x1, y)
+        if i > 0:
+            y_prev = int(y_pos(optimised[i - 1]))
+            painter.drawLine(x0, y_prev, x0, y)
 
     # Axis labels
     text_pen = QPen(QColor("#334155"))
@@ -218,7 +222,7 @@ def draw_comparison_graph(
     painter.drawText(4, pad_t + 4, f"{max_val:.4f} \u20ac")
     painter.drawText(4, height - pad_b + 4, f"{min_val:.4f} \u20ac")
 
-    # X-axis time labels (roughly every 4 hours for 96 slots)
+    # X-axis time labels
     step = max(1, n // 6)
     for i in range(0, n, step):
         painter.drawText(int(x_pos(i)) - 14, height - 8, x_labels[i])
@@ -232,7 +236,156 @@ def draw_comparison_graph(
     painter.setPen(pen_opt)
     painter.drawLine(pad_l + 120, legend_y, pad_l + 140, legend_y)
     painter.setPen(text_pen)
-    painter.drawText(pad_l + 144, legend_y + 4, "SMPC Optimised")
+    painter.drawText(pad_l + 144, legend_y + 4, "LP Optimised")
+
+    painter.end()
+    return pixmap
+
+
+# ---------------------------------------------------------------------------
+# Dual-series power/load comparison graph
+# ---------------------------------------------------------------------------
+
+def draw_power_comparison_graph(
+    baseline_kwh: np.ndarray,
+    smpc_kwh: np.ndarray,
+    x_labels: list[str],
+    prices_eur_mwh: np.ndarray | None = None,
+    width: int = 700,
+    height: int = 260,
+) -> QPixmap:
+    """Draw baseline load (red) vs SMPC load (green) as step blocks.
+
+    If *prices_eur_mwh* is provided, an orange price curve is overlaid
+    on a secondary Y axis (right side).
+    """
+    pixmap = QPixmap(width, height)
+    pixmap.fill(QColor("#f8fbff"))
+
+    pad_l = 60
+    pad_r = 60 if prices_eur_mwh is not None else 20
+    pad_t, pad_b = 24, 40
+    draw_w = width - pad_l - pad_r
+    draw_h = height - pad_t - pad_b
+
+    all_vals = np.concatenate([baseline_kwh, smpc_kwh])
+    min_val = float(np.min(all_vals))
+    max_val = float(np.max(all_vals))
+    spread = max(max_val - min_val, 1e-6)
+    n = len(baseline_kwh)
+    slot_w = draw_w / max(n, 1)
+
+    def x_pos(i: int) -> float:
+        return pad_l + i * slot_w
+
+    def y_pos(v: float) -> float:
+        return height - pad_b - ((v - min_val) / spread) * draw_h
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    # Grid lines
+    grid_pen = QPen(QColor("#dbe7f7"))
+    grid_pen.setWidth(1)
+    painter.setPen(grid_pen)
+    for i in range(5):
+        y = pad_t + i * draw_h / 4
+        painter.drawLine(pad_l, int(y), width - pad_r, int(y))
+
+    # Price overlay (orange step blocks, secondary Y axis)
+    if prices_eur_mwh is not None:
+        p_min = float(np.min(prices_eur_mwh))
+        p_max = float(np.max(prices_eur_mwh))
+        p_spread = max(p_max - p_min, 1e-6)
+
+        def y_price(v: float) -> float:
+            return height - pad_b - ((v - p_min) / p_spread) * draw_h
+
+        # Semi-transparent orange fill
+        for i in range(n):
+            x0 = int(x_pos(i))
+            x1 = int(x_pos(i + 1))
+            yp = int(y_price(prices_eur_mwh[i]))
+            y_bottom = height - pad_b
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(245, 158, 11, 35)))
+            painter.drawRect(x0, yp, x1 - x0, y_bottom - yp)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        # Orange step outline
+        pen_price = QPen(QColor("#f59e0b"))
+        pen_price.setWidth(1)
+        painter.setPen(pen_price)
+        for i in range(n):
+            x0 = int(x_pos(i))
+            x1 = int(x_pos(i + 1))
+            yp = int(y_price(prices_eur_mwh[i]))
+            painter.drawLine(x0, yp, x1, yp)
+            if i > 0:
+                yp_prev = int(y_price(prices_eur_mwh[i - 1]))
+                painter.drawLine(x0, yp_prev, x0, yp)
+
+        # Right-side price axis labels
+        text_pen_price = QPen(QColor("#b45309"))
+        painter.setPen(text_pen_price)
+        painter.drawText(width - pad_r + 4, pad_t + 4, f"{p_max:.0f}")
+        painter.drawText(width - pad_r + 4, height - pad_b + 4, f"{p_min:.0f}")
+        painter.drawText(width - pad_r + 4, pad_t + 16, "\u20ac/MWh")
+
+    # Baseline load step blocks (red)
+    pen_base = QPen(QColor("#dc2626"))
+    pen_base.setWidth(2)
+    painter.setPen(pen_base)
+    for i in range(n):
+        x0 = int(x_pos(i))
+        x1 = int(x_pos(i + 1))
+        y = int(y_pos(baseline_kwh[i]))
+        painter.drawLine(x0, y, x1, y)
+        if i > 0:
+            y_prev = int(y_pos(baseline_kwh[i - 1]))
+            painter.drawLine(x0, y_prev, x0, y)
+
+    # SMPC load step blocks (green)
+    pen_smpc = QPen(QColor("#16a34a"))
+    pen_smpc.setWidth(2)
+    painter.setPen(pen_smpc)
+    for i in range(n):
+        x0 = int(x_pos(i))
+        x1 = int(x_pos(i + 1))
+        y = int(y_pos(smpc_kwh[i]))
+        painter.drawLine(x0, y, x1, y)
+        if i > 0:
+            y_prev = int(y_pos(smpc_kwh[i - 1]))
+            painter.drawLine(x0, y_prev, x0, y)
+
+    # Left axis labels (kWh)
+    text_pen = QPen(QColor("#334155"))
+    painter.setPen(text_pen)
+    painter.drawText(4, pad_t + 4, f"{max_val:.0f} kWh")
+    painter.drawText(4, height - pad_b + 4, f"{min_val:.0f} kWh")
+
+    # X-axis time labels
+    step = max(1, n // 6)
+    for i in range(0, n, step):
+        painter.drawText(int(x_pos(i)) - 14, height - 8, x_labels[i])
+
+    # Legend
+    legend_y = pad_t - 6
+    painter.setPen(pen_base)
+    painter.drawLine(pad_l + 10, legend_y, pad_l + 30, legend_y)
+    painter.setPen(text_pen)
+    painter.drawText(pad_l + 34, legend_y + 4, "Baseline load")
+    painter.setPen(pen_smpc)
+    painter.drawLine(pad_l + 150, legend_y, pad_l + 170, legend_y)
+    painter.setPen(text_pen)
+    painter.drawText(pad_l + 174, legend_y + 4, "LP load")
+    if prices_eur_mwh is not None:
+        pen_price_leg = QPen(QColor("#f59e0b"))
+        pen_price_leg.setWidth(2)
+        painter.setPen(pen_price_leg)
+        painter.drawLine(pad_l + 270, legend_y, pad_l + 290, legend_y)
+        painter.setPen(text_pen)
+        painter.drawText(pad_l + 294, legend_y + 4, "Price")
 
     painter.end()
     return pixmap

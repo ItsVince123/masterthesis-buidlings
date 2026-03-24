@@ -19,13 +19,8 @@ PRICES_CSV = DASHBOARD_DIR / "prices.csv"
 CONFIG_JSON = DASHBOARD_DIR / "dashboard_config.json"
 
 # Historical building data CSV (hourly data with chiller, CHP, prices).
-# Used by HistoricalAnalysisDialog when "Historical CSV" mode is selected.
-HISTORICAL_CSV = Path(
-    os.environ.get(
-        "HISTORICAL_CSV",
-        str(DASHBOARD_DIR.parent / "Calculating digg" / "adjusted_DATA_edit.csv"),
-    )
-)
+# Used by HistoricalAnalysisDialog.
+HISTORICAL_CSV = DASHBOARD_DIR / "DATA.csv"
 
 # ---------------------------------------------------------------------------
 # Timezone & default location (Brussels)
@@ -57,5 +52,5 @@ GRID_FEE_EUR_MWH = 50.0
 # Data pipeline
 # ---------------------------------------------------------------------------
 DAILY_FETCH_HOUR = 14           # Local hour at which daily data refresh runs
-SOLAR_CAPACITY_KWP = 100.0     # Installed PV capacity
+SOLAR_CAPACITY_KWP = 1.525     # Installed PV capacity (kWp)
 INTERVAL_MINUTES = 15           # Time resolution used throughout the system

@@ -1,7 +1,9 @@
 {
   "version": 1,
   "smpc": {
-    "horizon": {"steps": 96},
+    "horizon": {
+      "steps": 96
+    },
     "ice_bank": {
       "capacity_kwh": 5000,
       "min_kwh": 100,
@@ -9,12 +11,12 @@
       "discharge_max_kwh": 180,
       "charge_efficiency": 0.85,
       "initial_kwh": 1000,
-      "target_soc_fraction": 0.30
+      "target_soc_fraction": 0.3
     },
     "wkk": {
       "gas_price_eur_m3": 0.35,
       "gas_energy_kwh_m3": 9.8,
-      "elec_efficiency": 0.40,
+      "elec_efficiency": 0.4,
       "heat_efficiency": 0.45,
       "heat_buffer_capacity_kwh": 8000,
       "heat_buffer_initial_kwh": 2000,
@@ -34,11 +36,23 @@
     "scenarios": {
       "count": 10,
       "volatility": 0.15,
-      "autocorrelation": 0.70
+      "autocorrelation": 0.7
     },
     "seasons": {
-      "summer_months": [5, 6, 7, 8, 9],
-      "winter_months": [11, 12, 1, 2, 3]
+      "summer_months": [
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "winter_months": [
+        11,
+        12,
+        1,
+        2,
+        3
+      ]
     },
     "building": {
       "base_load_kw": 1850,
@@ -113,7 +127,10 @@
       "section": "OPERATION",
       "icon": "fire",
       "properties": {
-        "status": ["RUN", "OFF"]
+        "status": [
+          "RUN",
+          "OFF"
+        ]
       },
       "simulation": {
         "mode": "smpc_state",
@@ -133,7 +150,10 @@
       "section": "OPERATION",
       "icon": "heat",
       "properties": {
-        "status": ["RUN", "OFF"]
+        "status": [
+          "RUN",
+          "OFF"
+        ]
       },
       "simulation": {
         "mode": "smpc_state",
@@ -153,7 +173,11 @@
       "section": "OPERATION",
       "icon": "target",
       "properties": {
-        "control_levels": ["Lowered", "Normal", "Higher"]
+        "control_levels": [
+          "Lowered",
+          "Normal",
+          "Higher"
+        ]
       },
       "simulation": {
         "mode": "smpc_setpoint",
@@ -230,6 +254,50 @@
         "decimals": 1,
         "color": "#0e7490"
       }
+    }
+  ],
+  "energy_assets": [
+    {
+      "uid": "ice_banks",
+      "name": "Ice Banks",
+      "asset_type": "shiftable_load",
+      "category": "output",
+      "icon": "snowflake",
+      "enabled": true,
+      "csv_column": "TotalChiller",
+      "hourly_max_kwh": 720.0,
+      "capacity_kwp": 0.0,
+      "solar_csv": "",
+      "csv_gen_column": "",
+      "decouple_below_eur_mwh": null
+    },
+    {
+      "uid": "solar",
+      "name": "Solar Panels",
+      "asset_type": "generator",
+      "category": "input",
+      "icon": "sun",
+      "enabled": true,
+      "csv_column": "",
+      "hourly_max_kwh": 720.0,
+      "capacity_kwp": 1.525,
+      "solar_csv": "solar_2022.csv",
+      "csv_gen_column": "",
+      "decouple_below_eur_mwh": 0.0
+    },
+    {
+      "uid": "wkk",
+      "name": "CHP / WKK",
+      "asset_type": "generator",
+      "category": "input",
+      "icon": "fire",
+      "enabled": true,
+      "csv_column": "",
+      "hourly_max_kwh": 720.0,
+      "capacity_kwp": 0.0,
+      "solar_csv": "",
+      "csv_gen_column": "ProductionWKK",
+      "decouple_below_eur_mwh": null
     }
   ]
 }
