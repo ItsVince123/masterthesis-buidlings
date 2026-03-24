@@ -362,12 +362,9 @@ def _optimise_summer_cvxpy(
     u_discharge = cp.Variable(H, nonneg=True)
     slack       = cp.Variable(H, nonneg=True)   # Peak limit softener
 
-    # State evolution (list of scalars / affine expressions)
-    buffer = [ice_bank_kwh]
-    for t in range(H):
-        buffer.append(
-            buffer[t] + u_charge[t] * cfg.ice_charge_efficiency - u_discharge[t]
-        )
+    # Vectorized state evolution via cumsum (avoids nested expression trees)
+    delta         = u_charge * cfg.ice_charge_efficiency - u_discharge
+    buffer_states = ice_bank_kwh + cp.cumsum(delta)   # shape (H,)
 
     p_net  = consumption + u_charge - u_discharge
     target = cfg.ice_bank_capacity_kwh * cfg.ice_bank_target_soc
@@ -378,15 +375,15 @@ def _optimise_summer_cvxpy(
     objective = (
         cfg.w_energy    * cp.sum(cp.multiply(total_price, p_net))
         + cfg.w_peak    * cp.sum_squares(slack)
-        + cfg.w_buffer_end * cp.square(buffer[-1] - target)
+        + cfg.w_buffer_end * cp.square(buffer_states[-1] - target)
     )
 
     constraints = [
-        u_charge    <= cfg.ice_charge_max_kwh,
-        u_discharge <= cfg.ice_discharge_max_kwh,
-        cp.vstack(buffer[1:]) >= cfg.ice_bank_min_kwh,
-        cp.vstack(buffer[1:]) <= cfg.ice_bank_capacity_kwh,
-        p_net <= cfg.peak_limit_kwh + slack,
+        u_charge      <= cfg.ice_charge_max_kwh,
+        u_discharge   <= cfg.ice_discharge_max_kwh,
+        buffer_states >= cfg.ice_bank_min_kwh,
+        buffer_states <= cfg.ice_bank_capacity_kwh,
+        p_net         <= cfg.peak_limit_kwh + slack,
     ]
 
     problem = cp.Problem(cp.Minimize(objective), constraints)
@@ -502,9 +499,9 @@ def _optimise_winter_cvxpy(
     heat_prod = u_gas * cfg.gas_energy_kwh_m3 * cfg.wkk_heat_efficiency
     elec_prod = u_gas * cfg.gas_energy_kwh_m3 * cfg.wkk_elec_efficiency
 
-    buffer = [heat_buffer_kwh]
-    for t in range(H):
-        buffer.append(buffer[t] + heat_prod[t] - heat_demand[t] + heat_slack[t])
+    # Vectorized state evolution via cumsum (avoids nested expression trees)
+    heat_net      = heat_prod - heat_demand + heat_slack
+    buffer_states = heat_buffer_kwh + cp.cumsum(heat_net)   # shape (H,)
 
     gas_cost         = cp.sum(u_gas) * cfg.gas_price_eur_m3
     # WKK electricity avoids grid import → value includes avoided grid fee
@@ -515,9 +512,9 @@ def _optimise_winter_cvxpy(
     objective = gas_cost - electricity_rev + comfort_penalty
 
     constraints = [
-        u_gas <= wkk_max_gas,
-        cp.vstack(buffer[1:]) >= 0,
-        cp.vstack(buffer[1:]) <= cfg.heat_buffer_capacity_kwh,
+        u_gas         <= wkk_max_gas,
+        buffer_states >= 0,
+        buffer_states <= cfg.heat_buffer_capacity_kwh,
     ]
 
     problem = cp.Problem(cp.Minimize(objective), constraints)
