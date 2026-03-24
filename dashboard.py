@@ -52,6 +52,9 @@ _ICON_KEY = {
     "plug": "\U0001f50c", "sun": "\u2600\ufe0f", "fire": "\U0001f525",
     "heat": "\u2668\ufe0f", "target": "\U0001f3af", "snowflake": "\U0001f9ca",
     "car": "\U0001f697", "globe": "\U0001f30d",
+    "battery": "\U0001f50b", "lightning": "\u26a1", "factory": "\U0001f3ed",
+    "house": "\U0001f3e0", "wind": "\U0001f32c\ufe0f", "leaf": "\U0001f33f",
+    "gear": "\u2699\ufe0f", "thermo": "\U0001f321\ufe0f",
 }
 _ICON_LEGACY = {
     "GRID": "\U0001f50c", "Solar Panels": "\u2600\ufe0f",
@@ -70,7 +73,7 @@ SIDE_COL_MIN_W = 340
 class ScadaWindow(QMainWindow):
     """Three-column SCADA-style dashboard."""
 
-    def __init__(self, input_tags: list, output_tags: list):
+    def __init__(self):
         super().__init__()
         self.setWindowTitle("Thesis \u2014 Building Management System")
         self.setMinimumSize(1000, 700)
@@ -78,7 +81,7 @@ class ScadaWindow(QMainWindow):
 
         self._init_state()
         self._init_smpc()
-        self._build_ui(input_tags, output_tags)
+        self._build_ui()
         self._start_timer()
         self._load_initial_data()
 
@@ -141,8 +144,8 @@ class ScadaWindow(QMainWindow):
     # UI construction
     # ------------------------------------------------------------------
 
-    def _build_ui(self, input_tags, output_tags):
-        """Build the three-column layout and populate from config tags."""
+    def _build_ui(self):
+        """Build the three-column layout and populate from energy assets."""
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
@@ -170,8 +173,25 @@ class ScadaWindow(QMainWindow):
         self.output_col.setMinimumWidth(SIDE_COL_MIN_W)
         cols.addWidget(self.output_col, stretch=1)
 
-        # Populate from config — merge energy_assets into tag lists
+        self._populate_columns()
+
+        # "Add" buttons
+        for container, label, key in [
+            (self.input_col, "+ Add input", "input"),
+            (self.output_col, "+ Add output", "output"),
+        ]:
+            btn = QPushButton(label)
+            btn.setMinimumHeight(52)
+            btn.setMinimumWidth(50)
+            btn.setStyleSheet(COLUMN_BUTTON_STYLE)
+            btn.clicked.connect(lambda _=False, k=key: self._open_popup(k))
+            container.layout().addWidget(btn)
+
+    def _populate_columns(self):
+        """Build input/output tag lists from energy assets and populate."""
         from energy_assets import load_assets as _load_ea, SHIFTABLE_LOAD as _SL
+        input_tags: list[dict] = []
+        output_tags: list[dict] = []
         for asset in _load_ea():
             tag = {
                 "id": asset.uid,
@@ -179,10 +199,10 @@ class ScadaWindow(QMainWindow):
                 "icon": asset.icon,
                 "section": "CONTROLLABLE" if asset.asset_type == _SL else "GENERATION",
             }
-            target = input_tags if asset.category == "input" else output_tags
-            existing_ids = {self._tag_id(t) for t in target}
-            if asset.uid not in existing_ids:
-                target.append(tag)
+            if asset.category == "input":
+                input_tags.append(tag)
+            else:
+                output_tags.append(tag)
 
         norm_in = self._normalise_tags(input_tags)
         norm_out = self._normalise_tags(output_tags)
@@ -200,18 +220,6 @@ class ScadaWindow(QMainWindow):
             self._group_by_section(norm_out, "OUTPUTS"),
             "output",
         )
-
-        # "Add" buttons
-        for container, label, key in [
-            (self.input_col, "+ Add input", "input"),
-            (self.output_col, "+ Add output", "output"),
-        ]:
-            btn = QPushButton(label)
-            btn.setMinimumHeight(52)
-            btn.setMinimumWidth(50)
-            btn.setStyleSheet(COLUMN_BUTTON_STYLE)
-            btn.clicked.connect(lambda _=False, k=key: self._open_popup(k))
-            container.layout().addWidget(btn)
 
     def _make_column(self, title: str, colour: str):
         """Create a scrollable side column with a coloured header."""
@@ -939,26 +947,6 @@ class ScadaWindow(QMainWindow):
 
     def _rebuild_columns(self):
         """Clear and re-populate both side columns after asset changes."""
-        config = load_dashboard_config()
-        input_tags = config.get("inputs", [])
-        output_tags = config.get("outputs", [])
-
-        # Merge energy_assets into the tag lists so they appear in the columns
-        from energy_assets import load_assets, SHIFTABLE_LOAD, GENERATOR
-        assets = load_assets()
-        for asset in assets:
-            tag = {
-                "id": asset.uid,
-                "name": asset.name,
-                "icon": asset.icon,
-                "section": "CONTROLLABLE" if asset.asset_type == SHIFTABLE_LOAD else "GENERATION",
-            }
-            # Avoid duplicates: skip if an asset with same id already exists
-            target = input_tags if asset.category == "input" else output_tags
-            existing_ids = {self._tag_id(t) for t in target}
-            if asset.uid not in existing_ids:
-                target.append(tag)
-
         # Clear content widgets (everything except the header and add-button)
         for content in (self.input_content, self.output_content):
             layout = content.layout()
@@ -972,22 +960,7 @@ class ScadaWindow(QMainWindow):
         self.value_labels.clear()
         self.tag_definitions = {"input": {}, "output": {}}
 
-        norm_in = self._normalise_tags(input_tags)
-        norm_out = self._normalise_tags(output_tags)
-        self._register_definitions("input", norm_in)
-        self._register_definitions("output", norm_out)
-
-        self._add_price_widgets(self.input_content)
-        self._add_grouped_tags(
-            self.input_content,
-            self._group_by_section(norm_in, "INPUTS"),
-            "input",
-        )
-        self._add_grouped_tags(
-            self.output_content,
-            self._group_by_section(norm_out, "OUTPUTS"),
-            "output",
-        )
+        self._populate_columns()
 
     # ------------------------------------------------------------------
     # Utility
@@ -1021,12 +994,8 @@ def main():
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
     )
-    config = load_dashboard_config()
     app = QApplication(sys.argv)
-    window = ScadaWindow(
-        config.get("inputs", []),
-        config.get("outputs", []),
-    )
+    window = ScadaWindow()
     window.show()
     sys.exit(app.exec())
 

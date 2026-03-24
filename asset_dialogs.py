@@ -186,6 +186,17 @@ class AssetEditorDialog(QDialog):
         self._hourly_max.setToolTip("Maximum energy this load can draw in one hour.")
         sf.addRow("Max per hour:", self._hourly_max)
 
+        self._shift_daily = QDoubleSpinBox()
+        self._shift_daily.setRange(0, 1_000_000)
+        self._shift_daily.setDecimals(1)
+        self._shift_daily.setSuffix(" kWh")
+        self._shift_daily.setValue(self._asset.daily_energy_kwh)
+        self._shift_daily.setToolTip(
+            "Fixed total daily energy demand in kWh.\n"
+            "Set to 0 to derive from CSV data."
+        )
+        sf.addRow("Daily total:", self._shift_daily)
+
         csv_hdr = QLabel("Historical CSV Linking (optional)")
         csv_hdr.setStyleSheet("font-weight: 600; color: #475569; font-size: 9pt;")
         sf.addRow(csv_hdr)
@@ -377,6 +388,7 @@ class AssetEditorDialog(QDialog):
         if atype == SHIFTABLE_LOAD:
             self._asset.csv_column = self._csv_col.text().strip()
             self._asset.hourly_max_kwh = self._hourly_max.value()
+            self._asset.daily_energy_kwh = self._shift_daily.value()
         elif atype == GENERATOR:
             self._asset.capacity_kwp = self._capacity.value()
             self._asset.solar_csv = self._solar_csv.text().strip()

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import logging
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,7 @@ from energy_assets import (
     EnergyAsset, ensure_defaults, load_assets,
     EXTRA_COST_EUR_MWH, GENERATOR, SHIFTABLE_LOAD,
 )
+from getCO2 import load_co2_csv, FALLBACK_CO2_GRAMS_PER_KWH
 from graph_renderer import draw_comparison_graph, draw_power_comparison_graph
 from settings import DASHBOARD_DIR, HISTORICAL_CSV
 from styles import HISTORICAL_DIALOG_STYLE, RUN_ANALYSIS_BUTTON_STYLE
@@ -62,6 +64,8 @@ _KPI_ROWS = [
     ("optimised",       "LP optimised cost"),
     ("saving",          "Savings"),
     ("saving_pct",      "Savings %"),
+    ("co2_saved",       "CO\u2082 saved"),
+    ("co2_saved_pct",   "CO\u2082 saved %"),
     ("slots",           "Time slots"),
     ("load_shifted",    "Total load shifted"),
     ("total_generation","Total on-site generation"),
@@ -154,6 +158,9 @@ class HistoricalAnalysisDialog(QDialog):
         # Per-hour solar data keyed by CSV path (loaded lazily)
         self._solar_cache: dict[str, dict[str, list[float]]] = {}
 
+        # CO2 intensity data (loaded lazily)
+        self._co2_data: dict[str, list[float]] | None = None
+
         # Energy asset config (loaded fresh each time dialog opens)
         self._assets: list[EnergyAsset] = load_assets()
         if not self._assets:
@@ -196,9 +203,17 @@ class HistoricalAnalysisDialog(QDialog):
         run_btn.setStyleSheet(RUN_ANALYSIS_BUTTON_STYLE)
         run_btn.clicked.connect(self._run_analysis)
         self._run_btn = run_btn
+
+        year_btn = QPushButton("Full Year")
+        year_btn.setMinimumHeight(36)
+        year_btn.setStyleSheet(RUN_ANALYSIS_BUTTON_STYLE)
+        year_btn.clicked.connect(self._run_year_analysis)
+        self._year_btn = year_btn
+
         sel.addWidget(lbl)
         sel.addWidget(self.date_edit, stretch=1)
         sel.addWidget(run_btn)
+        sel.addWidget(year_btn)
         top_lay.addLayout(sel)
 
         self.status_label = QLabel("Pick a date and click 'Run Analysis'")
@@ -289,6 +304,9 @@ class HistoricalAnalysisDialog(QDialog):
         self._run_btn.setEnabled(False)
         try:
             self._run_csv_analysis()
+        except Exception as exc:
+            logger.exception("Historical analysis failed")
+            self.status_label.setText(f"Analysis error: {exc}")
         finally:
             self._run_btn.setEnabled(True)
 
@@ -296,6 +314,14 @@ class HistoricalAnalysisDialog(QDialog):
         """Load CSV data for the selected date and run LP optimisation."""
         selected = self.date_edit.date().toPyDate()
         day_str = selected.strftime("%Y-%m-%d")
+
+        # Reset visual state so stale results never linger
+        self._clear_results()
+
+        # Reload assets fresh (may have changed since dialog opened)
+        self._assets = load_assets()
+        if not self._assets:
+            self._assets = ensure_defaults()
 
         # 1. Load CSV (once)
         self.status_label.setText("Loading historical data\u2026")
@@ -332,6 +358,18 @@ class HistoricalAnalysisDialog(QDialog):
             day_rows, day_key_candidates,
         )
 
+        # 3b. Compute CO2 impact
+        co2_hourly = self._get_co2_hours(day_key_candidates, len(day_rows))
+        baseline_grid = results["baseline_grid_kwh"]
+        optimised_grid = results["optimised_grid_kwh"]
+        co2_arr = np.array(co2_hourly[:len(day_rows)])
+        # CO2 in grams: grid_kwh * gCO2/kWh
+        baseline_co2_g = float(np.sum(baseline_grid * co2_arr))
+        optimised_co2_g = float(np.sum(optimised_grid * co2_arr))
+        results["co2_saved_kg"] = (baseline_co2_g - optimised_co2_g) / 1000.0
+        results["co2_baseline_g"] = baseline_co2_g
+        results["co2_optimised_g"] = optimised_co2_g
+
         # 4. Render graphs
         gw = max(780, self.width() - 60)  # scale to dialog width
         labels = [r["timestamp"].split(" ")[-1] for r in day_rows]
@@ -367,6 +405,18 @@ class HistoricalAnalysisDialog(QDialog):
                 return self._csv_data[key]
         return []
 
+    def _clear_results(self):
+        """Reset all result widgets to their initial empty state."""
+        self.graph_label.clear()
+        self.power_graph_label.clear()
+        self.kpi_title.setText("Results")
+        for lbl in self.kpi_labels.values():
+            lbl.setText("--")
+            lbl.setStyleSheet(
+                "font-family: 'Consolas'; font-weight: 700;"
+                " color: #0f766e; border: none;"
+            )
+
     # ------------------------------------------------------------------
     # Simulation — CSV hourly data
     # ------------------------------------------------------------------
@@ -389,6 +439,28 @@ class HistoricalAnalysisDialog(QDialog):
             if k in data:
                 return data[k]
         return []
+
+    # ------------------------------------------------------------------
+    # CO2 intensity cache helper
+    # ------------------------------------------------------------------
+
+    def _get_co2_hours(
+        self, day_key_candidates: list[str], n_hours: int,
+    ) -> list[float]:
+        """Return per-hour CO2 intensity (gCO2/kWh) for a day.
+
+        Loads ``co2_intensity.csv`` lazily.  If the file doesn't exist or
+        the day is missing, returns the Belgian grid fallback value.
+        """
+        if self._co2_data is None:
+            self._co2_data = load_co2_csv()
+        for k in day_key_candidates:
+            if k in self._co2_data:
+                hours = self._co2_data[k]
+                if len(hours) >= n_hours:
+                    return hours[:n_hours]
+                return hours + [FALLBACK_CO2_GRAMS_PER_KWH] * (n_hours - len(hours))
+        return [FALLBACK_CO2_GRAMS_PER_KWH] * n_hours
 
     # ------------------------------------------------------------------
     # Simulation — CSV hourly data (asset-driven)
@@ -511,6 +583,8 @@ class HistoricalAnalysisDialog(QDialog):
             "optimised": lp_cost,
             "baseline_load_kwh": baseline_load,
             "optimised_load_kwh": lp_load,
+            "baseline_grid_kwh": baseline_grid,
+            "optimised_grid_kwh": lp_grid,
             "prices_elec": prices_elec,
             "load_shifted": total_daily_charged,
             "total_generation": float(np.sum(total_gen_lp_effective)),
@@ -543,10 +617,179 @@ class HistoricalAnalysisDialog(QDialog):
         self.kpi_labels["saving"].setStyleSheet(coloured)
         self.kpi_labels["saving_pct"].setText(f"{pct:.2f}%")
         self.kpi_labels["saving_pct"].setStyleSheet(coloured)
+
+        co2_kg = results.get("co2_saved_kg", 0.0)
+        co2_baseline_g = results.get("co2_baseline_g", 0.0)
+        co2_pct = (
+            (co2_kg * 1000 / co2_baseline_g * 100) if co2_baseline_g > 0 else 0.0
+        )
+        co2_colour = "#16a34a" if co2_kg >= 0 else "#dc2626"
+        co2_styled = (
+            f"font-family: 'Consolas'; font-weight: 700;"
+            f" color: {co2_colour}; border: none;"
+        )
+        self.kpi_labels["co2_saved"].setText(f"{co2_kg:.2f} kg CO\u2082")
+        self.kpi_labels["co2_saved"].setStyleSheet(co2_styled)
+        self.kpi_labels["co2_saved_pct"].setText(f"{co2_pct:.2f}%")
+        self.kpi_labels["co2_saved_pct"].setStyleSheet(co2_styled)
+
         self.kpi_labels["slots"].setText(f"{results['n_slots']} hourly")
         self.kpi_labels["load_shifted"].setText(
             f"{results['load_shifted']:.1f} kWh"
         )
         self.kpi_labels["total_generation"].setText(
             f"{results['total_generation']:.1f} kWh"
+        )
+
+    # ------------------------------------------------------------------
+    # Full-year analysis
+    # ------------------------------------------------------------------
+
+    def _run_year_analysis(self):
+        """Run LP simulation for every day in the selected year."""
+        if not self._csv_available:
+            self.status_label.setText("Historical CSV file not found.")
+            return
+
+        self._run_btn.setEnabled(False)
+        self._year_btn.setEnabled(False)
+        try:
+            self._do_year_analysis()
+        except Exception as exc:
+            logger.exception("Year analysis failed")
+            self.status_label.setText(f"Year analysis error: {exc}")
+        finally:
+            self._run_btn.setEnabled(True)
+            self._year_btn.setEnabled(True)
+
+    def _do_year_analysis(self):
+        """Aggregate daily LP results across all available days in the year."""
+        year = self.date_edit.date().year()
+        self._clear_results()
+
+        # Reload assets
+        self._assets = load_assets()
+        if not self._assets:
+            self._assets = ensure_defaults()
+
+        # Load CSV data
+        self.status_label.setText("Loading historical data\u2026")
+        QApplication.processEvents()
+        if self._csv_data is None:
+            try:
+                self._csv_data = load_historical_csv(HISTORICAL_CSV)
+            except Exception as exc:
+                self.status_label.setText(f"CSV load failed: {exc}")
+                return
+
+        # Accumulators
+        total_baseline_cost = 0.0
+        total_optimised_cost = 0.0
+        total_co2_baseline_g = 0.0
+        total_co2_optimised_g = 0.0
+        total_load_shifted = 0.0
+        total_generation = 0.0
+        total_slots = 0
+        days_processed = 0
+
+        # Iterate every day in the year
+        day = date(year, 1, 1)
+        end = date(year + 1, 1, 1)
+        while day < end:
+            if days_processed % 30 == 0:
+                self.status_label.setText(
+                    f"Processing {year}\u2026 {day.strftime('%b %d')} "
+                    f"({days_processed} days done)"
+                )
+                QApplication.processEvents()
+
+            day_rows = self._find_day_rows(day)
+            if not day_rows:
+                day += timedelta(days=1)
+                continue
+
+            day_key_candidates = [
+                f"{day.day}/{day.month:02d}/{day.year}",
+                f"{day.day:02d}/{day.month:02d}/{day.year}",
+                f"{day.day}/{day.month}/{day.year}",
+            ]
+
+            results = self._simulate_day_csv(day_rows, day_key_candidates)
+
+            # Cost accumulators
+            total_baseline_cost += float(results["baseline"].sum())
+            total_optimised_cost += float(results["optimised"].sum())
+            total_load_shifted += results["load_shifted"]
+            total_generation += results["total_generation"]
+            total_slots += results["n_slots"]
+
+            # CO2 accumulators
+            n = len(day_rows)
+            co2_hourly = self._get_co2_hours(day_key_candidates, n)
+            co2_arr = np.array(co2_hourly[:n])
+            total_co2_baseline_g += float(
+                np.sum(results["baseline_grid_kwh"] * co2_arr)
+            )
+            total_co2_optimised_g += float(
+                np.sum(results["optimised_grid_kwh"] * co2_arr)
+            )
+
+            days_processed += 1
+            day += timedelta(days=1)
+
+        if days_processed == 0:
+            self.status_label.setText(f"No data found for {year}.")
+            return
+
+        # Build aggregated results dict
+        saving = total_baseline_cost - total_optimised_cost
+        saving_pct = (
+            (saving / total_baseline_cost * 100)
+            if total_baseline_cost != 0 else 0.0
+        )
+        co2_saved_kg = (total_co2_baseline_g - total_co2_optimised_g) / 1000.0
+        co2_pct = (
+            ((total_co2_baseline_g - total_co2_optimised_g)
+             / total_co2_baseline_g * 100)
+            if total_co2_baseline_g > 0 else 0.0
+        )
+
+        colour = "#16a34a" if saving >= 0 else "#dc2626"
+        coloured = (
+            f"font-family: 'Consolas'; font-weight: 700;"
+            f" color: {colour}; border: none;"
+        )
+        co2_colour = "#16a34a" if co2_saved_kg >= 0 else "#dc2626"
+        co2_styled = (
+            f"font-family: 'Consolas'; font-weight: 700;"
+            f" color: {co2_colour}; border: none;"
+        )
+
+        self.kpi_title.setText(f"Full Year Results for {year} ({days_processed} days)")
+        self.kpi_labels["baseline"].setText(f"\u20ac{total_baseline_cost:.2f}")
+        self.kpi_labels["optimised"].setText(f"\u20ac{total_optimised_cost:.2f}")
+        self.kpi_labels["saving"].setText(f"\u20ac{saving:.2f}")
+        self.kpi_labels["saving"].setStyleSheet(coloured)
+        self.kpi_labels["saving_pct"].setText(f"{saving_pct:.2f}%")
+        self.kpi_labels["saving_pct"].setStyleSheet(coloured)
+        self.kpi_labels["co2_saved"].setText(f"{co2_saved_kg:.2f} kg CO\u2082")
+        self.kpi_labels["co2_saved"].setStyleSheet(co2_styled)
+        self.kpi_labels["co2_saved_pct"].setText(f"{co2_pct:.2f}%")
+        self.kpi_labels["co2_saved_pct"].setStyleSheet(co2_styled)
+        self.kpi_labels["slots"].setText(f"{total_slots} hourly")
+        self.kpi_labels["load_shifted"].setText(
+            f"{total_load_shifted:.1f} kWh"
+        )
+        self.kpi_labels["total_generation"].setText(
+            f"{total_generation:.1f} kWh"
+        )
+
+        self.graph_label.setText(
+            "Full-year mode — per-day graphs not shown"
+        )
+        self.power_graph_label.setText(
+            "Full-year mode — per-day graphs not shown"
+        )
+        self.status_label.setText(
+            f"Year analysis complete — {days_processed} days processed."
         )
