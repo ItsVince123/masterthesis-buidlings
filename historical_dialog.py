@@ -5,14 +5,17 @@ for ice bank charge scheduling, comparing baseline vs LP-optimised cost.
 
 Asset configuration (shiftable loads, generators) is read from
 :mod:`energy_assets`, which persists to ``dashboard_config.json``.
+
+Architecture
+------------
+* **UI only** — layout, KPI display, graph rendering.
+* **Simulation** — delegated to :mod:`lp_solver` (shared with the live LP).
 """
 
 from __future__ import annotations
 
-import csv
 import logging
 from datetime import date, timedelta
-from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import Qt, QDate
@@ -21,42 +24,17 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
-from energy_assets import (
-    EnergyAsset, ensure_defaults, load_assets,
-    EXTRA_COST_EUR_MWH, GENERATOR, SHIFTABLE_LOAD,
-)
+from energy_assets import EnergyAsset, ensure_defaults, load_assets
 from getCO2 import load_co2_csv, FALLBACK_CO2_GRAMS_PER_KWH
 from graph_renderer import draw_comparison_graph, draw_power_comparison_graph
+from lp_solver import (
+    day_key_candidates, find_day_rows, load_historical_csv,
+    load_solar_csv, simulate_day,
+)
 from settings import DASHBOARD_DIR, HISTORICAL_CSV
 from styles import HISTORICAL_DIALOG_STYLE, RUN_ANALYSIS_BUTTON_STYLE
 
 logger = logging.getLogger(__name__)
-# ===================================================================
-# LP solver (greedy — provably optimal for this formulation)
-# ===================================================================
-
-def _solve_ice_bank_lp(
-    n_hours: int,
-    total_price_eur_mwh: np.ndarray,
-    daily_charge_kwh: float,
-    hourly_max_kwh: float,
-) -> np.ndarray:
-    """Schedule ice bank charging to minimise electricity cost.
-
-    Assigns charging to the cheapest hours first (greedy).
-    This is provably optimal for a linear objective with box + sum
-    constraints (no inter-temporal coupling beyond the total).
-    """
-    charge = np.zeros(n_hours)
-    remaining = daily_charge_kwh
-    for t in np.argsort(total_price_eur_mwh):
-        if remaining <= 0:
-            break
-        amount = min(hourly_max_kwh, remaining)
-        charge[t] = amount
-        remaining -= amount
-    return charge
-
 
 # KPI rows displayed in the results panel
 _KPI_ROWS = [
@@ -70,74 +48,6 @@ _KPI_ROWS = [
     ("load_shifted",    "Total load shifted"),
     ("total_generation","Total on-site generation"),
 ]
-
-
-# ===================================================================
-# CSV data loader
-# ===================================================================
-
-def _parse_eu_float(text: str) -> float:
-    """Parse a European-format number (comma = decimal separator).
-    Returns 0.0 for empty strings."""
-    text = text.strip()
-    if not text:
-        return 0.0
-    return float(text.replace(",", "."))
-
-
-def load_historical_csv(path: Path) -> dict[str, list[dict]]:
-    """Load the historical building CSV, grouped by day string.
-
-    Returns ``{day_str: [row_dict, …]}`` where *day_str* is ``"D/MM/YYYY"``
-    (matching the Timestamp column format) and each row dict contains floats.
-
-    Expected CSV columns (semicolon-separated, European decimals):
-    From Timestamp;TotalUsage;NetUsage;ProductionWKK;TotalChiller;
-    RemainingUsage;PricesElec;ExtraCost;TotalPrices
-    """
-    days: dict[str, list[dict]] = {}
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f, delimiter=";")
-        for raw in reader:
-            row = {
-                "timestamp": raw["From Timestamp"].strip(),
-                "total_usage": _parse_eu_float(raw["TotalUsage"]),
-                "net_usage": _parse_eu_float(raw["NetUsage"]),
-                "production_wkk": _parse_eu_float(raw["ProductionWKK"]),
-                "total_chiller": _parse_eu_float(raw["TotalChiller"]),
-                "remaining_usage": _parse_eu_float(raw["RemainingUsage"]),
-                "prices_elec": _parse_eu_float(raw["PricesElec"]),
-                "extra_cost": _parse_eu_float(raw["ExtraCost"]),
-            }
-            # Day key from the date part of Timestamp (e.g. "1/01/2022")
-            day_key = row["timestamp"].split(" ")[0]
-            days.setdefault(day_key, []).append(row)
-    return days
-
-
-def _load_solar_csv(path: Path) -> dict[str, list[float]]:
-    """Load solar_2022.csv into ``{day_key: [kwh_h0, kwh_h1, …]}``.
-
-    Day key format matches DATA.csv: ``D/MM/YYYY``.
-    """
-    days: dict[str, list[tuple[int, float]]] = {}
-    if not path.exists():
-        logger.warning("Solar CSV not found: %s — solar will be 0", path)
-        return {}
-    with path.open("r", encoding="utf-8", newline="") as f:
-        for raw in csv.DictReader(f, delimiter=";"):
-            ts = raw["Timestamp"].strip()
-            day_key = ts.split(" ")[0]
-            time_part = ts.split(" ")[1] if " " in ts else "0:00"
-            hour = int(time_part.split(":")[0])
-            val = float(raw["Solar_kWh"].strip().replace(",", "."))
-            days.setdefault(day_key, []).append((hour, val))
-    # Sort by hour and extract values
-    result: dict[str, list[float]] = {}
-    for k, pairs in days.items():
-        pairs.sort(key=lambda x: x[0])
-        result[k] = [v for _, v in pairs]
-    return result
 
 
 class HistoricalAnalysisDialog(QDialog):
@@ -334,7 +244,8 @@ class HistoricalAnalysisDialog(QDialog):
                 return
 
         # 2. Find the day's data.
-        day_rows = self._find_day_rows(selected)
+        day_keys = day_key_candidates(selected)
+        day_rows = find_day_rows(self._csv_data, selected)
         if not day_rows:
             self.status_label.setText(
                 f"No data for {day_str} in the historical CSV."
@@ -347,31 +258,23 @@ class HistoricalAnalysisDialog(QDialog):
         )
         QApplication.processEvents()
 
-        # Build day-key candidates for solar lookups
-        day_key_candidates = [
-            f"{selected.day}/{selected.month:02d}/{selected.year}",
-            f"{selected.day:02d}/{selected.month:02d}/{selected.year}",
-            f"{selected.day}/{selected.month}/{selected.year}",
-        ]
-
-        results = self._simulate_day_csv(
-            day_rows, day_key_candidates,
+        solar_hours = self._get_solar_hours_all(day_keys)
+        results = simulate_day(
+            day_rows, [a for a in self._assets if a.enabled],
+            solar_hours, day_keys,
         )
 
         # 3b. Compute CO2 impact
-        co2_hourly = self._get_co2_hours(day_key_candidates, len(day_rows))
-        baseline_grid = results["baseline_grid_kwh"]
-        optimised_grid = results["optimised_grid_kwh"]
+        co2_hourly = self._get_co2_hours(day_keys, len(day_rows))
         co2_arr = np.array(co2_hourly[:len(day_rows)])
-        # CO2 in grams: grid_kwh * gCO2/kWh
-        baseline_co2_g = float(np.sum(baseline_grid * co2_arr))
-        optimised_co2_g = float(np.sum(optimised_grid * co2_arr))
+        baseline_co2_g = float(np.sum(results["baseline_grid_kwh"] * co2_arr))
+        optimised_co2_g = float(np.sum(results["optimised_grid_kwh"] * co2_arr))
         results["co2_saved_kg"] = (baseline_co2_g - optimised_co2_g) / 1000.0
         results["co2_baseline_g"] = baseline_co2_g
         results["co2_optimised_g"] = optimised_co2_g
 
         # 4. Render graphs
-        gw = max(780, self.width() - 60)  # scale to dialog width
+        gw = max(780, self.width() - 60)
         labels = [r["timestamp"].split(" ")[-1] for r in day_rows]
         self.graph_label.setPixmap(
             draw_comparison_graph(
@@ -389,22 +292,6 @@ class HistoricalAnalysisDialog(QDialog):
         self._display_kpis_csv(day_str, results)
         self.status_label.setText(f"Analysis complete for {day_str}.")
 
-    def _find_day_rows(self, selected) -> list[dict]:
-        """Look up CSV rows for the given date, trying multiple key formats."""
-        if self._csv_data is None:
-            return []
-        # The CSV "Day" column may use D/MM/YYYY or DD/MM/YYYY format.
-        # Try several variants to be robust.
-        candidates = [
-            f"{selected.day}/{selected.month:02d}/{selected.year}",      # 1/01/2022
-            f"{selected.day:02d}/{selected.month:02d}/{selected.year}",  # 01/01/2022
-            f"{selected.day}/{selected.month}/{selected.year}",          # 1/1/2022
-        ]
-        for key in candidates:
-            if key in self._csv_data:
-                return self._csv_data[key]
-        return []
-
     def _clear_results(self):
         """Reset all result widgets to their initial empty state."""
         self.graph_label.clear()
@@ -418,27 +305,23 @@ class HistoricalAnalysisDialog(QDialog):
             )
 
     # ------------------------------------------------------------------
-    # Simulation — CSV hourly data
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
     # Solar CSV cache helper
     # ------------------------------------------------------------------
 
-    def _get_solar_hours(
-        self, solar_csv: str, day_key_candidates: list[str],
-    ) -> list[float]:
-        """Return per-hour solar kWh for a day, loading the CSV lazily."""
-        if not solar_csv:
-            return []
-        if solar_csv not in self._solar_cache:
-            path = DASHBOARD_DIR / solar_csv
-            self._solar_cache[solar_csv] = _load_solar_csv(path)
-        data = self._solar_cache[solar_csv]
-        for k in day_key_candidates:
-            if k in data:
-                return data[k]
-        return []
+    def _get_solar_hours_all(
+        self, keys: list[str],
+    ) -> dict[str, list[float]]:
+        """Return the full solar dict, loading each CSV lazily."""
+        result: dict[str, list[float]] = {}
+        for asset in self._assets:
+            if not asset.solar_csv:
+                continue
+            csv_path = str(asset.solar_csv)
+            if csv_path not in self._solar_cache:
+                path = DASHBOARD_DIR / csv_path
+                self._solar_cache[csv_path] = load_solar_csv(path)
+            result.update(self._solar_cache[csv_path])
+        return result
 
     # ------------------------------------------------------------------
     # CO2 intensity cache helper
@@ -461,135 +344,6 @@ class HistoricalAnalysisDialog(QDialog):
                     return hours[:n_hours]
                 return hours + [FALLBACK_CO2_GRAMS_PER_KWH] * (n_hours - len(hours))
         return [FALLBACK_CO2_GRAMS_PER_KWH] * n_hours
-
-    # ------------------------------------------------------------------
-    # Simulation — CSV hourly data (asset-driven)
-    # ------------------------------------------------------------------
-
-    def _simulate_day_csv(
-        self, day_rows: list[dict],
-        day_key_candidates: list[str],
-    ) -> dict:
-        """Solve a deterministic LP for shiftable-load scheduling.
-
-        Data model (from CSV):
-            TotalUsage     = NetUsage + ProductionWKK
-            RemainingUsage = TotalUsage − TotalChiller
-
-        RemainingUsage is the fixed (non-shiftable) base load.
-        Each shiftable-load asset (e.g. Ice Banks) reads its CSV column,
-        sums the daily total, and schedules via LP.
-        Each generator asset (solar, CHP) reduces grid draw; generators
-        with a ``decouple_below_eur_mwh`` threshold are disconnected
-        when the price drops below that value.
-
-        Baseline = actual historical data (no optimisation, no solar).
-        LP       = same daily energy per shiftable load, redistributed
-                   optimally + generators applied.
-        """
-        n = len(day_rows)
-        remaining   = np.array([r["remaining_usage"] for r in day_rows])
-        net_usage   = np.array([r["net_usage"]       for r in day_rows])
-        prices_elec = np.array([r["prices_elec"]     for r in day_rows])
-
-        # Extra cost is a fixed 50 €/MWh (distribution fees, taxes, etc.)
-        total_price = prices_elec + EXTRA_COST_EUR_MWH
-
-        # Only consider enabled assets
-        assets = [a for a in self._assets if a.enabled]
-
-        # ── Baseline ────────────────────────────────────────────────
-        # Actual historical load (all shiftable loads at their original
-        # schedule) and actual grid draw.
-        baseline_shiftable = np.zeros(n)  # sum of all shiftable actuals
-        total_daily_charged = 0.0
-
-        # ── LP shiftable loads ──────────────────────────────────────
-        lp_shiftable = np.zeros(n)
-
-        # Column name → numpy key mapping for the parsed day_rows
-        _col_map = {
-            "TotalChiller": "total_chiller",
-            "ProductionWKK": "production_wkk",
-        }
-
-        for asset in assets:
-            if asset.asset_type != SHIFTABLE_LOAD:
-                continue
-            if not asset.csv_column:
-                continue  # no CSV linkage — skip in historical sim
-            col = _col_map.get(asset.csv_column, asset.csv_column)
-            actual = np.array([r.get(col, 0.0) for r in day_rows])
-            daily_sum = float(np.sum(actual))
-            total_daily_charged += daily_sum
-            hourly_max = max(asset.hourly_max_kwh, float(np.max(actual)))
-
-            baseline_shiftable += actual
-            lp_shiftable += _solve_ice_bank_lp(
-                n, total_price, daily_sum, hourly_max,
-            )
-
-        baseline_load = remaining + baseline_shiftable
-        baseline_grid = net_usage
-        baseline_cost = baseline_grid * total_price / 1000.0
-
-        # ── Generators ──────────────────────────────────────────────
-        total_gen = np.zeros(n)           # used in both baseline and LP
-        total_gen_lp_effective = np.zeros(n)
-
-        for asset in assets:
-            if asset.asset_type != GENERATOR:
-                continue
-
-            gen_kwh = np.zeros(n)
-
-            # Solar CSV-based generation
-            if asset.solar_csv:
-                hours = self._get_solar_hours(
-                    asset.solar_csv, day_key_candidates,
-                )
-                if hours:
-                    arr = np.array(hours[:n])
-                    if len(arr) < n:
-                        arr = np.pad(arr, (0, n - len(arr)))
-                    gen_kwh += arr
-
-            # CSV column-based generation (e.g. WKK)
-            if asset.csv_gen_column:
-                col = _col_map.get(
-                    asset.csv_gen_column, asset.csv_gen_column,
-                )
-                gen_kwh += np.array([r.get(col, 0.0) for r in day_rows])
-
-            total_gen += gen_kwh
-
-            # Decoupling: when price < threshold, disconnect this gen
-            if asset.decouple_below_eur_mwh is not None:
-                effective = np.where(
-                    total_price >= asset.decouple_below_eur_mwh,
-                    gen_kwh, 0.0,
-                )
-            else:
-                effective = gen_kwh
-            total_gen_lp_effective += effective
-
-        # ── LP result ───────────────────────────────────────────────
-        lp_load = remaining + lp_shiftable
-        lp_grid = lp_load - total_gen_lp_effective
-        lp_cost = lp_grid * total_price / 1000.0
-
-        return {
-            "baseline": baseline_cost,
-            "optimised": lp_cost,
-            "baseline_load_kwh": baseline_load,
-            "optimised_load_kwh": lp_load,
-            "baseline_grid_kwh": baseline_grid,
-            "optimised_grid_kwh": lp_grid,
-            "prices_elec": prices_elec,
-            "load_shifted": total_daily_charged,
-            "total_generation": float(np.sum(total_gen_lp_effective)),
-            "n_slots": n,
-        }
 
     # ------------------------------------------------------------------
     # Results display
@@ -682,6 +436,10 @@ class HistoricalAnalysisDialog(QDialog):
                 self.status_label.setText(f"CSV load failed: {exc}")
                 return
 
+        # Pre-load solar data
+        solar_hours = self._get_solar_hours_all([])
+        enabled_assets = [a for a in self._assets if a.enabled]
+
         # Accumulators
         total_baseline_cost = 0.0
         total_optimised_cost = 0.0
@@ -703,18 +461,13 @@ class HistoricalAnalysisDialog(QDialog):
                 )
                 QApplication.processEvents()
 
-            day_rows = self._find_day_rows(day)
+            day_rows = find_day_rows(self._csv_data, day)
             if not day_rows:
                 day += timedelta(days=1)
                 continue
 
-            day_key_candidates = [
-                f"{day.day}/{day.month:02d}/{day.year}",
-                f"{day.day:02d}/{day.month:02d}/{day.year}",
-                f"{day.day}/{day.month}/{day.year}",
-            ]
-
-            results = self._simulate_day_csv(day_rows, day_key_candidates)
+            keys = day_key_candidates(day)
+            results = simulate_day(day_rows, enabled_assets, solar_hours, keys)
 
             # Cost accumulators
             total_baseline_cost += float(results["baseline"].sum())
@@ -725,7 +478,7 @@ class HistoricalAnalysisDialog(QDialog):
 
             # CO2 accumulators
             n = len(day_rows)
-            co2_hourly = self._get_co2_hours(day_key_candidates, n)
+            co2_hourly = self._get_co2_hours(keys, n)
             co2_arr = np.array(co2_hourly[:n])
             total_co2_baseline_g += float(
                 np.sum(results["baseline_grid_kwh"] * co2_arr)

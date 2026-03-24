@@ -5,36 +5,39 @@ Run with::
     python dashboard.py
 
 The window has three columns:
+  * **Left** — system inputs (price, solar, CHP, …)
+  * **Centre** — graphs, KPIs, historical-analysis button
+  * **Right** — system outputs (CHP state, heat-pump, setpoint, ice banks, …)
 
-* **Left**   — system inputs  (price, solar, CHP, …)
-* **Centre** — graphs, KPIs, historical-analysis button
-* **Right**  — system outputs (CHP state, ice banks, …)
-
-Architecture
-------------
-* **UI only** — all layout, widgets, and rendering live here.
-* **Data**    — fetched / cached by :class:`data_manager.DataManager`.
-* **LP**      — solved by :class:`smpc_calculator.SMPCCalculator`.
+Values update every second via SMPC and live data refreshes.
 """
 
+import csv
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QMainWindow,
+    QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QMainWindow,
     QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from asset_dialogs import AssetManagerDialog
+import getPrice
+import getWeather
+import predict
 from dashboard_config import load_dashboard_config
-from data_manager import DataManager, current_slot
+from energy_assets import ensure_defaults
+from asset_dialogs import AssetManagerDialog
 from graph_renderer import draw_price_graph, draw_solar_graph
 from historical_dialog import HistoricalAnalysisDialog
-from settings import INTERVAL_MINUTES, LOCAL_TZ
-from smpc_calculator import SMPCCalculator
+from settings import (
+    DASHBOARD_DIR, DAILY_FETCH_HOUR, DEFAULT_LATITUDE, DEFAULT_LONGITUDE,
+    INTERVAL_MINUTES, LOCAL_TZ, PREDICT_CSV, SOLAR_CAPACITY_KWP,
+    WEATHER_CSV,
+)
+from smpc_calculator import SMPCCalculator, SMPCInputs
 from styles import (
     COLUMN_BUTTON_STYLE, HISTORICAL_BUTTON_STYLE, MAIN_WINDOW_STYLE,
     value_css,
@@ -77,21 +80,18 @@ class ScadaWindow(QMainWindow):
         self.setStyleSheet(MAIN_WINDOW_STYLE)
 
         self._init_state()
-        self._init_data()
-        self._init_lp()
+        self._init_smpc()
         self._build_ui()
         self._start_timer()
-
-        # First data load
-        self.data.refresh_all(force=True)
-        self._update_all_widgets()
+        self._load_initial_data()
 
     # ------------------------------------------------------------------
     # Initialisation helpers
     # ------------------------------------------------------------------
 
     def _init_state(self):
-        """Declare widget references and tag bookkeeping."""
+        """Declare every mutable attribute with its default value."""
+        self.small_windows: dict = {}
         self.value_labels: dict = {}
         self.tag_definitions: dict = {"input": {}, "output": {}}
 
@@ -105,21 +105,40 @@ class ScadaWindow(QMainWindow):
         self.center_uv_value_label = None
         self.center_solar_value_label = None
 
-    def _init_data(self):
-        """Create the DataManager (handles all fetching and caching)."""
-        self.data = DataManager()
+        # Data caches
+        self.cached_price_rows: list = []
+        self.cached_avg_48h: float | None = None
+        self.predicted_by_timestamp: dict = {}
+        self.uv_by_timestamp: dict = {}
 
-    def _init_lp(self):
-        """Create the LP calculator and load building parameters."""
+        # Current-slot derived values
+        self.current_predicted_power_kw: float | None = None
+        self.current_predicted_yield_kwh: float | None = None
+        self.current_uv_index: float | None = None
+
+        # Refresh scheduling
+        self.price_next_refresh = None
+        self.predict_next_refresh = None
+        self.weather_next_refresh = None
+        self.next_data_pipeline_run = None
+
+    def _init_smpc(self):
+        """Load SMPC configuration and create the calculator."""
         raw = load_dashboard_config()
         building = raw.get("smpc", {}).get("building", {})
 
-        self.lp = SMPCCalculator()
-        self.lp_last_slot = None
-        self.last_lp_outputs = None
+        self.smpc_calculator = SMPCCalculator()
+        self.smpc_cfg = self.smpc_calculator.cfg
 
-        self.base_load_kw = building.get("base_load_kw", 80)
-        self.peak_load_kw = building.get("peak_load_kw", 200)
+        self.ice_bank_kwh = self.smpc_cfg.ice_bank_initial_kwh
+        self.heat_buffer_kwh = self.smpc_cfg.heat_buffer_initial_kwh
+        self.last_smpc_outputs = None
+        self.smpc_last_slot = None
+
+        self.smpc_base_load_kw = building.get("base_load_kw", 80)
+        self.smpc_peak_load_kw = building.get("peak_load_kw", 200)
+        self.smpc_wkk_max_gas_m3 = building.get("wkk_max_gas_m3", 9.0)
+        self.smpc_heat_demand_base_kwh = building.get("heat_demand_base_kwh", 20)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -467,60 +486,136 @@ class ScadaWindow(QMainWindow):
         self.timer.timeout.connect(self._on_tick)
         self.timer.start(1000)
 
-    # ------------------------------------------------------------------
-    # Main tick (called every second)
-    # ------------------------------------------------------------------
-
-    def _on_tick(self):
-        self._update_clock()
-        self.data.tick()
-        self._run_lp_if_needed()
-        self._update_all_widgets()
-
-    # ------------------------------------------------------------------
-    # Widget updates (pure UI — reads from DataManager)
-    # ------------------------------------------------------------------
-
-    def _update_all_widgets(self):
-        self._update_price_labels()
-        self._update_predict_labels()
+    def _load_initial_data(self):
+        self._run_data_pipeline(force=True)
+        self._refresh_prices(force=True)
+        self._refresh_predictions(force=True)
+        self._refresh_weather(force=True)
         self._update_center()
-        self._update_tag_labels()
+
+    # ------------------------------------------------------------------
+    # Data refresh — prices
+    # ------------------------------------------------------------------
+
+    def _refresh_prices(self, force=False):
+        if self.price_current_label is None:
+            return
+        now = datetime.now(LOCAL_TZ)
+        if not force and self.price_next_refresh and now < self.price_next_refresh:
+            return
+        try:
+            rows, avg = getPrice.get_flagged_next_day_prices()
+            self.cached_price_rows = rows
+            self.cached_avg_48h = avg
+            self.price_next_refresh = self._next_quarter(now)
+        except Exception as exc:
+            if force:
+                self.price_current_label.setText("API error")
+                self.price_avg_label.setText("API error")
+            logger.warning("Price refresh: %s", exc)
+            return
+        self._update_price_labels()
 
     def _update_price_labels(self):
-        dm = self.data
-        if dm.current_price is None or dm.avg_48h is None:
+        slot = self._current_slot()
+        if not self.cached_price_rows or self.cached_avg_48h is None:
             return
-        if self.price_current_label:
-            self.price_current_label.setText(f"{dm.current_price:.2f} EUR/MWh")
-            colour = "#16a34a" if dm.current_price < dm.avg_48h else "#dc2626"
-            self.price_current_label.setStyleSheet(value_css(colour))
-        if self.price_avg_label:
-            self.price_avg_label.setText(f"{dm.avg_48h:.2f} EUR/MWh")
-            self.price_avg_label.setStyleSheet(value_css("#0f766e"))
+        price = None
+        for ts, p, _ in self.cached_price_rows:
+            if ts.astimezone(LOCAL_TZ) == slot:
+                price = p
+                break
+        if price is None:
+            return
+
+        self.price_current_label.setText(f"{price:.2f} EUR/MWh")
+        self.price_avg_label.setText(f"{self.cached_avg_48h:.2f} EUR/MWh")
+        colour = "#16a34a" if price < self.cached_avg_48h else "#dc2626"
+        self.price_current_label.setStyleSheet(value_css(colour))
+        self.price_avg_label.setStyleSheet(value_css("#0f766e"))
+
+    # ------------------------------------------------------------------
+    # Data refresh — predictions
+    # ------------------------------------------------------------------
+
+    def _refresh_predictions(self, force=False):
+        now = datetime.now(LOCAL_TZ)
+        if not force and self.predict_next_refresh and now < self.predict_next_refresh:
+            return
+        if not PREDICT_CSV.exists():
+            return
+        try:
+            loaded: dict = {}
+            with PREDICT_CSV.open("r", encoding="utf-8", newline="") as f:
+                for row in csv.DictReader(f, delimiter=";"):
+                    ts = row.get("Timestamp", "").strip()
+                    if not ts:
+                        continue
+                    pw = float(row["Predicted Power (kW)"].replace(",", "."))
+                    yl = float(row["Predicted Yield (kWh)"].replace(",", "."))
+                    loaded[ts] = (pw, yl)
+            self.predicted_by_timestamp = loaded
+        except Exception as exc:
+            logger.warning("Predict refresh: %s", exc)
+            return
+        self.predict_next_refresh = self._next_quarter(now)
+        self._update_predict_labels()
 
     def _update_predict_labels(self):
+        key = self._current_slot().strftime("%Y-%m-%d %H:%M:%S")
+        cur = self.predicted_by_timestamp.get(key)
+        if cur is None:
+            self.current_predicted_power_kw = None
+            self.current_predicted_yield_kwh = None
+            if self.actual_yield_label:
+                self.actual_yield_label.setText("-- kWh")
+            return
+        self.current_predicted_power_kw, self.current_predicted_yield_kwh = cur
         if self.actual_yield_label:
             self.actual_yield_label.setText("-- kWh")
             self.actual_yield_label.setStyleSheet(value_css("#64748b"))
+
+    # ------------------------------------------------------------------
+    # Data refresh — weather
+    # ------------------------------------------------------------------
+
+    def _refresh_weather(self, force=False):
+        now = datetime.now(LOCAL_TZ)
+        if not force and self.weather_next_refresh and now < self.weather_next_refresh:
+            return
+        if not WEATHER_CSV.exists():
+            return
+        try:
+            loaded: dict = {}
+            with WEATHER_CSV.open("r", encoding="utf-8", newline="") as f:
+                for row in csv.DictReader(f, delimiter=";"):
+                    ts = row.get("Timestamp", "").strip()
+                    if ts:
+                        loaded[ts] = float(
+                            row.get("UV Index", "0").replace(",", ".")
+                        )
+            self.uv_by_timestamp = loaded
+        except Exception as exc:
+            logger.warning("Weather refresh: %s", exc)
+            return
+        self.weather_next_refresh = self._next_quarter(now)
 
     # ------------------------------------------------------------------
     # Centre panel updates
     # ------------------------------------------------------------------
 
     def _update_center(self):
-        slot = current_slot()
+        slot = self._current_slot()
         slot_key = slot.strftime("%Y-%m-%d %H:%M:%S")
-        dm = self.data
 
         # Price graph
         if self.center_price_graph_label is not None:
-            prices = [p for _, p, _ in dm.price_rows]
+            prices = [p for _, p, _ in self.cached_price_rows]
             idx = None
-            if dm.price_rows:
-                start = dm.price_rows[0][0].astimezone(LOCAL_TZ).strftime("%d/%m %H:%M")
-                end = dm.price_rows[-1][0].astimezone(LOCAL_TZ).strftime("%d/%m %H:%M")
-                for i, (ts, _, _) in enumerate(dm.price_rows):
+            if self.cached_price_rows:
+                start = self.cached_price_rows[0][0].astimezone(LOCAL_TZ).strftime("%d/%m %H:%M")
+                end = self.cached_price_rows[-1][0].astimezone(LOCAL_TZ).strftime("%d/%m %H:%M")
+                for i, (ts, _, _) in enumerate(self.cached_price_rows):
                     if ts.astimezone(LOCAL_TZ).replace(second=0, microsecond=0) == slot:
                         idx = i
                         break
@@ -532,7 +627,7 @@ class ScadaWindow(QMainWindow):
 
         # Solar graph
         if self.center_solar_graph_label is not None:
-            items = sorted(dm.predictions.items())
+            items = sorted(self.predicted_by_timestamp.items())
             values = [pw for _, (pw, _) in items]
             idx = None
             if items:
@@ -552,17 +647,19 @@ class ScadaWindow(QMainWindow):
                 draw_solar_graph(values, start, end, idx),
             )
 
-        # Scalar metrics
+        # UV & solar value labels
+        self.current_uv_index = self.uv_by_timestamp.get(slot_key)
         if self.center_uv_value_label:
             self.center_uv_value_label.setText(
-                "--" if dm.current_uv is None else f"{dm.current_uv:.2f}",
+                "--" if self.current_uv_index is None
+                else f"{self.current_uv_index:.2f}"
             )
         if self.center_solar_value_label:
-            if dm.current_power_kw is None:
+            if self.current_predicted_power_kw is None:
                 self.center_solar_value_label.setText("-- kW")
             else:
                 self.center_solar_value_label.setText(
-                    f"{dm.current_power_kw:.1f} kW",
+                    f"{self.current_predicted_power_kw:.1f} kW"
                 )
 
     # ------------------------------------------------------------------
@@ -577,46 +674,188 @@ class ScadaWindow(QMainWindow):
         )
         self.clock_label.setStyleSheet(value_css("#0e7490"))
 
-    def _update_tag_labels(self):
-        for (ttype, tid), label in self.value_labels.items():
-            defn = self.tag_definitions.get(ttype, {}).get(tid, {})
-            text, colour = self._sim_value(defn)
-            label.setStyleSheet(value_css(colour))
-            label.setText(text)
-
     # ------------------------------------------------------------------
-    # LP integration (called once per 15-min slot)
+    # Data pipeline (daily scheduled refresh)
     # ------------------------------------------------------------------
 
-    def _run_lp_if_needed(self):
-        slot = current_slot()
-        if self.lp_last_slot == slot:
-            return
-        self.lp_last_slot = slot
-
-        H = self.lp.cfg.horizon_steps
-        month = datetime.now(LOCAL_TZ).month
-
-        price_fc = self.data.build_price_forecast(slot, H)
-        base_load, solar_kwh = self.data.build_load_and_solar(
-            slot, H, self.base_load_kw, self.peak_load_kw,
+    def _next_pipeline_time(self, now=None):
+        if now is None:
+            now = datetime.now(LOCAL_TZ)
+        target = now.replace(
+            hour=DAILY_FETCH_HOUR, minute=0, second=0, microsecond=0,
         )
+        return target if now < target else target + timedelta(days=1)
+
+    def _run_data_pipeline(self, force=False):
+        now = datetime.now(LOCAL_TZ)
+        if not force and self.next_data_pipeline_run and now < self.next_data_pipeline_run:
+            return
+
+        today = now.strftime("%Y-%m-%d")
+        tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
         try:
-            self.last_lp_outputs = self.lp.solve_lp(
+            client = getWeather.build_client()
+            data = getWeather.fetch_weather(
+                client, DEFAULT_LATITUDE, DEFAULT_LONGITUDE, today, tomorrow,
+            )
+            getWeather.export_csv(data, WEATHER_CSV)
+        except Exception as exc:
+            logger.warning("Weather pipeline: %s", exc)
+
+        try:
+            rows = predict.read_weather_csv(WEATHER_CSV)
+            if rows:
+                predict.export_predictions(
+                    rows, PREDICT_CSV, SOLAR_CAPACITY_KWP,
+                )
+        except Exception as exc:
+            logger.warning("Predict pipeline: %s", exc)
+
+        try:
+            getPrice.fetch_and_save_prices(
+                output_filename="prices.csv",
+                output_dir=DASHBOARD_DIR,
+                reference_time=now,
+            )
+        except Exception as exc:
+            logger.warning("Price pipeline: %s", exc)
+
+        self.next_data_pipeline_run = self._next_pipeline_time(now)
+
+    def _maybe_run_pipeline(self):
+        now = datetime.now(LOCAL_TZ)
+        if self.next_data_pipeline_run is None:
+            self.next_data_pipeline_run = self._next_pipeline_time(now)
+        if now >= self.next_data_pipeline_run:
+            self._run_data_pipeline(force=True)
+            self._refresh_predictions(force=True)
+            self._refresh_weather(force=True)
+            self._refresh_prices(force=True)
+            self._update_center()
+
+    # ------------------------------------------------------------------
+    # SMPC integration
+    # ------------------------------------------------------------------
+
+    def _build_price_forecast(self, slot):
+        H = self.smpc_cfg.horizon_steps
+        if not self.cached_price_rows:
+            return np.full(H, 0.10)
+        timeline = sorted(
+            [
+                (ts.astimezone(LOCAL_TZ).replace(second=0, microsecond=0),
+                 price / 1000.0)
+                for ts, price, _ in self.cached_price_rows
+            ],
+            key=lambda r: r[0],
+        )
+        prices = np.zeros(H)
+        for t in range(H):
+            target = slot + timedelta(minutes=INTERVAL_MINUTES * t)
+            best = timeline[0][1]
+            for ts, p in timeline:
+                if ts <= target:
+                    best = p
+                else:
+                    break
+            prices[t] = best
+        return prices
+
+    def _build_consumption_profile(self, slot):
+        H = self.smpc_cfg.horizon_steps
+        start_h = slot.hour + slot.minute / 60.0
+        load = np.zeros(H)
+        solar = np.zeros(H)
+        for t in range(H):
+            h = (start_h + t * 0.25) % 24
+            if 6 <= h <= 18:
+                kw = self.smpc_base_load_kw + (
+                    self.smpc_peak_load_kw - self.smpc_base_load_kw
+                ) * max(0.0, np.sin(np.pi * (h - 6) / 12))
+            else:
+                kw = self.smpc_base_load_kw
+            load[t] = kw * 0.25
+            key = (slot + timedelta(minutes=INTERVAL_MINUTES * t)).strftime(
+                "%Y-%m-%d %H:%M:%S",
+            )
+            pred = self.predicted_by_timestamp.get(key)
+            if pred:
+                _, yld = pred
+                solar[t] = max(0.0, yld)
+        return np.maximum(load - solar, 0.0)
+
+    def _run_smpc_if_needed(self):
+        slot = self._current_slot()
+        if self.smpc_last_slot == slot:
+            return
+        self.smpc_last_slot = slot
+
+        cfg = self.smpc_cfg
+        month = datetime.now(LOCAL_TZ).month
+        price_fc = self._build_price_forecast(slot)
+
+        # Build base (non-shiftable) load and solar separately so the
+        # LP can handle generator decoupling without double-counting.
+        H = cfg.horizon_steps
+        start_h = slot.hour + slot.minute / 60.0
+        base_load = np.zeros(H)
+        solar_kwh = np.zeros(H)
+        for t in range(H):
+            h = (start_h + t * 0.25) % 24
+            if 6 <= h <= 18:
+                kw = self.smpc_base_load_kw + (
+                    self.smpc_peak_load_kw - self.smpc_base_load_kw
+                ) * max(0.0, np.sin(np.pi * (h - 6) / 12))
+            else:
+                kw = self.smpc_base_load_kw
+            base_load[t] = kw * 0.25          # kW → kWh per 15-min step
+            key = (slot + timedelta(minutes=INTERVAL_MINUTES * t)).strftime(
+                "%Y-%m-%d %H:%M:%S",
+            )
+            pred = self.predicted_by_timestamp.get(key)
+            if pred:
+                _, yld = pred
+                solar_kwh[t] = max(0.0, yld)
+
+        try:
+            self.last_smpc_outputs = self.smpc_calculator.solve_lp(
                 price_forecast_eur_kwh=price_fc,
                 base_load_kwh=base_load,
                 solar_pred_kwh=solar_kwh,
                 month=month,
             )
+            self.ice_bank_kwh = self.last_smpc_outputs.ice_bank_next_kwh
+            self.heat_buffer_kwh = self.last_smpc_outputs.heat_buffer_next_kwh
         except Exception as exc:
             logger.warning("LP solve: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Main tick (called every second)
+    # ------------------------------------------------------------------
+
+    def _on_tick(self):
+        self._update_clock()
+        self._maybe_run_pipeline()
+        self._refresh_prices()
+        self._update_price_labels()
+        self._refresh_predictions()
+        self._update_predict_labels()
+        self._refresh_weather()
+        self._update_center()
+        self._run_smpc_if_needed()
+
+        for (ttype, tid), label in self.value_labels.items():
+            defn = self.tag_definitions.get(ttype, {}).get(tid, {})
+            text, colour = self._sim_value(ttype, defn)
+            label.setStyleSheet(value_css(colour))
+            label.setText(text)
 
     # ------------------------------------------------------------------
     # Tag value simulation
     # ------------------------------------------------------------------
 
-    def _sim_value(self, defn):
+    def _sim_value(self, tag_type, defn):
         """Determine the display text and colour for a single tag."""
         sim = defn.get("simulation", {}) if isinstance(defn, dict) else {}
         mode = str(sim.get("mode", "")).strip().lower()
@@ -637,9 +876,9 @@ class ScadaWindow(QMainWindow):
         unit = sim.get("unit", "kW")
         dec = int(sim.get("decimals", 1))
         col = sim.get("color", "#0e7490")
-        if self.data.current_power_kw is None:
+        if self.current_predicted_power_kw is None:
             return f"-- {unit}", col
-        return f"{self.data.current_power_kw:.{dec}f} {unit}", col
+        return f"{self.current_predicted_power_kw:.{dec}f} {unit}", col
 
     def _sim_smpc(self, sim):
         field = sim.get("field", "")
@@ -647,9 +886,9 @@ class ScadaWindow(QMainWindow):
         dec = int(sim.get("decimals", 1))
         mult = float(sim.get("multiplier", 1))
         col = sim.get("color", "#0e7490")
-        if self.last_lp_outputs is None:
+        if self.last_smpc_outputs is None:
             return f"-- {unit}".strip(), col
-        kpis = SMPCCalculator.outputs_to_dashboard_dict(self.last_lp_outputs)
+        kpis = SMPCCalculator.outputs_to_dashboard_dict(self.last_smpc_outputs)
         val = kpis.get(field)
         if val is None:
             return f"-- {unit}".strip(), col
@@ -664,9 +903,9 @@ class ScadaWindow(QMainWindow):
         above = sim.get("above", "ON")
         below = sim.get("below", "OFF")
         cols = sim.get("colors", {})
-        if self.last_lp_outputs is None:
+        if self.last_smpc_outputs is None:
             return "--", "#64748b"
-        kpis = SMPCCalculator.outputs_to_dashboard_dict(self.last_lp_outputs)
+        kpis = SMPCCalculator.outputs_to_dashboard_dict(self.last_smpc_outputs)
         state = above if kpis.get(field, 0) > thresh else below
         return state, cols.get(state, "#0e7490")
 
@@ -674,9 +913,9 @@ class ScadaWindow(QMainWindow):
         cols = sim.get("colors", {
             "CHARGE": "#0e7490", "DISCHARGE": "#f59e0b", "IDLE": "#16a34a",
         })
-        if self.last_lp_outputs is None:
+        if self.last_smpc_outputs is None:
             return "--", "#64748b"
-        out = self.last_lp_outputs
+        out = self.last_smpc_outputs
         if out.ice_bank_charge_kwh > 0.1:
             state = "CHARGE"
         elif out.ice_bank_discharge_kwh > 0.1:
@@ -689,9 +928,9 @@ class ScadaWindow(QMainWindow):
         cols = sim.get("colors", {
             "Lowered": "#16a34a", "Normal": "#0e7490", "Higher": "#dc2626",
         })
-        if self.last_lp_outputs is None:
+        if self.last_smpc_outputs is None:
             return "--", "#64748b"
-        saving = self.last_lp_outputs.cost_saving_eur
+        saving = self.last_smpc_outputs.cost_saving_eur
         if saving > 0.001:
             state = "Lowered"
         elif saving < -0.001:
@@ -715,6 +954,7 @@ class ScadaWindow(QMainWindow):
 
     def _rebuild_columns(self):
         """Clear and re-populate both side columns after asset changes."""
+        # Clear content widgets (everything except the header and add-button)
         for content in (self.input_content, self.output_content):
             layout = content.layout()
             while layout.count():
@@ -723,10 +963,33 @@ class ScadaWindow(QMainWindow):
                 if w:
                     w.deleteLater()
 
+        # Clear stale value-label references
         self.value_labels.clear()
         self.tag_definitions = {"input": {}, "output": {}}
 
         self._populate_columns()
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _current_slot():
+        """Return the current 15-minute slot as a tz-aware datetime."""
+        now = datetime.now(LOCAL_TZ)
+        return now.replace(
+            minute=(now.minute // INTERVAL_MINUTES) * INTERVAL_MINUTES,
+            second=0, microsecond=0,
+        )
+
+    @staticmethod
+    def _next_quarter(now):
+        """Return the start of the next 15-minute interval."""
+        aligned = now.replace(
+            minute=(now.minute // INTERVAL_MINUTES) * INTERVAL_MINUTES,
+            second=0, microsecond=0,
+        )
+        return aligned + timedelta(minutes=INTERVAL_MINUTES)
 
 
 # ===================================================================

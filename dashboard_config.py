@@ -10,7 +10,8 @@ DEFAULT_CONFIG_PATH = CONFIG_JSON
 def load_dashboard_config(config_path: str | Path | None = None) -> dict[str, Any]:
     """Load dashboard configuration from JSON.
 
-    Returns a dictionary with at least `inputs` and `outputs` list keys.
+    Returns a dictionary.  The ``smpc`` and ``energy_assets`` blocks are
+    the primary expected sections.
     """
     path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
     with path.open("r", encoding="utf-8") as config_file:
@@ -18,12 +19,6 @@ def load_dashboard_config(config_path: str | Path | None = None) -> dict[str, An
 
     if not isinstance(data, dict):
         raise ValueError("Dashboard config root must be a JSON object")
-
-    data.setdefault("inputs", [])
-    data.setdefault("outputs", [])
-
-    if not isinstance(data["inputs"], list) or not isinstance(data["outputs"], list):
-        raise ValueError("Dashboard config fields 'inputs' and 'outputs' must be lists")
 
     return data
 

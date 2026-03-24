@@ -343,6 +343,10 @@ def _generate_price_scenarios(
 # SECTION 4: OPTIMISATION ROUTINES
 # ===========================================================================
 
+
+from lp_solver import greedy_lp as _greedy_lp
+
+
 def _optimise_summer_cvxpy(
     mean_price: np.ndarray,
     consumption: np.ndarray,
@@ -809,6 +813,126 @@ class SMPCCalculator:
             season        = season,
             solver_used   = solver_used,
             solver_status = solver_status,
+            solve_time_ms = solve_ms,
+        )
+
+    # ------------------------------------------------------------------
+    # Asset-driven greedy LP (24 h rolling window)
+    # ------------------------------------------------------------------
+
+    def solve_lp(
+        self,
+        price_forecast_eur_kwh: np.ndarray,
+        base_load_kwh: np.ndarray | None = None,
+        solar_pred_kwh: np.ndarray | None = None,
+        month: int = 7,
+    ) -> SMPCOutputs:
+        """Asset-driven greedy LP over a 24-hour rolling window.
+
+        Reads energy-asset configuration, schedules every shiftable load
+        to the cheapest 15-minute intervals, applies generator output
+        (with price-based decoupling), and returns the first-step action
+        following the receding-horizon principle.
+
+        Parameters
+        ----------
+        price_forecast_eur_kwh : array (H,)
+            Spot electricity prices for the next 24 h (EUR / kWh).
+        base_load_kwh : array (H,) | None
+            Non-shiftable building consumption per 15-min step (kWh).
+            Pass the *gross* load (before solar subtraction).
+        solar_pred_kwh : array (H,) | None
+            Predicted solar production per 15-min step (kWh).
+        month : int
+            Current calendar month (1-12) for season tagging.
+        """
+        import time as _time
+        from energy_assets import (
+            load_assets, SHIFTABLE_LOAD, GENERATOR, EXTRA_COST_EUR_MWH,
+        )
+
+        t0 = _time.perf_counter()
+        cfg = self.cfg
+        H = cfg.horizon_steps
+
+        price_fc = self._pad_forecast(price_forecast_eur_kwh, H)
+        total_price = price_fc + cfg.grid_fee_eur_kwh        # spot + distr.
+
+        base = (self._pad_forecast(base_load_kwh, H)
+                if base_load_kwh is not None
+                else np.full(H, 20.0))
+        solar = (self._pad_forecast(solar_pred_kwh, H)
+                 if solar_pred_kwh is not None
+                 else np.zeros(H))
+
+        assets = [a for a in load_assets() if a.enabled]
+
+        # ── Shiftable loads ─────────────────────────────────────────
+        baseline_shiftable = np.zeros(H)
+        lp_shiftable = np.zeros(H)
+        total_shifted = 0.0
+
+        for asset in assets:
+            if asset.asset_type != SHIFTABLE_LOAD:
+                continue
+            daily_kwh = asset.daily_energy_kwh
+            if daily_kwh <= 0:
+                continue
+            max_per_step = asset.hourly_max_kwh / 4.0   # hourly → 15-min
+            baseline_shiftable += np.full(H, daily_kwh / H)
+            lp_shiftable += _greedy_lp(H, total_price, daily_kwh, max_per_step)
+            total_shifted += daily_kwh
+
+        # ── Generators ──────────────────────────────────────────────
+        total_gen = np.zeros(H)
+
+        for asset in assets:
+            if asset.asset_type != GENERATOR:
+                continue
+            gen = np.zeros(H)
+            if asset.solar_csv:
+                gen += solar
+            if asset.decouple_below_eur_mwh is not None:
+                price_mwh = total_price * 1000.0
+                gen = np.where(
+                    price_mwh >= asset.decouple_below_eur_mwh, gen, 0.0,
+                )
+            total_gen += gen
+
+        # ── Cost comparison ─────────────────────────────────────────
+        baseline_grid = base + baseline_shiftable - total_gen
+        lp_grid = base + lp_shiftable - total_gen
+
+        baseline_cost = baseline_grid * total_price
+        lp_cost = lp_grid * total_price
+
+        # First-step values (step 0 = current interval)
+        charge_now  = float(lp_shiftable[0])
+        net_now     = float(lp_grid[0])
+        bl_cost_now = float(baseline_cost[0])
+        lp_cost_now = float(lp_cost[0])
+
+        solve_ms = (_time.perf_counter() - t0) * 1000
+
+        return SMPCOutputs(
+            ice_bank_charge_kwh    = charge_now,
+            ice_bank_discharge_kwh = 0.0,
+            wkk_gas_setpoint_m3    = 0.0,
+            net_power_kwh          = net_now,
+            wkk_elec_kwh           = 0.0,
+            wkk_heat_kwh           = 0.0,
+            smpc_cost_eur          = lp_cost_now,
+            baseline_cost_eur      = bl_cost_now,
+            cost_saving_eur        = bl_cost_now - lp_cost_now,
+            ice_bank_next_kwh      = cfg.ice_bank_initial_kwh,
+            heat_buffer_next_kwh   = cfg.heat_buffer_initial_kwh,
+            plan_ice_charge_kwh    = lp_shiftable,
+            plan_ice_discharge_kwh = np.zeros(H),
+            plan_wkk_gas_m3        = np.zeros(H),
+            plan_net_power_kwh     = lp_grid,
+            season        = _get_season(month, cfg),
+            solver_used   = "greedy_lp",
+            solver_status = "optimal",
             solve_time_ms = solve_ms,
         )
 
