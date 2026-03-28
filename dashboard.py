@@ -25,7 +25,7 @@ import numpy as np
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QMainWindow,
-    QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSizePolicy, QSlider, QVBoxLayout, QWidget,
 )
 
 from asset_dialogs import AssetManagerDialog
@@ -37,7 +37,7 @@ from settings import INTERVAL_MINUTES, LOCAL_TZ
 from smpc_calculator import SMPCCalculator
 from styles import (
     COLUMN_BUTTON_STYLE, HISTORICAL_BUTTON_STYLE, MAIN_WINDOW_STYLE,
-    value_css,
+    SLOT_SLIDER_STYLE, value_css,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,7 @@ _ICON_LEGACY = {
     "EVs": "\U0001f697", "BEO": "\U0001f30d",
 }
 
-SIDE_COL_MIN_W = 340
+SIDE_COL_MIN_W = 260
 
 
 # ===================================================================
@@ -73,8 +73,9 @@ class ScadaWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Thesis \u2014 Building Management System")
-        self.setMinimumSize(1000, 700)
+        self.setMinimumSize(1280, 800)
         self.setStyleSheet(MAIN_WINDOW_STYLE)
+        self.resize(1400, 900)
 
         self._init_state()
         self._init_data()
@@ -95,6 +96,9 @@ class ScadaWindow(QMainWindow):
         self.value_labels: dict = {}
         self.tag_definitions: dict = {"input": {}, "output": {}}
 
+        # Slot preview slider (0 = Now, 1..95 = future 15-min steps)
+        self._selected_step: int = 0
+
         # Widget references (populated during UI build)
         self.clock_label = None
         self.price_current_label = None
@@ -104,6 +108,8 @@ class ScadaWindow(QMainWindow):
         self.center_solar_graph_label = None
         self.center_uv_value_label = None
         self.center_solar_value_label = None
+        self.slot_slider = None
+        self.slot_label = None
 
     def _init_data(self):
         """Create the DataManager (handles all fetching and caching)."""
@@ -142,7 +148,8 @@ class ScadaWindow(QMainWindow):
             "System inputs", "#004d40",
         )
         self.input_col.setMinimumWidth(SIDE_COL_MIN_W)
-        cols.addWidget(self.input_col, stretch=1)
+        self.input_col.setMaximumWidth(360)
+        cols.addWidget(self.input_col, stretch=0)
 
         # Centre — graphs / KPIs
         cols.addWidget(self._build_center_panel(), stretch=1)
@@ -152,7 +159,8 @@ class ScadaWindow(QMainWindow):
             "System outputs", "#4d1a1a",
         )
         self.output_col.setMinimumWidth(SIDE_COL_MIN_W)
-        cols.addWidget(self.output_col, stretch=1)
+        self.output_col.setMaximumWidth(360)
+        cols.addWidget(self.output_col, stretch=0)
 
         self._populate_columns()
 
@@ -168,22 +176,83 @@ class ScadaWindow(QMainWindow):
             btn.clicked.connect(lambda _=False, k=key: self._open_popup(k))
             container.layout().addWidget(btn)
 
+    @staticmethod
+    def _simulation_for_asset(asset, side):
+        """Return simulation config dict for a known asset.
+
+        *side* is ``"input"`` (power / value) or ``"output"`` (status).
+        Generators get power on input, ON/OFF on output.
+        Shiftable loads only appear on output with power + status.
+        """
+        from energy_assets import SHIFTABLE_LOAD as _SL, GENERATOR as _GEN
+
+        uid = asset.uid
+
+        # ── Generators ──────────────────────────────────────────
+        if asset.asset_type == _GEN:
+            if uid == "solar":
+                if side == "input":
+                    return {"mode": "predicted_solar", "unit": "kW", "decimals": 1, "color": "#f59e0b"}
+                return {
+                    "mode": "smpc_state",
+                    "field": "net_power_kwh",
+                    "threshold": 0.0,
+                    "above": "PRODUCING",
+                    "below": "IDLE",
+                    "colors": {"PRODUCING": "#16a34a", "IDLE": "#64748b"},
+                }
+            # Generic generator (CHP / WKK / any new one)
+            if side == "input":
+                return {
+                    "mode": "smpc",
+                    "field": "wkk_elec_kwh",
+                    "unit": "kW",
+                    "decimals": 1,
+                    "multiplier": 4,
+                    "color": "#0e7490",
+                }
+            return {
+                "mode": "smpc_state",
+                "field": "wkk_elec_kwh",
+                "threshold": 0.1,
+                "above": "ON",
+                "below": "OFF",
+                "colors": {"ON": "#16a34a", "OFF": "#dc2626"},
+            }
+
+        # ── Shiftable loads (output side only) ──────────────────
+        if asset.asset_type == _SL:
+            return {
+                "mode": "asset_power",
+                "uid": uid,
+                "unit": "kW",
+                "decimals": 1,
+            }
+
+        return {}
+
     def _populate_columns(self):
         """Build input/output tag lists from energy assets and populate."""
         from energy_assets import load_assets as _load_ea, SHIFTABLE_LOAD as _SL
         input_tags: list[dict] = []
         output_tags: list[dict] = []
         for asset in _load_ea():
-            tag = {
+            base = {
                 "id": asset.uid,
                 "name": asset.name,
                 "icon": asset.icon,
                 "section": "CONTROLLABLE" if asset.asset_type == _SL else "GENERATION",
             }
-            if asset.category == "input":
-                input_tags.append(tag)
+            if asset.asset_type == _SL:
+                # Shiftable loads → output column only
+                out_tag = dict(base, simulation=self._simulation_for_asset(asset, "output"))
+                output_tags.append(out_tag)
             else:
-                output_tags.append(tag)
+                # Generators → both columns (power on input, status on output)
+                in_tag = dict(base, simulation=self._simulation_for_asset(asset, "input"))
+                out_tag = dict(base, simulation=self._simulation_for_asset(asset, "output"))
+                input_tags.append(in_tag)
+                output_tags.append(out_tag)
 
         norm_in = self._normalise_tags(input_tags)
         norm_out = self._normalise_tags(output_tags)
@@ -236,7 +305,21 @@ class ScadaWindow(QMainWindow):
         """Construct the centre panel: graphs, metrics, analysis button."""
         panel = QFrame()
         panel.setObjectName("ColumnContainer")
-        lay = QVBoxLayout(panel)
+        outer_lay = QVBoxLayout(panel)
+        outer_lay.setContentsMargins(0, 0, 0, 0)
+        outer_lay.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+        )
+
+        content = QWidget()
+        lay = QVBoxLayout(content)
         lay.setContentsMargins(20, 18, 20, 18)
         lay.setSpacing(12)
 
@@ -268,15 +351,72 @@ class ScadaWindow(QMainWindow):
         )
         lay.addWidget(metrics)
 
+        # ── Time-slot preview slider ──────────────────────────────
+        slider_card = QFrame()
+        slider_card.setObjectName("TagRow")
+        sl = QVBoxLayout(slider_card)
+        sl.setContentsMargins(12, 10, 12, 10)
+        sl.setSpacing(6)
+
+        slider_header = QHBoxLayout()
+        slider_title = QLabel("\U0001f55b  Preview time slot")
+        slider_title.setObjectName("TagName")
+        self.slot_label = QLabel("Now")
+        self.slot_label.setObjectName("TagValue")
+        slider_header.addWidget(slider_title)
+        slider_header.addStretch()
+        slider_header.addWidget(self.slot_label)
+        sl.addLayout(slider_header)
+
+        self.slot_slider = QSlider(Qt.Orientation.Horizontal)
+        self.slot_slider.setMinimum(0)
+        self.slot_slider.setMaximum(191)
+        self.slot_slider.setValue(0)
+        self.slot_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.slot_slider.setTickInterval(4)  # tick every hour
+        self.slot_slider.setStyleSheet(SLOT_SLIDER_STYLE)
+        self.slot_slider.valueChanged.connect(self._on_slot_slider_changed)
+        sl.addWidget(self.slot_slider)
+
+        reset_btn = QPushButton("Reset to Now")
+        reset_btn.setMinimumHeight(28)
+        reset_btn.setStyleSheet(
+            "QPushButton { background: #475569; color: white; border: none; "
+            "border-radius: 4px; padding: 4px 12px; font-size: 9pt; } "
+            "QPushButton:hover { background: #334155; }"
+        )
+        reset_btn.clicked.connect(lambda: self.slot_slider.setValue(0))
+        sl.addWidget(reset_btn)
+
+        lay.addWidget(slider_card)
+
         # Historical analysis button
-        hist_btn = QPushButton("Historical SMPC Analysis")
+        hist_btn = QPushButton("Historical LP Analysis")
         hist_btn.setMinimumHeight(44)
         hist_btn.setStyleSheet(HISTORICAL_BUTTON_STYLE)
         hist_btn.clicked.connect(self._open_historical)
         lay.addWidget(hist_btn)
 
         lay.addStretch()
+
+        scroll.setWidget(content)
+        outer_lay.addWidget(scroll)
         return panel
+
+    def _on_slot_slider_changed(self, value: int):
+        """Handle slider position change."""
+        self._selected_step = value
+        if value == 0:
+            self.slot_label.setText("Now")
+            self.slot_label.setStyleSheet(value_css("#0e7490"))
+        else:
+            from datetime import timedelta
+            future = current_slot() + timedelta(minutes=value * INTERVAL_MINUTES)
+            self.slot_label.setText(future.strftime("%H:%M"))
+            self.slot_label.setStyleSheet(value_css("#7c3aed"))
+        self._update_tag_labels()
+        self._update_price_for_slot()
+        self._update_center()
 
     # ------------------------------------------------------------------
     # Reusable widget builders
@@ -295,7 +435,7 @@ class ScadaWindow(QMainWindow):
         cl.addWidget(t)
         lbl = QLabel(placeholder)
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setMinimumHeight(170)
+        lbl.setFixedHeight(200)
         lbl.setObjectName("TagValue")
         cl.addWidget(lbl)
         parent_layout.addWidget(card)
@@ -482,7 +622,7 @@ class ScadaWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _update_all_widgets(self):
-        self._update_price_labels()
+        self._update_price_for_slot()
         self._update_predict_labels()
         self._update_center()
         self._update_tag_labels()
@@ -498,6 +638,29 @@ class ScadaWindow(QMainWindow):
         if self.price_avg_label:
             self.price_avg_label.setText(f"{dm.avg_48h:.2f} EUR/MWh")
             self.price_avg_label.setStyleSheet(value_css("#0f766e"))
+
+    def _update_price_for_slot(self):
+        """Update the current price label for the selected future slot."""
+        if not self.price_current_label:
+            return
+        dm = self.data
+        if self._selected_step == 0:
+            self._update_price_labels()
+            return
+        from datetime import timedelta
+        target = current_slot() + timedelta(minutes=self._selected_step * INTERVAL_MINUTES)
+        price = None
+        for ts, p, _ in dm.price_rows:
+            if ts.astimezone(LOCAL_TZ).replace(second=0, microsecond=0) == target:
+                price = p
+                break
+        if price is not None and dm.avg_48h is not None:
+            self.price_current_label.setText(f"{price:.2f} EUR/MWh")
+            colour = "#16a34a" if price < dm.avg_48h else "#dc2626"
+            self.price_current_label.setStyleSheet(value_css(colour))
+        else:
+            self.price_current_label.setText("-- EUR/MWh")
+            self.price_current_label.setStyleSheet(value_css("#64748b"))
 
     def _update_predict_labels(self):
         if self.actual_yield_label:
@@ -526,9 +689,17 @@ class ScadaWindow(QMainWindow):
                         break
             else:
                 start, end = "", ""
+            sel_idx = (idx + self._selected_step) if idx is not None and self._selected_step > 0 else None
+            gw = max(self.center_price_graph_label.width(), 300)
+            gh = self.center_price_graph_label.height() or 200
             self.center_price_graph_label.setPixmap(
-                draw_price_graph(prices, start, end, idx),
+                draw_price_graph(prices, start, end, idx, sel_idx, gw, gh),
             )
+            # Clamp slider to remaining future data
+            if idx is not None:
+                max_future = max(len(prices) - 1 - idx, 0)
+                if self.slot_slider.maximum() != max_future:
+                    self.slot_slider.setMaximum(max(max_future, 1))
 
         # Solar graph
         if self.center_solar_graph_label is not None:
@@ -548,8 +719,11 @@ class ScadaWindow(QMainWindow):
                         break
             else:
                 start, end = "", ""
+            sel_idx = (idx + self._selected_step) if idx is not None and self._selected_step > 0 else None
+            gw = max(self.center_solar_graph_label.width(), 300)
+            gh = self.center_solar_graph_label.height() or 200
             self.center_solar_graph_label.setPixmap(
-                draw_solar_graph(values, start, end, idx),
+                draw_solar_graph(values, start, end, idx, sel_idx, gw, gh),
             )
 
         # Scalar metrics
@@ -631,12 +805,26 @@ class ScadaWindow(QMainWindow):
             return self._sim_ice_status(sim)
         if mode == "smpc_setpoint":
             return self._sim_setpoint(sim)
+        if mode == "asset_power":
+            return self._sim_asset_power(sim)
         return "--", "#64748b"
 
     def _sim_predicted_solar(self, sim):
         unit = sim.get("unit", "kW")
         dec = int(sim.get("decimals", 1))
         col = sim.get("color", "#0e7490")
+
+        step = self._selected_step
+        if step > 0:
+            # Look up predicted solar at the future slot
+            from datetime import timedelta
+            future = current_slot() + timedelta(minutes=step * INTERVAL_MINUTES)
+            key = future.strftime("%Y-%m-%d %H:%M:%S")
+            pred = self.data.predictions.get(key)
+            if pred is None:
+                return f"-- {unit}", col
+            return f"{pred[0]:.{dec}f} {unit}", col
+
         if self.data.current_power_kw is None:
             return f"-- {unit}", col
         return f"{self.data.current_power_kw:.{dec}f} {unit}", col
@@ -649,7 +837,9 @@ class ScadaWindow(QMainWindow):
         col = sim.get("color", "#0e7490")
         if self.last_lp_outputs is None:
             return f"-- {unit}".strip(), col
-        kpis = SMPCCalculator.outputs_to_dashboard_dict(self.last_lp_outputs)
+        kpis = SMPCCalculator.outputs_to_dashboard_dict(
+            self.last_lp_outputs, step=self._selected_step,
+        )
         val = kpis.get(field)
         if val is None:
             return f"-- {unit}".strip(), col
@@ -666,7 +856,9 @@ class ScadaWindow(QMainWindow):
         cols = sim.get("colors", {})
         if self.last_lp_outputs is None:
             return "--", "#64748b"
-        kpis = SMPCCalculator.outputs_to_dashboard_dict(self.last_lp_outputs)
+        kpis = SMPCCalculator.outputs_to_dashboard_dict(
+            self.last_lp_outputs, step=self._selected_step,
+        )
         state = above if kpis.get(field, 0) > thresh else below
         return state, cols.get(state, "#0e7490")
 
@@ -674,16 +866,52 @@ class ScadaWindow(QMainWindow):
         cols = sim.get("colors", {
             "CHARGE": "#0e7490", "DISCHARGE": "#f59e0b", "IDLE": "#16a34a",
         })
+        show_power = sim.get("show_power", False)
         if self.last_lp_outputs is None:
             return "--", "#64748b"
         out = self.last_lp_outputs
-        if out.ice_bank_charge_kwh > 0.1:
+        step = self._selected_step
+        if step > 0 and len(out.plan_ice_charge_kwh) > step:
+            charge = float(out.plan_ice_charge_kwh[step])
+            discharge = float(out.plan_ice_discharge_kwh[step]) if len(out.plan_ice_discharge_kwh) > step else 0.0
+        else:
+            charge = out.ice_bank_charge_kwh
+            discharge = out.ice_bank_discharge_kwh
+        if charge > 0.1:
             state = "CHARGE"
-        elif out.ice_bank_discharge_kwh > 0.1:
+            power_kw = charge * 4.0
+        elif discharge > 0.1:
             state = "DISCHARGE"
+            power_kw = discharge * 4.0
         else:
             state = "IDLE"
-        return state, cols.get(state, "#0e7490")
+            power_kw = 0.0
+        txt = state
+        if show_power and power_kw > 0.1:
+            txt = f"{state} {power_kw:.1f} kW"
+        return txt, cols.get(state, "#0e7490")
+
+    def _sim_asset_power(self, sim):
+        """Show per-asset scheduled power from the LP solution."""
+        uid = sim.get("uid", "")
+        unit = sim.get("unit", "kW")
+        dec = int(sim.get("decimals", 1))
+        if self.last_lp_outputs is None:
+            return f"-- {unit}", "#64748b"
+        out = self.last_lp_outputs
+        step = self._selected_step
+        # Use per-asset full schedule if looking at a future step
+        if step > 0:
+            sched = out.asset_schedules.get(uid)
+            if sched is not None and len(sched) > step:
+                kw = float(sched[step]) * 4.0  # kWh/15min → kW
+            else:
+                kw = 0.0
+        else:
+            kw = out.asset_power_kw.get(uid, 0.0)
+        if kw < 0.1:
+            return "IDLE", "#16a34a"
+        return f"{kw:.{dec}f} {unit}", "#0e7490"
 
     def _sim_setpoint(self, sim):
         cols = sim.get("colors", {

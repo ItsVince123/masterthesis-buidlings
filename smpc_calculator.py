@@ -93,6 +93,7 @@ class SMPCConfig:
     heat_buffer_capacity_kwh:   float = 15_000.0
     heat_buffer_initial_kwh:    float =  3_000.0  # Starting state when dashboard boots
     spark_spread_threshold:     float =    0.01   # Min spark spread [€/kWh] to run WKK
+    wkk_max_gas_m3:             float =    0.0    # Max gas burn rate [m³/interval] (from building config)
 
     # --- Grid connection ----------------------------------------------------
     peak_limit_kwh:             float = 3_250.0   # Per 15-min step = 13 MW peak
@@ -182,6 +183,9 @@ class SMPCConfig:
         # seasons
         d.summer_months = tuple(_get("seasons", "summer_months", list(d.summer_months)))
         d.winter_months = tuple(_get("seasons", "winter_months", list(d.winter_months)))
+
+        # building
+        d.wkk_max_gas_m3 = float(_get("building", "wkk_max_gas_m3", d.wkk_max_gas_m3))
 
         return d
 
@@ -297,6 +301,12 @@ class SMPCOutputs:
 
     # Shape: (horizon_steps,) — expected net power over horizon
     plan_net_power_kwh:     np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # --- Per-asset first-step power (kW) ------------------------------------
+    asset_power_kw: dict = field(default_factory=dict)  # uid → kW
+
+    # --- Per-asset full schedule (for slider) --------------------------------
+    asset_schedules: dict = field(default_factory=dict)  # uid → np.ndarray (H,)
 
     # --- Solver metadata ----------------------------------------------------
     season:        str = "unknown"   # "summer" / "winter" / "transition"
@@ -871,6 +881,7 @@ class SMPCCalculator:
         baseline_shiftable = np.zeros(H)
         lp_shiftable = np.zeros(H)
         total_shifted = 0.0
+        asset_schedules: dict[str, np.ndarray] = {}
 
         for asset in assets:
             if asset.asset_type != SHIFTABLE_LOAD:
@@ -879,8 +890,10 @@ class SMPCCalculator:
             if daily_kwh <= 0:
                 continue
             max_per_step = asset.hourly_max_kwh / 4.0   # hourly → 15-min
+            schedule = _greedy_lp(H, total_price, daily_kwh, max_per_step)
             baseline_shiftable += np.full(H, daily_kwh / H)
-            lp_shiftable += _greedy_lp(H, total_price, daily_kwh, max_per_step)
+            lp_shiftable += schedule
+            asset_schedules[asset.uid] = schedule
             total_shifted += daily_kwh
 
         # ── Generators ──────────────────────────────────────────────
@@ -899,12 +912,40 @@ class SMPCCalculator:
                 )
             total_gen += gen
 
+        # ── CHP / WKK scheduling (simple spark-spread rule) ─────────
+        # Run the CHP when it is profitable: the electricity it produces
+        # offsets grid import, so its value = spot + grid fee.  If that
+        # revenue exceeds the gas cost we run it at full capacity.
+        # Heat output is treated as a free byproduct — a simple rule that
+        # ignores buffer constraints.  TODO: replace with proper heat-
+        # demand-aware optimisation when real heat data is available.
+        gas_plan = np.zeros(H)
+        wkk_elec_plan = np.zeros(H)
+        wkk_max_gas = cfg.wkk_max_gas_m3
+
+        if wkk_max_gas > 0:
+            gas_cost_per_m3 = cfg.gas_price_eur_m3
+            gas_energy = cfg.gas_energy_kwh_m3
+            elec_eff = cfg.wkk_elec_efficiency
+            for t in range(H):
+                # Revenue from 1 m³ gas converted to electricity
+                elec_per_m3 = gas_energy * elec_eff       # kWh per m³
+                revenue_per_m3 = elec_per_m3 * total_price[t]  # EUR per m³
+                # Simple rule: run CHP when revenue > gas cost
+                if revenue_per_m3 > gas_cost_per_m3:
+                    gas_plan[t] = wkk_max_gas
+            wkk_elec_plan = gas_plan * gas_energy * elec_eff
+            total_gen += wkk_elec_plan
+
         # ── Cost comparison ─────────────────────────────────────────
         baseline_grid = base + baseline_shiftable - total_gen
         lp_grid = base + lp_shiftable - total_gen
 
-        baseline_cost = baseline_grid * total_price
-        lp_cost = lp_grid * total_price
+        # Gas cost for CHP operation
+        gas_cost_arr = gas_plan * cfg.gas_price_eur_m3
+
+        baseline_cost = baseline_grid * total_price + gas_cost_arr
+        lp_cost = lp_grid * total_price + gas_cost_arr
 
         # First-step values (step 0 = current interval)
         charge_now  = float(lp_shiftable[0])
@@ -912,23 +953,30 @@ class SMPCCalculator:
         bl_cost_now = float(baseline_cost[0])
         lp_cost_now = float(lp_cost[0])
 
+        # Per-asset first-step power in kW (kWh per 15 min × 4)
+        asset_power = {}
+        for uid, sched in asset_schedules.items():
+            asset_power[uid] = float(sched[0]) * 4.0
+
         solve_ms = (_time.perf_counter() - t0) * 1000
 
         return SMPCOutputs(
             ice_bank_charge_kwh    = charge_now,
             ice_bank_discharge_kwh = 0.0,
-            wkk_gas_setpoint_m3    = 0.0,
+            wkk_gas_setpoint_m3    = float(gas_plan[0]),
             net_power_kwh          = net_now,
-            wkk_elec_kwh           = 0.0,
-            wkk_heat_kwh           = 0.0,
+            wkk_elec_kwh           = float(wkk_elec_plan[0]),
+            wkk_heat_kwh           = float(gas_plan[0] * cfg.gas_energy_kwh_m3 * cfg.wkk_heat_efficiency),
             smpc_cost_eur          = lp_cost_now,
             baseline_cost_eur      = bl_cost_now,
             cost_saving_eur        = bl_cost_now - lp_cost_now,
             ice_bank_next_kwh      = cfg.ice_bank_initial_kwh,
             heat_buffer_next_kwh   = cfg.heat_buffer_initial_kwh,
+            asset_power_kw         = asset_power,
+            asset_schedules        = asset_schedules,
             plan_ice_charge_kwh    = lp_shiftable,
             plan_ice_discharge_kwh = np.zeros(H),
-            plan_wkk_gas_m3        = np.zeros(H),
+            plan_wkk_gas_m3        = gas_plan,
             plan_net_power_kwh     = lp_grid,
             season        = _get_season(month, cfg),
             solver_used   = "greedy_lp",
@@ -953,18 +1001,51 @@ class SMPCCalculator:
         return np.concatenate([arr, pad])
 
     @staticmethod
-    def outputs_to_dashboard_dict(outputs: SMPCOutputs) -> dict:
+    def outputs_to_dashboard_dict(outputs: SMPCOutputs, step: int = 0) -> dict:
         """
         Flatten SMPCOutputs into a flat key→value dict suitable for
         updating dashboard tag labels directly.
 
-        Example usage in dashboard.py:
-            kpis = SMPCCalculator.outputs_to_dashboard_dict(outputs)
-            self.value_labels[("output", "ice_charge")].setText(
-                f"{kpis['ice_bank_charge_kwh']:.1f} kWh"
-            )
+        *step* selects which horizon step to read (0 = current, >0 = future).
         """
-        return {
+        if step > 0:
+            # Read from full-horizon plan arrays
+            def _plan_val(arr, idx):
+                if arr is not None and len(arr) > idx:
+                    return round(float(arr[idx]), 1)
+                return 0.0
+
+            ice_charge = _plan_val(outputs.plan_ice_charge_kwh, step)
+            ice_discharge = _plan_val(outputs.plan_ice_discharge_kwh, step)
+            net_power = _plan_val(outputs.plan_net_power_kwh, step)
+            wkk_gas = _plan_val(outputs.plan_wkk_gas_m3, step)
+
+            cfg = SMPCConfig()  # defaults for efficiency calcs
+            wkk_elec = round(wkk_gas * cfg.gas_energy_kwh_m3 * cfg.wkk_elec_efficiency, 1)
+            wkk_heat = round(wkk_gas * cfg.gas_energy_kwh_m3 * cfg.wkk_heat_efficiency, 1)
+
+            d = {
+                "ice_bank_charge_kwh":     ice_charge,
+                "ice_bank_discharge_kwh":  ice_discharge,
+                "wkk_gas_setpoint_m3":     round(wkk_gas, 2),
+                "net_power_kwh":           net_power,
+                "wkk_elec_kwh":            wkk_elec,
+                "wkk_heat_kwh":            wkk_heat,
+                "smpc_cost_eur":           0.0,
+                "baseline_cost_eur":       0.0,
+                "cost_saving_eur":         0.0,
+                "ice_bank_next_kwh":       0.0,
+                "heat_buffer_next_kwh":    0.0,
+                "season":                  outputs.season,
+                "solver":                  outputs.solver_used,
+                "solve_time_ms":           round(outputs.solve_time_ms, 1),
+            }
+            for uid, sched in outputs.asset_schedules.items():
+                kw = round(float(sched[step]) * 4.0, 1) if len(sched) > step else 0.0
+                d[f"asset_{uid}_kw"] = kw
+            return d
+
+        d = {
             "ice_bank_charge_kwh":     round(outputs.ice_bank_charge_kwh,     1),
             "ice_bank_discharge_kwh":  round(outputs.ice_bank_discharge_kwh,  1),
             "wkk_gas_setpoint_m3":     round(outputs.wkk_gas_setpoint_m3,     2),
@@ -980,6 +1061,9 @@ class SMPCCalculator:
             "solver":                  outputs.solver_used,
             "solve_time_ms":           round(outputs.solve_time_ms,           1),
         }
+        for uid, kw in outputs.asset_power_kw.items():
+            d[f"asset_{uid}_kw"] = round(kw, 1)
+        return d
 
 
 # ===========================================================================

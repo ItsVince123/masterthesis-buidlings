@@ -98,6 +98,30 @@ QFrame#SectionDivider {
 # ---------------------------------------------------------------------------
 # Button styles
 # ---------------------------------------------------------------------------
+
+SLOT_SLIDER_STYLE = """
+QSlider::groove:horizontal {
+    border: 1px solid #cbd5e1;
+    height: 6px;
+    background: #e2e8f0;
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    background: #2563eb;
+    border: 2px solid #1d4ed8;
+    width: 16px;
+    height: 16px;
+    margin: -6px 0;
+    border-radius: 9px;
+}
+QSlider::handle:horizontal:hover {
+    background: #1d4ed8;
+}
+QSlider::sub-page:horizontal {
+    background: #93c5fd;
+    border-radius: 3px;
+}
+"""
 COLUMN_BUTTON_STYLE = """
 QPushButton {
     background-color: #2563eb;

@@ -22,8 +22,9 @@ def draw_series_graph(
     end_label: str,
     line_color: str,
     current_index: int | None = None,
+    selected_index: int | None = None,
     width: int = 420,
-    height: int = 170,
+    height: int = 200,
 ) -> QPixmap:
     """Render a line graph with unit and timestamp annotations.
 
@@ -74,24 +75,39 @@ def draw_series_graph(
         y = pad_t + i * draw_h / 4
         painter.drawLine(pad_l, int(y), width - pad_r, int(y))
 
-    # Data line
-    line_pen = QPen(QColor(line_color))
-    line_pen.setWidth(2)
-    painter.setPen(line_pen)
-    for i in range(n - 1):
-        painter.drawLine(
-            int(x_at(i)), int(y_at(values[i])),
-            int(x_at(i + 1)), int(y_at(values[i + 1])),
-        )
+    # Data step blocks (bar / column style)
+    slot_w = draw_w / max(n, 1)
+    bar_pen = QPen(QColor(line_color))
+    bar_pen.setWidth(2)
+    painter.setPen(bar_pen)
+    for i in range(n):
+        x0 = int(pad_l + i * slot_w)
+        x1 = int(pad_l + (i + 1) * slot_w)
+        y = int(y_at(values[i]))
+        painter.drawLine(x0, y, x1, y)
+        if i > 0:
+            y_prev = int(y_at(values[i - 1]))
+            painter.drawLine(x0, y_prev, x0, y)
 
     # "Now" marker
     if current_index is not None and 0 <= current_index < n:
         now_pen = QPen(QColor("#dc2626"))
         now_pen.setWidth(2)
         painter.setPen(now_pen)
-        x_now = int(x_at(current_index))
+        x_now = int(pad_l + current_index * slot_w)
         painter.drawLine(x_now, pad_t, x_now, height - pad_b)
         painter.drawText(x_now + 4, pad_t + 12, "Now")
+
+    # Selected slot marker (purple dashed line)
+    if selected_index is not None and selected_index > 0 and 0 <= selected_index < n:
+        sel_pen = QPen(QColor("#7c3aed"))
+        sel_pen.setWidth(2)
+        sel_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(sel_pen)
+        x_sel = int(pad_l + selected_index * slot_w)
+        painter.drawLine(x_sel, pad_t, x_sel, height - pad_b)
+        painter.setPen(QPen(QColor("#7c3aed")))
+        painter.drawText(x_sel + 4, pad_t + 12, "\u25bc")
 
     # Axis labels
     text_pen = QPen(QColor("#334155"))
@@ -114,10 +130,14 @@ def draw_price_graph(
     start_label: str,
     end_label: str,
     current_index: int | None = None,
+    selected_index: int | None = None,
+    width: int = 420,
+    height: int = 200,
 ) -> QPixmap:
     """Line graph styled for electricity prices (blue)."""
     return draw_series_graph(
         prices, "EUR/MWh", start_label, end_label, "#1d4ed8", current_index,
+        selected_index, width, height,
     )
 
 
@@ -126,10 +146,14 @@ def draw_solar_graph(
     start_label: str,
     end_label: str,
     current_index: int | None = None,
+    selected_index: int | None = None,
+    width: int = 420,
+    height: int = 200,
 ) -> QPixmap:
     """Line graph styled for solar power output (amber)."""
     return draw_series_graph(
         powers, "kW", start_label, end_label, "#f59e0b", current_index,
+        selected_index, width, height,
     )
 
 
