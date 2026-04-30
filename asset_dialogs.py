@@ -1,4 +1,13 @@
-"""Dialogs for adding, editing, and removing energy assets.
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  FRONTEND FILE — student is NOT responsible for this module      ║
+║                                                                  ║
+║  Dialogs for adding, editing, and removing energy assets via     ║
+║  a form UI.  Saving is delegated to energy_assets.save_assets()  ║
+║  (backend).                                                      ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Dialogs for adding, editing, and removing energy assets.
 
 Provides :class:`AssetManagerDialog` (list of all assets with add/edit/remove)
 and :class:`AssetEditorDialog` (form for a single asset's properties).
@@ -14,7 +23,8 @@ from PyQt6.QtWidgets import (
 )
 
 from energy_assets import (
-    ASSET_TYPES, FIXED_LOAD, GENERATOR, SHIFTABLE_LOAD, STORAGE,
+    ASSET_TYPES, FIXED_LOAD, GAS_HEATER, GENERATOR, HEAT_PUMP,
+    SHIFTABLE_LOAD, STORAGE,
     EnergyAsset, load_assets, save_assets, ensure_defaults,
 )
 
@@ -210,6 +220,32 @@ class AssetEditorDialog(QDialog):
         )
         sf.addRow("CSV column:", self._csv_col)
 
+        ramp_hdr = QLabel("Ramp Rate Constraints")
+        ramp_hdr.setStyleSheet("font-weight: 600; color: #475569; font-size: 9pt;")
+        sf.addRow(ramp_hdr)
+
+        self._ramp_up = QDoubleSpinBox()
+        self._ramp_up.setRange(0, 100)
+        self._ramp_up.setDecimals(1)
+        self._ramp_up.setSuffix(" %/hour")
+        self._ramp_up.setValue(self._asset.ramp_up_pct_per_hour)
+        self._ramp_up.setToolTip(
+            "Maximum ramp-up rate as percentage of hourly max\n"
+            "capacity per hour. 100% = no ramp constraint."
+        )
+        sf.addRow("Ramp up:", self._ramp_up)
+
+        self._ramp_down = QDoubleSpinBox()
+        self._ramp_down.setRange(0, 100)
+        self._ramp_down.setDecimals(1)
+        self._ramp_down.setSuffix(" %/hour")
+        self._ramp_down.setValue(self._asset.ramp_down_pct_per_hour)
+        self._ramp_down.setToolTip(
+            "Maximum ramp-down rate as percentage of hourly max\n"
+            "capacity per hour. 100% = no ramp constraint."
+        )
+        sf.addRow("Ramp down:", self._ramp_down)
+
         layout.addWidget(self._shift_frame)
 
         # ── Generator properties ────────────────────────────────────
@@ -268,6 +304,21 @@ class AssetEditorDialog(QDialog):
             "available (e.g. pure solar with separate CSV)."
         )
         gf.addRow("CSV column:", self._csv_gen_col)
+
+        cost_hdr = QLabel("Operational Costs")
+        cost_hdr.setStyleSheet("font-weight: 600; color: #475569; font-size: 9pt;")
+        gf.addRow(cost_hdr)
+
+        self._startup_cost = QDoubleSpinBox()
+        self._startup_cost.setRange(0, 100_000)
+        self._startup_cost.setDecimals(2)
+        self._startup_cost.setSuffix(" €")
+        self._startup_cost.setValue(self._asset.startup_cost_eur)
+        self._startup_cost.setToolTip(
+            "One-off cost each time this generator starts up.\n"
+            "Used to penalise frequent on/off cycling (e.g. CHP)."
+        )
+        gf.addRow("Startup cost:", self._startup_cost)
 
         layout.addWidget(self._gen_frame)
 
@@ -348,6 +399,141 @@ class AssetEditorDialog(QDialog):
 
         layout.addWidget(self._stor_frame)
 
+        # ── Gas heater properties ───────────────────────────────────
+        self._gas_frame = QFrame()
+        self._gas_frame.setObjectName("PropertyGroup")
+        ghf = QFormLayout(self._gas_frame)
+        ghf.setContentsMargins(0, 8, 0, 0)
+        ghf.setSpacing(8)
+
+        hdr5 = QLabel("Gas Heater Properties")
+        hdr5.setStyleSheet("font-weight: 700; color: #0b3a6e;")
+        ghf.addRow(hdr5)
+
+        self._thermal_output = QDoubleSpinBox()
+        self._thermal_output.setRange(0, 100_000)
+        self._thermal_output.setDecimals(1)
+        self._thermal_output.setSuffix(" kW")
+        self._thermal_output.setValue(self._asset.thermal_output_kw)
+        self._thermal_output.setToolTip("Rated thermal output.")
+        ghf.addRow("Thermal output:", self._thermal_output)
+
+        self._gas_eff = QDoubleSpinBox()
+        self._gas_eff.setRange(0, 100)
+        self._gas_eff.setDecimals(1)
+        self._gas_eff.setSuffix(" %")
+        self._gas_eff.setValue(self._asset.gas_efficiency * 100)
+        self._gas_eff.setToolTip("Thermal efficiency (HHV-based).")
+        ghf.addRow("Efficiency:", self._gas_eff)
+
+        self._gas_consumption = QDoubleSpinBox()
+        self._gas_consumption.setRange(0, 10_000)
+        self._gas_consumption.setDecimals(2)
+        self._gas_consumption.setSuffix(" m³/h")
+        self._gas_consumption.setValue(self._asset.gas_consumption_m3_per_hour)
+        self._gas_consumption.setToolTip("Maximum gas consumption rate.")
+        ghf.addRow("Gas rate:", self._gas_consumption)
+
+        layout.addWidget(self._gas_frame)
+
+        # ── Heat pump properties ────────────────────────────────────
+        self._hp_frame = QFrame()
+        self._hp_frame.setObjectName("PropertyGroup")
+        hpf = QFormLayout(self._hp_frame)
+        hpf.setContentsMargins(0, 8, 0, 0)
+        hpf.setSpacing(8)
+
+        hdr6 = QLabel("Heat Pump Properties")
+        hdr6.setStyleSheet("font-weight: 700; color: #0b3a6e;")
+        hpf.addRow(hdr6)
+
+        self._cop = QDoubleSpinBox()
+        self._cop.setRange(0.1, 20)
+        self._cop.setDecimals(2)
+        self._cop.setValue(self._asset.cop)
+        self._cop.setToolTip("Coefficient of performance (COP).")
+        hpf.addRow("COP:", self._cop)
+
+        self._hp_elec = QDoubleSpinBox()
+        self._hp_elec.setRange(0, 100_000)
+        self._hp_elec.setDecimals(1)
+        self._hp_elec.setSuffix(" kW")
+        self._hp_elec.setValue(self._asset.electrical_input_kw)
+        self._hp_elec.setToolTip("Rated electrical input power.")
+        hpf.addRow("Electrical input:", self._hp_elec)
+
+        self._hp_heating = QDoubleSpinBox()
+        self._hp_heating.setRange(0, 100_000)
+        self._hp_heating.setDecimals(1)
+        self._hp_heating.setSuffix(" kW")
+        self._hp_heating.setValue(self._asset.heating_capacity_kw)
+        self._hp_heating.setToolTip("Rated heating capacity.")
+        hpf.addRow("Heating capacity:", self._hp_heating)
+
+        self._hp_cooling = QDoubleSpinBox()
+        self._hp_cooling.setRange(0, 100_000)
+        self._hp_cooling.setDecimals(1)
+        self._hp_cooling.setSuffix(" kW")
+        self._hp_cooling.setValue(self._asset.cooling_capacity_kw)
+        self._hp_cooling.setToolTip("Rated cooling capacity (0 = heating only).")
+        hpf.addRow("Cooling capacity:", self._hp_cooling)
+
+        # Ground-source / BEO-veld toggle
+        hdr_beo = QLabel("Source & BEO-veld")
+        hdr_beo.setStyleSheet("font-weight: 700; color: #0b3a6e; margin-top: 8px;")
+        hpf.addRow(hdr_beo)
+
+        self._ground_source = QCheckBox("Ground-source (BEO-veld)")
+        self._ground_source.setChecked(self._asset.is_ground_source)
+        self._ground_source.setToolTip(
+            "Enable for ground-source heat pumps connected to a BEO-veld "
+            "(borehole energy storage). Disable for air-source."
+        )
+        self._ground_source.toggled.connect(self._on_ground_source_toggled)
+        hpf.addRow(self._ground_source)
+
+        self._beo_frame = QFrame()
+        beo_lay = QFormLayout(self._beo_frame)
+        beo_lay.setContentsMargins(8, 0, 0, 0)
+        beo_lay.setSpacing(6)
+
+        self._beo_capacity = QDoubleSpinBox()
+        self._beo_capacity.setRange(0, 10_000_000)
+        self._beo_capacity.setDecimals(0)
+        self._beo_capacity.setSuffix(" kWh")
+        self._beo_capacity.setValue(self._asset.beo_capacity_kwh)
+        self._beo_capacity.setToolTip("Total thermal storage capacity of the BEO-veld.")
+        beo_lay.addRow("BEO capacity:", self._beo_capacity)
+
+        self._beo_extraction = QDoubleSpinBox()
+        self._beo_extraction.setRange(0, 100_000)
+        self._beo_extraction.setDecimals(1)
+        self._beo_extraction.setSuffix(" kW")
+        self._beo_extraction.setValue(self._asset.beo_extraction_rate_kw)
+        self._beo_extraction.setToolTip("Max heat extraction rate from ground.")
+        beo_lay.addRow("Extraction rate:", self._beo_extraction)
+
+        self._beo_injection = QDoubleSpinBox()
+        self._beo_injection.setRange(0, 100_000)
+        self._beo_injection.setDecimals(1)
+        self._beo_injection.setSuffix(" kW")
+        self._beo_injection.setValue(self._asset.beo_injection_rate_kw)
+        self._beo_injection.setToolTip("Max heat injection rate into ground.")
+        beo_lay.addRow("Injection rate:", self._beo_injection)
+
+        self._beo_temp = QDoubleSpinBox()
+        self._beo_temp.setRange(-10, 50)
+        self._beo_temp.setDecimals(1)
+        self._beo_temp.setSuffix(" °C")
+        self._beo_temp.setValue(self._asset.beo_initial_temp_c)
+        self._beo_temp.setToolTip("Initial ground temperature of the BEO-veld.")
+        beo_lay.addRow("Ground temp:", self._beo_temp)
+
+        hpf.addRow(self._beo_frame)
+        self._beo_frame.setVisible(self._asset.is_ground_source)
+
+        layout.addWidget(self._hp_frame)
+
         # ── Buttons ─────────────────────────────────────────────────
         btns = QHBoxLayout()
         btns.setSpacing(10)
@@ -373,6 +559,11 @@ class AssetEditorDialog(QDialog):
         self._gen_frame.setVisible(current == GENERATOR)
         self._fixed_frame.setVisible(current == FIXED_LOAD)
         self._stor_frame.setVisible(current == STORAGE)
+        self._gas_frame.setVisible(current == GAS_HEATER)
+        self._hp_frame.setVisible(current == HEAT_PUMP)
+
+    def _on_ground_source_toggled(self, checked: bool):
+        self._beo_frame.setVisible(checked)
 
     def _on_save(self):
         name = self._name.text().strip()
@@ -389,6 +580,8 @@ class AssetEditorDialog(QDialog):
             self._asset.csv_column = self._csv_col.text().strip()
             self._asset.hourly_max_kwh = self._hourly_max.value()
             self._asset.daily_energy_kwh = self._shift_daily.value()
+            self._asset.ramp_up_pct_per_hour = self._ramp_up.value()
+            self._asset.ramp_down_pct_per_hour = self._ramp_down.value()
         elif atype == GENERATOR:
             self._asset.capacity_kwp = self._capacity.value()
             self._asset.solar_csv = self._solar_csv.text().strip()
@@ -397,6 +590,7 @@ class AssetEditorDialog(QDialog):
             self._asset.decouple_below_eur_mwh = (
                 None if decouple_val <= -10_000 else decouple_val
             )
+            self._asset.startup_cost_eur = self._startup_cost.value()
         elif atype == FIXED_LOAD:
             self._asset.csv_column = self._fixed_csv_col.text().strip()
             self._asset.daily_energy_kwh = self._daily_energy.value()
@@ -405,6 +599,21 @@ class AssetEditorDialog(QDialog):
             self._asset.charge_rate_kw = self._charge_rate.value()
             self._asset.discharge_rate_kw = self._discharge_rate.value()
             self._asset.efficiency = self._efficiency.value() / 100.0
+        elif atype == GAS_HEATER:
+            self._asset.thermal_output_kw = self._thermal_output.value()
+            self._asset.gas_efficiency = self._gas_eff.value() / 100.0
+            self._asset.gas_consumption_m3_per_hour = self._gas_consumption.value()
+        elif atype == HEAT_PUMP:
+            self._asset.cop = self._cop.value()
+            self._asset.electrical_input_kw = self._hp_elec.value()
+            self._asset.heating_capacity_kw = self._hp_heating.value()
+            self._asset.cooling_capacity_kw = self._hp_cooling.value()
+            self._asset.is_ground_source = self._ground_source.isChecked()
+            if self._asset.is_ground_source:
+                self._asset.beo_capacity_kwh = self._beo_capacity.value()
+                self._asset.beo_extraction_rate_kw = self._beo_extraction.value()
+                self._asset.beo_injection_rate_kw = self._beo_injection.value()
+                self._asset.beo_initial_temp_c = self._beo_temp.value()
         self.accept()
 
     def get_asset(self) -> EnergyAsset:

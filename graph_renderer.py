@@ -1,4 +1,12 @@
-"""Graph rendering functions using QPainter on QPixmap.
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  FRONTEND FILE — student is NOT responsible for this module      ║
+║                                                                  ║
+║  All graph rendering via QPainter on QPixmap.                    ║
+║  Pure display logic — no calculations here.                      ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Graph rendering functions using QPainter on QPixmap.
 
 All functions are stateless: they accept data arrays and return a QPixmap
 ready to be set on a QLabel via ``label.setPixmap(pixmap)``.

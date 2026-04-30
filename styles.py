@@ -1,4 +1,12 @@
-"""QSS stylesheet definitions for the Dashboard UI.
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  FRONTEND FILE — student is NOT responsible for this module      ║
+║                                                                  ║
+║  QSS stylesheet strings.  All visual appearance is defined here  ║
+║  (colours, fonts, border-radius, spacing).                       ║
+╚══════════════════════════════════════════════════════════════════╝
+
+QSS stylesheet definitions for the Dashboard UI.
 
 Keeping all styling in one place makes it easy to adjust colours, fonts, and
 spacing without digging through widget code.
@@ -148,6 +156,20 @@ QPushButton {
 }
 QPushButton:hover  { background-color: #0e4d8f; }
 QPushButton:pressed { background-color: #072a50; }
+"""
+
+FUTURE_BUTTON_STYLE = """
+QPushButton {
+    background-color: #166534;
+    color: white;
+    border: 1px solid #14532d;
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 10pt;
+    font-weight: 700;
+}
+QPushButton:hover  { background-color: #15803d; }
+QPushButton:pressed { background-color: #14532d; }
 """
 
 # ---------------------------------------------------------------------------

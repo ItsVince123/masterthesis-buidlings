@@ -1,4 +1,13 @@
-"""Predict solar yield from weather CSV and export to predict.csv.
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  BACKEND FILE — student is responsible for this module           ║
+║                                                                  ║
+║  Solar yield prediction model.                                   ║
+║  Converts weather observations (UV index + temperature) into     ║
+║  PV power estimates using a physics-inspired proxy model.        ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Predict solar yield from weather CSV and export to predict.csv.
 
 The model uses UV index as a proxy for irradiance and applies a temperature
 derating factor for panel efficiency.
@@ -86,10 +95,27 @@ def read_weather_csv(path: Path) -> list[WeatherRow]:
 def predict_power_kw(row: WeatherRow, capacity_kwp: float) -> float:
     """Estimate instantaneous PV power (kW) from weather conditions.
 
-    Assumptions
+    SOLAR MODEL
     -----------
-    * UV index mapped to irradiance proxy via normalised factor ``uv / 8``.
-    * Temperature derating of ``-0.4 %/\u00b0C`` above 25 \u00b0C, clamped at 75 %.
+    PV power is estimated using two factors:
+
+    1. IRRADIANCE PROXY:
+       UV index is used as a proxy for solar irradiance (GHI).
+       Mapping: UV 8 ≈ 1000 W/m² (full sun) → factor = 1.0
+                UV 0 → factor = 0.0 (no production)
+       Formula: irradiance_factor = clip(UV / 8.0, 0, 1)
+
+    2. TEMPERATURE DERATING:
+       PV panels lose efficiency when hot.  Standard rating is at 25°C.
+       Above 25°C: -0.4%/°C (typical silicon panel temperature coefficient)
+       The derate is clamped at 75% (worst case at ~87.5°C, unrealistic).
+       Formula: temp_derate = max(0.75, 1 - max(0, T - 25) × 0.004)
+
+    Combined:
+       power_kw = capacity_kwp × irradiance_factor × temp_derate
+
+    LIMITATIONS: This is a simplified proxy model.  A production-grade
+    system would use measured GHI/DNI data and a PVWatts or PVLIB model.
     """
     irradiance_factor = max(0.0, min(row.uv_index / 8.0, 1.0))
     temp_derate = 1.0 - max(0.0, row.temperature_c - 25.0) * 0.004

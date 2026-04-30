@@ -1,4 +1,12 @@
-"""Main Dashboard window — Building Management System.
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  FRONTEND FILE — student is NOT responsible for this module      ║
+║                                                                  ║
+║  Main PyQt6 window.  Contains only UI layout, widget wiring,    ║
+║  and display logic.  All calculations happen in the backend.     ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Main Dashboard window — Building Management System.
 
 Run with::
 
@@ -32,12 +40,14 @@ from asset_dialogs import AssetManagerDialog
 from dashboard_config import load_dashboard_config
 from data_manager import DataManager, current_slot
 from graph_renderer import draw_price_graph, draw_solar_graph
+from future_dialog import FutureSimulationDialog
 from historical_dialog import HistoricalAnalysisDialog
+from thermal_dialog import BuildingThermalDialog
 from settings import INTERVAL_MINUTES, LOCAL_TZ
 from smpc_calculator import SMPCCalculator
 from styles import (
-    COLUMN_BUTTON_STYLE, HISTORICAL_BUTTON_STYLE, MAIN_WINDOW_STYLE,
-    SLOT_SLIDER_STYLE, value_css,
+    COLUMN_BUTTON_STYLE, FUTURE_BUTTON_STYLE, HISTORICAL_BUTTON_STYLE,
+    MAIN_WINDOW_STYLE, SLOT_SLIDER_STYLE, value_css,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,11 +122,20 @@ class ScadaWindow(QMainWindow):
         self.slot_label = None
 
     def _init_data(self):
-        """Create the DataManager (handles all fetching and caching)."""
+        """Create the DataManager (handles all fetching and caching).
+
+        BACKEND CALL: DataManager lives in data_manager.py (backend).
+        The dashboard never fetches data directly — it only reads from this object.
+        """
         self.data = DataManager()
 
     def _init_lp(self):
-        """Create the LP calculator and load building parameters."""
+        """Create the LP calculator and load building parameters.
+
+        BACKEND CALL: SMPCCalculator lives in smpc_calculator.py (backend).
+        Building parameters (base_load_kw, peak_load_kw) come from
+        dashboard_config.json → 'smpc' → 'building'.
+        """
         raw = load_dashboard_config()
         building = raw.get("smpc", {}).get("building", {})
 
@@ -126,6 +145,11 @@ class ScadaWindow(QMainWindow):
 
         self.base_load_kw = building.get("base_load_kw", 80)
         self.peak_load_kw = building.get("peak_load_kw", 200)
+
+        # Building thermal state
+        thermal = building.get("thermal", {})
+        self._building_temp_c = thermal.get("initial_temp_c", 21.0)
+        self._building_setpoint_c = thermal.get("setpoint_c", 21.0)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -260,6 +284,7 @@ class ScadaWindow(QMainWindow):
         self._register_definitions("output", norm_out)
 
         self._add_price_widgets(self.input_content)
+        self._add_thermal_widgets(self.input_content)
         self._add_grouped_tags(
             self.input_content,
             self._group_by_section(norm_in, "INPUTS"),
@@ -369,7 +394,7 @@ class ScadaWindow(QMainWindow):
         sl.addLayout(slider_header)
 
         self.slot_slider = QSlider(Qt.Orientation.Horizontal)
-        self.slot_slider.setMinimum(0)
+        self.slot_slider.setMinimum(-96)
         self.slot_slider.setMaximum(191)
         self.slot_slider.setValue(0)
         self.slot_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
@@ -397,6 +422,24 @@ class ScadaWindow(QMainWindow):
         hist_btn.clicked.connect(self._open_historical)
         lay.addWidget(hist_btn)
 
+        # Future simulation button
+        future_btn = QPushButton("Future LP Simulation")
+        future_btn.setMinimumHeight(44)
+        future_btn.setStyleSheet(FUTURE_BUTTON_STYLE)
+        future_btn.clicked.connect(self._open_future)
+        lay.addWidget(future_btn)
+
+        # Building thermal settings button
+        thermal_btn = QPushButton("\U0001f321\ufe0f  Building Thermal Settings")
+        thermal_btn.setMinimumHeight(44)
+        thermal_btn.setStyleSheet(
+            "QPushButton { background: #7c3aed; color: white; border: none; "
+            "border-radius: 8px; font-weight: 700; font-size: 10pt; } "
+            "QPushButton:hover { background: #6d28d9; }"
+        )
+        thermal_btn.clicked.connect(self._open_thermal_settings)
+        lay.addWidget(thermal_btn)
+
         lay.addStretch()
 
         scroll.setWidget(content)
@@ -411,12 +454,24 @@ class ScadaWindow(QMainWindow):
             self.slot_label.setStyleSheet(value_css("#0e7490"))
         else:
             from datetime import timedelta
-            future = current_slot() + timedelta(minutes=value * INTERVAL_MINUTES)
-            self.slot_label.setText(future.strftime("%H:%M"))
-            self.slot_label.setStyleSheet(value_css("#7c3aed"))
+            target = current_slot() + timedelta(minutes=value * INTERVAL_MINUTES)
+            self.slot_label.setText(target.strftime("%H:%M"))
+            if value < 0:
+                self.slot_label.setStyleSheet(value_css("#94a3b8"))
+            else:
+                self.slot_label.setStyleSheet(value_css("#7c3aed"))
         self._update_tag_labels()
         self._update_price_for_slot()
         self._update_center()
+
+    def wheelEvent(self, event):
+        """Scroll wheel adjusts the time-slot slider."""
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return super().wheelEvent(event)
+        step = 1 if delta > 0 else -1
+        self.slot_slider.setValue(self.slot_slider.value() + step)
+        event.accept()
 
     # ------------------------------------------------------------------
     # Reusable widget builders
@@ -489,6 +544,21 @@ class ScadaWindow(QMainWindow):
             container, "\U0001f506  Actual Yield", "-- kWh",
         )
         self._update_clock()
+
+    def _add_thermal_widgets(self, container):
+        """Add building temperature, setpoint, and BEO-veld info rows."""
+        self.building_temp_label = self._info_row(
+            container, "\U0001f321\ufe0f  Building temp", "-- °C",
+        )
+        self.building_setpoint_label = self._info_row(
+            container, "\U0001f3af  Setpoint", "-- °C",
+        )
+        self.heating_power_label = self._info_row(
+            container, "\U0001f525  Heating", "-- kW",
+        )
+        self.beo_temp_label = self._info_row(
+            container, "\U0001f30d  BEO-veld", "-- °C",
+        )
 
     # ------------------------------------------------------------------
     # Tag handling
@@ -603,18 +673,27 @@ class ScadaWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _start_timer(self):
+        """Start the 1-second tick timer that drives all live updates."""
         self.timer = QTimer()
         self.timer.timeout.connect(self._on_tick)
         self.timer.start(1000)
 
     # ------------------------------------------------------------------
-    # Main tick (called every second)
+    # Main tick (called every second by QTimer)
     # ------------------------------------------------------------------
 
     def _on_tick(self):
+        """Central update loop — runs every second.
+
+        ORDER OF OPERATIONS (important):
+        1. Update clock display (cheap, always runs)
+        2. DataManager.tick() — check if data refresh is due (backend)
+        3. _run_lp_if_needed() — run backend LP solver if we're in a new slot
+        4. _update_all_widgets() — propagate results to the UI labels (frontend)
+        """
         self._update_clock()
-        self.data.tick()
-        self._run_lp_if_needed()
+        self.data.tick()               # may refresh prices/predictions/weather
+        self._run_lp_if_needed()       # runs once per 15-min slot
         self._update_all_widgets()
 
     # ------------------------------------------------------------------
@@ -626,6 +705,7 @@ class ScadaWindow(QMainWindow):
         self._update_predict_labels()
         self._update_center()
         self._update_tag_labels()
+        self._update_thermal_labels()
 
     def _update_price_labels(self):
         dm = self.data
@@ -666,6 +746,39 @@ class ScadaWindow(QMainWindow):
         if self.actual_yield_label:
             self.actual_yield_label.setText("-- kWh")
             self.actual_yield_label.setStyleSheet(value_css("#64748b"))
+
+    def _update_thermal_labels(self):
+        """Update building temperature display from LP outputs."""
+        out = self.last_lp_outputs
+        if out is not None:
+            temp = out.building_temp_c
+            sp = out.building_setpoint_c
+            heat = out.heating_power_kw
+            beo = out.beo_temp_c
+
+            # Temperature colour: green=OK, orange=near limit, red=out of band
+            diff = abs(temp - sp)
+            if diff < 1.0:
+                colour = "#16a34a"
+            elif diff < 2.0:
+                colour = "#f59e0b"
+            else:
+                colour = "#dc2626"
+
+            self.building_temp_label.setText(f"{temp:.1f} °C")
+            self.building_temp_label.setStyleSheet(value_css(colour))
+
+            self.building_setpoint_label.setText(f"{sp:.1f} °C")
+            self.building_setpoint_label.setStyleSheet(value_css("#0f766e"))
+
+            heat_colour = "#dc2626" if heat > 0 else "#64748b"
+            self.heating_power_label.setText(
+                f"{heat:.1f} kW" if heat > 0 else "Off"
+            )
+            self.heating_power_label.setStyleSheet(value_css(heat_colour))
+
+            self.beo_temp_label.setText(f"{beo:.1f} °C")
+            self.beo_temp_label.setStyleSheet(value_css("#0f766e"))
 
     # ------------------------------------------------------------------
     # Centre panel updates
@@ -763,20 +876,36 @@ class ScadaWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _run_lp_if_needed(self):
+        """Run the LP solver at the start of each new 15-minute interval.
+
+        BACKEND CALL: SMPCCalculator.solve_lp() in smpc_calculator.py.
+
+        This implements the RECEDING HORIZON principle of MPC:
+          - At every 15-min slot boundary, re-solve the full 24 h problem.
+          - Execute only the FIRST-step command (self.last_lp_outputs.* at step 0).
+          - Repeat at the next slot with fresh measurements and forecasts.
+
+        Input data flow:
+          DataManager.build_price_forecast() → EUR/kWh array [96 steps]
+          DataManager.build_load_and_solar() → (base_load_kwh, solar_kwh) arrays
+          SMPCCalculator.solve_lp()          → SMPCOutputs (schedules + KPIs)
+        """
         slot = current_slot()
         if self.lp_last_slot == slot:
-            return
+            return                     # already solved for this interval
         self.lp_last_slot = slot
 
-        H = self.lp.cfg.horizon_steps
+        H = self.lp.cfg.horizon_steps          # 96 steps = 24 hours
         month = datetime.now(LOCAL_TZ).month
 
+        # Build forecasts from cached data (backend call)
         price_fc = self.data.build_price_forecast(slot, H)
         base_load, solar_kwh = self.data.build_load_and_solar(
             slot, H, self.base_load_kw, self.peak_load_kw,
         )
 
         try:
+            # ── BACKEND CALL: run the greedy LP optimiser ──────────
             self.last_lp_outputs = self.lp.solve_lp(
                 price_forecast_eur_kwh=price_fc,
                 base_load_kwh=base_load,
@@ -791,7 +920,23 @@ class ScadaWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _sim_value(self, defn):
-        """Determine the display text and colour for a single tag."""
+        """Determine the display text and colour for a single tag.
+
+        Reads from self.last_lp_outputs (set by _run_lp_if_needed) and from
+        self.data (DataManager).  Each tag has a 'mode' that selects
+        which backend field to read:
+
+        Modes:
+          predicted_solar  — reads PV power from DataManager.predictions
+          smpc             — reads a numeric KPI from SMPCOutputs
+          smpc_state       — reads a state string (ON/OFF/CHARGE/etc.)
+          smpc_ice_status  — reads ice bank charge/discharge state
+          smpc_setpoint    — reads a setpoint value
+          asset_power      — reads per-asset kW from asset_schedules
+
+        IMPORTANT: this method only READS the outputs; all calculations
+        are done in the backend (smpc_calculator.py / data_manager.py).
+        """
         sim = defn.get("simulation", {}) if isinstance(defn, dict) else {}
         mode = str(sim.get("mode", "")).strip().lower()
 
@@ -934,6 +1079,18 @@ class ScadaWindow(QMainWindow):
 
     def _open_historical(self):
         HistoricalAnalysisDialog(self).exec()
+
+    def _open_future(self):
+        FutureSimulationDialog(self).exec()
+
+    def _open_thermal_settings(self):
+        dlg = BuildingThermalDialog(self)
+        if dlg.exec():
+            # Reload thermal config into running state
+            cfg = load_dashboard_config()
+            th = cfg.get("smpc", {}).get("building", {}).get("thermal", {})
+            self._building_setpoint_c = th.get("setpoint_c", 21.0)
+            self._building_temp_c = th.get("initial_temp_c", 21.0)
 
     def _open_popup(self, key):
         dlg = AssetManagerDialog(category=key, parent=self)

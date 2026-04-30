@@ -1,4 +1,13 @@
-"""Historical LP cost-analysis dialog.
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  FRONTEND FILE — student is NOT responsible for this module      ║
+║                                                                  ║
+║  Historical analysis dialog.  UI glue only: date picker,        ║
+║  graph display, KPI table.  All simulation logic is in           ║
+║  lp_solver.simulate_day() (backend).                             ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Historical LP cost-analysis dialog.
 
 Loads hourly building data from ``DATA.csv`` and runs a deterministic LP
 for ice bank charge scheduling, comparing baseline vs LP-optimised cost.
@@ -20,7 +29,7 @@ from datetime import date, timedelta
 import numpy as np
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtWidgets import (
-    QApplication, QDateEdit, QDialog, QFrame, QHBoxLayout,
+    QApplication, QDateEdit, QDialog, QFileDialog, QFrame, QHBoxLayout,
     QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
@@ -71,6 +80,11 @@ class HistoricalAnalysisDialog(QDialog):
         # CO2 intensity data (loaded lazily)
         self._co2_data: dict[str, list[float]] | None = None
 
+        # Last simulation results (for CSV export)
+        self._last_results: dict | None = None
+        self._last_day_str: str = ""
+        self._last_day_rows: list[dict] = []
+
         # Energy asset config (loaded fresh each time dialog opens)
         self._assets: list[EnergyAsset] = load_assets()
         if not self._assets:
@@ -120,10 +134,18 @@ class HistoricalAnalysisDialog(QDialog):
         year_btn.clicked.connect(self._run_year_analysis)
         self._year_btn = year_btn
 
+        export_btn = QPushButton("Export CSV")
+        export_btn.setMinimumHeight(36)
+        export_btn.setStyleSheet(RUN_ANALYSIS_BUTTON_STYLE)
+        export_btn.clicked.connect(self._export_csv)
+        export_btn.setEnabled(False)
+        self._export_btn = export_btn
+
         sel.addWidget(lbl)
         sel.addWidget(self.date_edit, stretch=1)
         sel.addWidget(run_btn)
         sel.addWidget(year_btn)
+        sel.addWidget(export_btn)
         top_lay.addLayout(sel)
 
         self.status_label = QLabel("Pick a date and click 'Run Analysis'")
@@ -253,6 +275,11 @@ class HistoricalAnalysisDialog(QDialog):
             return
 
         # 3. Run LP optimisation
+        # ── BACKEND CALL: lp_solver.simulate_day() ──────────────────
+        # This is where the actual optimisation happens.
+        # simulate_day() runs greedy_lp() for each shiftable load and
+        # compares the rescheduled cost to the historical (baseline) cost.
+        # The dialog only displays the results — it contains no calculations.
         self.status_label.setText(
             f"Running LP optimisation ({len(day_rows)} hourly slots)\u2026"
         )
@@ -292,6 +319,12 @@ class HistoricalAnalysisDialog(QDialog):
         self._display_kpis_csv(day_str, results)
         self.status_label.setText(f"Analysis complete for {day_str}.")
 
+        # Store for CSV export
+        self._last_results = results
+        self._last_day_str = day_str
+        self._last_day_rows = day_rows
+        self._export_btn.setEnabled(True)
+
     def _clear_results(self):
         """Reset all result widgets to their initial empty state."""
         self.graph_label.clear()
@@ -303,6 +336,87 @@ class HistoricalAnalysisDialog(QDialog):
                 "font-family: 'Consolas'; font-weight: 700;"
                 " color: #0f766e; border: none;"
             )
+
+    # ------------------------------------------------------------------
+    # CSV export
+    # ------------------------------------------------------------------
+
+    def _export_csv(self):
+        """Export last simulation results to a CSV file with decision log."""
+        if self._last_results is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Results", f"historical_{self._last_day_str}.csv",
+            "CSV Files (*.csv)",
+        )
+        if not path:
+            return
+
+        r = self._last_results
+        n = r["n_slots"]
+        timestamps = [row["timestamp"] for row in self._last_day_rows[:n]]
+
+        lines: list[str] = []
+        # Header
+        lines.append(
+            "Timestamp;Baseline_Cost_EUR;Optimised_Cost_EUR;"
+            "Baseline_Load_kWh;Optimised_Load_kWh;"
+            "Baseline_Grid_kWh;Optimised_Grid_kWh;"
+            "Price_EUR_MWh;Decision"
+        )
+        for i in range(n):
+            bl_cost = r["baseline"][i]
+            opt_cost = r["optimised"][i]
+            bl_load = r["baseline_load_kwh"][i]
+            opt_load = r["optimised_load_kwh"][i]
+            bl_grid = r["baseline_grid_kwh"][i]
+            opt_grid = r["optimised_grid_kwh"][i]
+            price = r["prices_elec"][i]
+
+            # Decision explanation
+            delta_load = opt_load - bl_load
+            if abs(delta_load) < 0.01:
+                decision = "No change"
+            elif delta_load > 0:
+                decision = f"Shifted +{delta_load:.1f} kWh here (cheap hour)"
+            else:
+                decision = f"Shifted {delta_load:.1f} kWh away (expensive hour)"
+
+            lines.append(
+                f"{timestamps[i]};{bl_cost:.4f};{opt_cost:.4f};"
+                f"{bl_load:.2f};{opt_load:.2f};"
+                f"{bl_grid:.2f};{opt_grid:.2f};"
+                f"{price:.2f};{decision}"
+            )
+
+        # Summary section
+        total_bl = float(r["baseline"].sum())
+        total_opt = float(r["optimised"].sum())
+        saving = total_bl - total_opt
+        lines.append("")
+        lines.append("# Summary")
+        lines.append(f"# Date;{self._last_day_str}")
+        lines.append(f"# Baseline total;EUR {total_bl:.2f}")
+        lines.append(f"# Optimised total;EUR {total_opt:.2f}")
+        lines.append(f"# Saving;EUR {saving:.2f}")
+        lines.append(f"# Load shifted;{r['load_shifted']:.1f} kWh")
+        lines.append(f"# Generation;{r['total_generation']:.1f} kWh")
+        startup = r.get("startup_cost", 0.0)
+        if startup > 0:
+            lines.append(f"# Startup costs;EUR {startup:.2f}")
+        lines.append("")
+        lines.append("# Decision logic: The LP schedules shiftable loads")
+        lines.append("# (e.g. ice banks) to the cheapest hours while")
+        lines.append("# respecting daily energy and ramp-rate constraints.")
+        lines.append("# Generators reduce grid draw; startup costs are")
+        lines.append("# incurred on each off-to-on transition.")
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            self.status_label.setText(f"Exported to {path}")
+        except OSError as exc:
+            self.status_label.setText(f"Export failed: {exc}")
 
     # ------------------------------------------------------------------
     # Solar CSV cache helper

@@ -1,4 +1,13 @@
-"""Fetch grid CO2 intensity (gCO2eq/kWh) for the Belgian zone.
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  BACKEND FILE — student is responsible for this module           ║
+║                                                                  ║
+║  Grid CO2 intensity calculator.                                  ║
+║  Fetches actual generation mix per fuel type from ENTSO-E and   ║
+║  converts to CO2 intensity using IPCC lifecycle emission factors.║
+╚══════════════════════════════════════════════════════════════════╝
+
+Fetch grid CO2 intensity (gCO2eq/kWh) for the Belgian zone.
 
 Data source: ENTSO-E Transparency Platform — Actual Generation per Type
 (document type ``A75``).  The generation mix is converted to CO2 intensity

@@ -1,4 +1,12 @@
 """
+╔══════════════════════════════════════════════════════════════════╗
+║  BACKEND FILE — student is responsible for this module           ║
+║                                                                  ║
+║  THIS IS THE CORE THESIS ALGORITHM                               ║
+║  Stochastic Model Predictive Control (SMPC) optimiser for        ║
+║  building energy management.                                     ║
+╚══════════════════════════════════════════════════════════════════╝
+
 smpc_calculator.py — SMPC Live Calculator
 ==========================================
 Single-solve Stochastic MPC that the dashboard calls every control interval.
@@ -116,6 +124,13 @@ class SMPCConfig:
     winter_months:  tuple = (11, 12, 1, 2, 3)
     # April and October are treated as transition months
 
+    # --- Building thermal model ---------------------------------------------
+    building_setpoint_c:        float =  21.0   # Target indoor temperature [°C]
+    building_deadband_c:        float =   1.0   # Acceptable deviation ± [°C]
+    building_initial_temp_c:    float =  21.0   # Start temperature when dashboard boots
+    cooldown_rate_c_per_hour:   float =   0.5   # Natural heat loss rate [°C/h]
+    thermal_mass_kwh_per_c:     float = 500.0   # Thermal inertia: kWh to raise building 1 °C
+
     # -----------------------------------------------------------------------
 
     @classmethod
@@ -186,6 +201,14 @@ class SMPCConfig:
 
         # building
         d.wkk_max_gas_m3 = float(_get("building", "wkk_max_gas_m3", d.wkk_max_gas_m3))
+
+        # building thermal model
+        thermal = smpc_block.get("building", {}).get("thermal", {})
+        d.building_setpoint_c      = float(thermal.get("setpoint_c",              d.building_setpoint_c))
+        d.building_deadband_c      = float(thermal.get("deadband_c",              d.building_deadband_c))
+        d.building_initial_temp_c  = float(thermal.get("initial_temp_c",          d.building_initial_temp_c))
+        d.cooldown_rate_c_per_hour = float(thermal.get("cooldown_rate_c_per_hour", d.cooldown_rate_c_per_hour))
+        d.thermal_mass_kwh_per_c   = float(thermal.get("thermal_mass_kwh_per_c",  d.thermal_mass_kwh_per_c))
 
         return d
 
@@ -314,6 +337,12 @@ class SMPCOutputs:
     solver_status: str = "unknown"
     solve_time_ms: float = 0.0
 
+    # --- Building thermal state ---------------------------------------------
+    building_temp_c:     float = 21.0    # Current simulated indoor temperature [°C]
+    building_setpoint_c: float = 21.0    # Target setpoint [°C]
+    heating_power_kw:    float = 0.0     # Total active heating this step [kW]
+    beo_temp_c:          float = 12.0    # BEO-veld ground temperature [°C]
+
 
 # ===========================================================================
 # SECTION 3: PRICE SCENARIO GENERATOR
@@ -329,8 +358,20 @@ def _generate_price_scenarios(
     """
     Generate N correlated price scenarios around the base forecast.
 
-    Uses a simple AR(1) log-normal model.  In production, replace with
-    ENTSO-E DAM distributions or an ARIMA/GARCH fit on historical EPEX data.
+    MODEL: AR(1) log-normal noise on top of the deterministic forecast.
+
+    For each scenario s and time step t:
+        noise[t] = ρ · noise[t-1] + σ_corr · ε_t       (AR(1) process)
+        scenario[s, t] = base_forecast[t] · exp(noise[t])
+
+    where:
+        ρ           = autocorrelation coefficient (persistence of noise)
+        σ_corr      = volatility × sqrt(1 - ρ²)         (innovations std)
+        ε_t ~ N(0,1) i.i.d.
+
+    The exp() ensures prices stay positive (log-normal distribution).
+    In production, replace with ENTSO-E DAM distributions or an ARIMA/GARCH
+    fit on historical EPEX data for better accuracy.
 
     Returns shape (n_scenarios, horizon_steps), all values ≥ 0.
     """
@@ -354,7 +395,7 @@ def _generate_price_scenarios(
 # ===========================================================================
 
 
-from lp_solver import greedy_lp as _greedy_lp
+from lp_solver import greedy_lp as _greedy_lp, greedy_lp_ramped as _greedy_lp_ramped, simulate_building_thermal as _simulate_thermal
 
 
 def _optimise_summer_cvxpy(
@@ -364,12 +405,36 @@ def _optimise_summer_cvxpy(
     cfg: SMPCConfig,
 ) -> dict:
     """
-    Convex QP for summer ice-bank optimisation.
+    Convex QP for summer ice-bank optimisation (uses cvxpy).
 
-    Minimises:
-        J = w_energy  × Σ mean_price × P_net
-          + w_peak    × Σ slack²              (soft peak constraint)
-          + w_buffer  × (buffer_end − target)²
+    PROBLEM FORMULATION
+    -------------------
+    Decision variables:
+        u_charge[t]    — electrical energy drawn to charge ice bank [kWh]
+        u_discharge[t] — thermal energy released from ice bank [kWh]
+        slack[t]       — peak constraint violation (soft, penalised) [kWh]
+
+    State evolution (ice bank state of energy, SOE):
+        soe[t] = ice_bank_kwh + Σ_{k=0}^{t} (u_charge[k]·η - u_discharge[k])
+    Implemented via cumsum for numerical efficiency.
+
+    Objective (minimise):
+        J = w_energy  × Σ_t total_price[t] · P_net[t]     (energy cost)
+          + w_peak    × Σ_t slack[t]²                       (soft peak penalty)
+          + w_buffer  × (soe[H-1] - target)²                (end-of-horizon penalty)
+
+    where:
+        total_price[t] = spot_price[t] + grid_fee             (EUR/kWh)
+        P_net[t]       = consumption[t] + u_charge[t] - u_discharge[t]
+        target         = capacity × target_soc_fraction
+
+    Constraints:
+        0 ≤ u_charge[t]    ≤ ice_charge_max_kwh
+        0 ≤ u_discharge[t] ≤ ice_discharge_max_kwh
+        ice_bank_min_kwh   ≤ soe[t] ≤ ice_bank_capacity_kwh
+        P_net[t]           ≤ peak_limit_kwh + slack[t]   (soft, slack ≥ 0)
+
+    SOLVER: CLARABEL (first choice, fast exact QP), falls back to SCS.
     """
     H = len(mean_price)
     u_charge    = cp.Variable(H, nonneg=True)
@@ -498,13 +563,34 @@ def _optimise_winter_cvxpy(
     cfg: SMPCConfig,
 ) -> dict:
     """
-    Convex QP for winter WKK optimisation.
+    Convex QP for winter WKK / CHP optimisation (uses cvxpy).
 
-    Minimises:
-        J = Σ gas_cost  −  Σ electricity_revenue  +  w_comfort × Σ heat_shortfall²
+    PROBLEM FORMULATION
+    -------------------
+    Decision variables:
+        u_gas[t]      — gas burned per interval [m³]
+        heat_slack[t] — unmet heat demand (comfort penalty) [kWh]
 
-    WKK runs when spark spread (electricity revenue − gas cost per m³) > threshold.
-    Heat buffer absorbs excess heat; prevents WKK from over-running.
+    Derived quantities:
+        heat_prod[t]  = u_gas[t] × calorific_value × heat_efficiency  [kWh heat]
+        elec_prod[t]  = u_gas[t] × calorific_value × elec_efficiency  [kWh elec]
+
+    Heat buffer evolution:
+        buffer[t] = heat_buffer_kwh + Σ_{k=0}^{t} (heat_prod[k] − heat_demand[k] + heat_slack[k])
+
+    Objective (minimise):
+        J = Σ_t gas_cost_per_m3 · u_gas[t]       (gas cost)
+          − Σ_t (mean_price[t] + grid_fee) · elec_prod[t]  (avoided grid import ← negative term)
+          + w_heat_comfort × Σ_t heat_slack[t]²   (penalty for unmet heat demand)
+
+    Economic intuition: WKK is run when the avoided electricity cost exceeds
+    the gas cost — i.e. the spark spread is positive.
+
+    Constraints:
+        0 ≤ u_gas[t]   ≤ wkk_max_gas
+        0 ≤ buffer[t]  ≤ heat_buffer_capacity_kwh
+
+    SOLVER: CLARABEL, falls back to SCS.
     """
     H = len(mean_price)
     u_gas       = cp.Variable(H, nonneg=True)
@@ -858,7 +944,8 @@ class SMPCCalculator:
         """
         import time as _time
         from energy_assets import (
-            load_assets, SHIFTABLE_LOAD, GENERATOR, EXTRA_COST_EUR_MWH,
+            load_assets, SHIFTABLE_LOAD, GENERATOR, GAS_HEATER, HEAT_PUMP,
+            EXTRA_COST_EUR_MWH,
         )
 
         t0 = _time.perf_counter()
@@ -890,7 +977,11 @@ class SMPCCalculator:
             if daily_kwh <= 0:
                 continue
             max_per_step = asset.hourly_max_kwh / 4.0   # hourly → 15-min
-            schedule = _greedy_lp(H, total_price, daily_kwh, max_per_step)
+            schedule = _greedy_lp_ramped(
+                H, total_price, daily_kwh, max_per_step,
+                ramp_up_pct=asset.ramp_up_pct_per_hour,
+                ramp_down_pct=asset.ramp_down_pct_per_hour,
+            )
             baseline_shiftable += np.full(H, daily_kwh / H)
             lp_shiftable += schedule
             asset_schedules[asset.uid] = schedule
@@ -937,15 +1028,70 @@ class SMPCCalculator:
             wkk_elec_plan = gas_plan * gas_energy * elec_eff
             total_gen += wkk_elec_plan
 
+        # ── Startup costs for generators ────────────────────────────
+        total_startup_cost = 0.0
+        for asset in assets:
+            if asset.asset_type != GENERATOR or asset.startup_cost_eur <= 0:
+                continue
+            # For CHP: detect on/off transitions in gas_plan
+            if asset.csv_gen_column or (not asset.solar_csv):
+                on = gas_plan > 0
+            else:
+                gen_chk = solar.copy()
+                if asset.decouple_below_eur_mwh is not None:
+                    price_mwh = total_price * 1000.0
+                    gen_chk = np.where(price_mwh >= asset.decouple_below_eur_mwh, gen_chk, 0.0)
+                on = gen_chk > 0
+            starts = int(np.sum(on[1:] & ~on[:-1]))
+            if len(on) > 0 and on[0]:
+                starts += 1
+            total_startup_cost += starts * asset.startup_cost_eur
+
+        # ── CHP exhaust heat for thermal model ──────────────────────
+        # CHP heat output per step [kW] = gas_plan [m³/step] × calorific [kWh/m³] × heat_eff / dt
+        chp_heat_kw = gas_plan * cfg.gas_energy_kwh_m3 * cfg.wkk_heat_efficiency / 0.25
+
+        # ── Building thermal simulation ─────────────────────────────
+        # Run the thermal model to track building temperature and
+        # compute heating actions from gas heaters and heat pumps.
+        thermal_result = _simulate_thermal(
+            n_steps=H,
+            dt_hours=0.25,  # 15-minute steps
+            initial_temp_c=cfg.building_initial_temp_c,
+            setpoint_c=cfg.building_setpoint_c,
+            deadband_c=cfg.building_deadband_c,
+            cooldown_rate_c_per_hour=cfg.cooldown_rate_c_per_hour,
+            thermal_mass_kwh_per_c=cfg.thermal_mass_kwh_per_c,
+            assets=assets,
+            prices=total_price * 1000.0,  # convert to EUR/MWh for cost calc
+            chp_heat_kw=chp_heat_kw,
+        )
+
+        # Add heat pump electrical consumption to grid draw
+        hp_elec_per_step = np.zeros(H)
+        for hp_asset in assets:
+            if hp_asset.asset_type == HEAT_PUMP and hp_asset.enabled:
+                # Distribute heat pump usage across steps based on heating_kw
+                if thermal_result["heating_kw"].sum() > 0:
+                    hp_frac = hp_asset.heating_capacity_kw / max(
+                        1.0, sum(a.heating_capacity_kw for a in assets
+                                 if a.asset_type == HEAT_PUMP and a.enabled)
+                    )
+                    hp_heat_kw = thermal_result["heating_kw"] * hp_frac
+                    hp_elec_per_step += (hp_heat_kw / hp_asset.cop) * 0.25  # kWh per 15-min
+
         # ── Cost comparison ─────────────────────────────────────────
         baseline_grid = base + baseline_shiftable - total_gen
-        lp_grid = base + lp_shiftable - total_gen
+        lp_grid = base + lp_shiftable - total_gen + hp_elec_per_step
 
         # Gas cost for CHP operation
         gas_cost_arr = gas_plan * cfg.gas_price_eur_m3
 
         baseline_cost = baseline_grid * total_price + gas_cost_arr
         lp_cost = lp_grid * total_price + gas_cost_arr
+        # Add startup costs to optimised scenario
+        if H > 0 and total_startup_cost > 0:
+            lp_cost[0] += total_startup_cost
 
         # First-step values (step 0 = current interval)
         charge_now  = float(lp_shiftable[0])
@@ -982,6 +1128,10 @@ class SMPCCalculator:
             solver_used   = "greedy_lp",
             solver_status = "optimal",
             solve_time_ms = solve_ms,
+            building_temp_c    = float(thermal_result["temp_profile"][0]) if H > 0 else cfg.building_initial_temp_c,
+            building_setpoint_c = cfg.building_setpoint_c,
+            heating_power_kw   = float(thermal_result["heating_kw"][0]) if H > 0 else 0.0,
+            beo_temp_c         = float(thermal_result["beo_temp"][0]) if H > 0 else 12.0,
         )
 
     # ------------------------------------------------------------------

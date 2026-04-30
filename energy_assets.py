@@ -1,4 +1,9 @@
-"""Shared energy-asset definitions used by the dashboard UI and LP solver.
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  BACKEND FILE — student is responsible for this module           ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Shared energy-asset definitions used by the dashboard UI and LP solver.
 
 Asset categories
 ----------------
@@ -36,12 +41,16 @@ SHIFTABLE_LOAD = "shiftable_load"
 GENERATOR = "generator"
 FIXED_LOAD = "fixed_load"
 STORAGE = "storage"
+GAS_HEATER = "gas_heater"
+HEAT_PUMP = "heat_pump"
 
 ASSET_TYPES = {
     SHIFTABLE_LOAD: "Shiftable Load",
     GENERATOR: "Generator",
     FIXED_LOAD: "Fixed Load",
     STORAGE: "Storage",
+    GAS_HEATER: "Gas Heater",
+    HEAT_PUMP: "Heat Pump",
 }
 
 # Extra cost added on top of spot price (distribution fees, taxes, etc.)
@@ -65,18 +74,39 @@ class EnergyAsset:
     csv_column: str = ""               # CSV column (optional – blank = no link)
     hourly_max_kwh: float = 720.0      # max kWh in any single hour
     daily_energy_kwh: float = 0.0      # fixed daily energy demand (0 = from CSV)
+    ramp_up_pct_per_hour: float = 100.0    # max ramp-up rate [% of hourly_max / hour]
+    ramp_down_pct_per_hour: float = 100.0  # max ramp-down rate [% of hourly_max / hour]
 
     # ── Generator properties ────────────────────────────────────────
     capacity_kwp: float = 0.0          # installed capacity (for solar)
     solar_csv: str = ""                # file with hourly solar production (optional)
     csv_gen_column: str = ""           # CSV column for non-solar gen (optional)
     decouple_below_eur_mwh: float | None = None  # disconnect when price < this
+    startup_cost_eur: float = 0.0      # one-off cost each time unit starts up
 
     # ── Storage properties ──────────────────────────────────────────
     storage_capacity_kwh: float = 0.0  # total storage capacity
     charge_rate_kw: float = 0.0        # max charge rate
     discharge_rate_kw: float = 0.0     # max discharge rate
     efficiency: float = 0.90           # round-trip efficiency
+
+    # ── Gas heater properties ───────────────────────────────────────
+    thermal_output_kw: float = 0.0     # rated thermal output [kW]
+    gas_efficiency: float = 0.92       # thermal efficiency (HHV)
+    gas_consumption_m3_per_hour: float = 0.0   # max gas consumption [m³/h]
+
+    # ── Heat pump properties ────────────────────────────────────────
+    cop: float = 3.5                   # coefficient of performance
+    electrical_input_kw: float = 0.0   # rated electrical input [kW]
+    heating_capacity_kw: float = 0.0   # rated heating capacity [kW]
+    cooling_capacity_kw: float = 0.0   # rated cooling capacity [kW] (0 = heating-only)
+
+    # ── Heat pump source (air vs ground / BEO-veld) ─────────────────
+    is_ground_source: bool = False     # True = ground-source (BEO), False = air-source
+    beo_capacity_kwh: float = 50000.0  # BEO-veld thermal storage capacity [kWh]
+    beo_extraction_rate_kw: float = 0.0  # max heat extraction from ground [kW]
+    beo_injection_rate_kw: float = 0.0   # max heat injection into ground [kW]
+    beo_initial_temp_c: float = 12.0   # initial ground temperature [°C]
 
     def __post_init__(self):
         if not self.uid:
@@ -151,6 +181,32 @@ def get_default_assets() -> list[EnergyAsset]:
             category="input",
             icon="fire",
             csv_gen_column="ProductionWKK",
+        ),
+        EnergyAsset(
+            uid="gas_heater_1",
+            name="Gas Boiler",
+            asset_type=GAS_HEATER,
+            category="input",
+            icon="fire",
+            thermal_output_kw=500.0,
+            gas_efficiency=0.92,
+            gas_consumption_m3_per_hour=55.0,
+        ),
+        EnergyAsset(
+            uid="heat_pump_1",
+            name="Ground-Source Heat Pump",
+            asset_type=HEAT_PUMP,
+            category="input",
+            icon="heat",
+            cop=4.2,
+            electrical_input_kw=120.0,
+            heating_capacity_kw=500.0,
+            cooling_capacity_kw=400.0,
+            is_ground_source=True,
+            beo_capacity_kwh=50000.0,
+            beo_extraction_rate_kw=350.0,
+            beo_injection_rate_kw=300.0,
+            beo_initial_temp_c=12.0,
         ),
     ]
 

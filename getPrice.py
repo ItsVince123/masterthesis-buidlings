@@ -1,4 +1,13 @@
-"""Fetch day-ahead electricity prices from ENTSO-E and export to CSV.
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  BACKEND FILE — student is responsible for this module           ║
+║                                                                  ║
+║  ENTSO-E day-ahead electricity price fetcher.                    ║
+║  Retrieves EUR/MWh prices for Belgium and caches them to         ║
+║  prices.csv so the dashboard can read them without network I/O.  ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Fetch day-ahead electricity prices from ENTSO-E and export to CSV.
 
 Usage::
 
@@ -149,6 +158,16 @@ def get_flagged_next_day_prices(
 
     Fetches today + tomorrow (Brussels local) and flags entries whose price
     falls below the combined 48 h average.
+
+    WHY 48 H?
+    The dashboard shows today's data + tomorrow's day-ahead auction results.
+    By computing the average over both days the colour-coding (green = cheap
+    relative to the full two-day window, red = expensive) gives a useful
+    visual indication of whether NOW is a good time to consume.
+
+    BELOW-AVERAGE FLAG
+    Each price entry is flagged True when price < 48h_average.
+    The dashboard colours these green (cheap hours to shift load into).
     """
     now = (
         reference_time.astimezone(LOCAL_TZ) if reference_time
@@ -173,11 +192,19 @@ def get_flagged_next_day_prices(
     with ThreadPoolExecutor(max_workers=2) as pool:
         f1 = pool.submit(fetch_prices, domain, prev_s, prev_e)
         f2 = pool.submit(fetch_prices, domain, next_s, next_e)
-        prev_data = parse_prices(f1.result())
-        next_data = parse_prices(f2.result())
+        try:
+            prev_data = parse_prices(f1.result())
+        except Exception as exc:
+            logger.warning("Could not fetch today's prices: %s", exc)
+            prev_data = []
+        try:
+            next_data = parse_prices(f2.result())
+        except Exception as exc:
+            logger.warning("Could not fetch tomorrow's prices: %s", exc)
+            next_data = []
 
-    if not prev_data or not next_data:
-        raise ValueError("No complete 48 h price data found in the response.")
+    if not prev_data and not next_data:
+        raise ValueError("No price data available for today or tomorrow.")
 
     combined = sorted(prev_data + next_data, key=lambda x: x[0])
     avg = sum(p for _, p in combined) / len(combined)

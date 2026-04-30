@@ -1,4 +1,9 @@
-"""Central configuration constants for the Dashboard application.
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  BACKEND FILE — student is responsible for this module           ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Central configuration constants for the Dashboard application.
 
 All hardcoded values (paths, coordinates, API config) live here so they
 can be changed in one place.  Every other module imports the constants it
@@ -46,11 +51,15 @@ ENTSOE_DOMAIN = "10YBE----------2"  # Belgium bidding zone
 # ---------------------------------------------------------------------------
 # Grid/distribution/tax charges that apply on top of the ENTSO-E spot price.
 # Typical Belgian industrial value is ~50 EUR/MWh  (= 0.05 EUR/kWh).
-GRID_FEE_EUR_MWH = 50.0
+# This fee is added in BOTH the LP solver and the SMPC calculator so the
+# optimiser includes the real total cost, not just the volatile spot component.
+GRID_FEE_EUR_MWH = 50.0       # EUR/MWh = EXTRA_COST_EUR_MWH in energy_assets.py
 
 # ---------------------------------------------------------------------------
 # Data pipeline
 # ---------------------------------------------------------------------------
 DAILY_FETCH_HOUR = 14           # Local hour at which daily data refresh runs
-SOLAR_CAPACITY_KWP = 1.525     # Installed PV capacity (kWp)
+                                # (14:00 ensures tomorrow's DAM prices are available)
+SOLAR_CAPACITY_KWP = 1.525      # Installed PV capacity (kWp) — used by predict.py
 INTERVAL_MINUTES = 15           # Time resolution used throughout the system
+                                # (must match ENTSO-E data resolution after Oct 2025)

@@ -1,9 +1,22 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  BACKEND FILE — student is responsible for this module           ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Load and save dashboard_config.json.
+
+This module is the single entry point for reading/writing the JSON
+configuration file.  Both the dashboard UI and the SMPC calculator
+import from here — they never open the JSON directly.
+"""
+
 import json
 from pathlib import Path
 from typing import Any
 
 from settings import CONFIG_JSON
 
+# Default path — can be overridden in all functions by passing config_path
 DEFAULT_CONFIG_PATH = CONFIG_JSON
 
 
