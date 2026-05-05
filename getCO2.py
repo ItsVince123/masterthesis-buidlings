@@ -75,6 +75,10 @@ _CO2_FACTORS: dict[str, float] = {
 # Fallback when no API data is available (Belgian grid average ~150-180)
 FALLBACK_CO2_GRAMS_PER_KWH = 170.0
 
+# Direct combustion CO2 factor for natural gas (HHV basis, combustion only)
+# Source: IPCC / IEA — approx 202 gCO2/kWh_gas (56.1 kgCO2/GJ × 3.6 MJ/kWh)
+GAS_CO2_G_PER_KWH_GAS = 202.0
+
 CO2_CSV = DASHBOARD_DIR / "co2_intensity.csv"
 
 

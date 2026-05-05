@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from dashboard_config import load_dashboard_config, save_dashboard_config
+from lp_solver import reload_thermal_config as _reload_thermal
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ class BuildingThermalDialog(QDialog):
         self._deadband = thermal.get("deadband_c", 1.0)
         self._initial_temp = thermal.get("initial_temp_c", 21.0)
         self._cooldown_rate = thermal.get("cooldown_rate_c_per_hour", 0.5)
-        self._thermal_mass = thermal.get("thermal_mass_kwh_per_c", 500.0)
+        self._thermal_mass = thermal.get("thermal_mass_kwh_per_c", 50.0)
 
     # ------------------------------------------------------------------
     def _build_ui(self):
@@ -148,4 +149,5 @@ class BuildingThermalDialog(QDialog):
 
         save_dashboard_config(cfg)
         logger.info("Saved building thermal config: %s", thermal)
+        _reload_thermal()  # refresh lp_solver's cached thermal params immediately
         self.accept()

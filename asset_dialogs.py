@@ -19,7 +19,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from energy_assets import (
@@ -157,6 +157,20 @@ class AssetEditorDialog(QDialog):
         self._type.currentIndexChanged.connect(self._on_type_changed)
         form.addRow("Type:", self._type)
 
+        # Category (dashboard column)
+        self._category = QComboBox()
+        self._category.addItem("Input (energy source / supply side)", "input")
+        self._category.addItem("Output (controllable load / demand side)", "output")
+        cat_idx = self._category.findData(self._asset.category)
+        if cat_idx >= 0:
+            self._category.setCurrentIndex(cat_idx)
+        self._category.setToolTip(
+            "Determines which column on the dashboard this asset appears in.\n"
+            "Input = energy sources (solar, CHP, heat pumps).\n"
+            "Output = controllable loads (ice banks, EV chargers)."
+        )
+        form.addRow("Category:", self._category)
+
         # Icon
         self._icon = QComboBox()
         for key, label in _ICON_OPTIONS.items():
@@ -246,6 +260,57 @@ class AssetEditorDialog(QDialog):
         )
         sf.addRow("Ramp down:", self._ramp_down)
 
+        baseline_hdr = QLabel("Baseline Schedule Window")
+        baseline_hdr.setStyleSheet("font-weight: 600; color: #475569; font-size: 9pt;")
+        sf.addRow(baseline_hdr)
+
+        self._baseline_start = QSpinBox()
+        self._baseline_start.setRange(0, 23)
+        self._baseline_start.setSuffix(":00")
+        self._baseline_start.setValue(int(getattr(self._asset, "baseline_start_hour", 9)))
+        self._baseline_start.setToolTip(
+            "First hour (inclusive) of the fixed baseline operating window.\n"
+            "e.g. 9 = 09:00. The LP will shift energy outside this window\n"
+            "to cheaper hours."
+        )
+        sf.addRow("Active from:", self._baseline_start)
+
+        self._baseline_end = QSpinBox()
+        self._baseline_end.setRange(1, 24)
+        self._baseline_end.setSuffix(":00")
+        self._baseline_end.setValue(int(getattr(self._asset, "baseline_end_hour", 19)))
+        self._baseline_end.setToolTip(
+            "Last hour (exclusive) of the fixed baseline operating window.\n"
+            "e.g. 19 = until 19:00 (10 hours of operation from 9:00-19:00)."
+        )
+        sf.addRow("Active until:", self._baseline_end)
+
+        flex_hdr = QLabel("LP Flexible Hours (optional — 0\u202200 to 24\u202200 = unrestricted)")
+        flex_hdr.setStyleSheet("font-weight: 600; color: #475569; font-size: 9pt;")
+        sf.addRow(flex_hdr)
+
+        self._flex_start = QSpinBox()
+        self._flex_start.setRange(0, 23)
+        self._flex_start.setSuffix(":00")
+        self._flex_start.setValue(int(getattr(self._asset, "flex_start_hour", 0)))
+        self._flex_start.setToolTip(
+            "First hour (inclusive) the LP is allowed to schedule this load.\n"
+            "Supports overnight wrap (e.g. 22 with end 6 = 22:00-06:00).\n"
+            "Keep at 0 with end at 24 for no restriction."
+        )
+        sf.addRow("LP from:", self._flex_start)
+
+        self._flex_end = QSpinBox()
+        self._flex_end.setRange(1, 24)
+        self._flex_end.setSuffix(":00")
+        self._flex_end.setValue(int(getattr(self._asset, "flex_end_hour", 24)))
+        self._flex_end.setToolTip(
+            "Last hour (exclusive) the LP is allowed to schedule this load.\n"
+            "Supports overnight wrap (e.g. start 22 with end 6 = 22:00-06:00).\n"
+            "Keep at 24 with start at 0 for no restriction."
+        )
+        sf.addRow("LP until:", self._flex_end)
+
         layout.addWidget(self._shift_frame)
 
         # ── Generator properties ────────────────────────────────────
@@ -319,6 +384,56 @@ class AssetEditorDialog(QDialog):
             "Used to penalise frequent on/off cycling (e.g. CHP)."
         )
         gf.addRow("Startup cost:", self._startup_cost)
+
+        chp_hdr = QLabel("CHP / Cogeneration (leave at 0 for non-CHP generators)")
+        chp_hdr.setStyleSheet("font-weight: 700; color: #0b3a6e; margin-top: 8px;")
+        gf.addRow(chp_hdr)
+
+        self._chp_elec_eff = QDoubleSpinBox()
+        self._chp_elec_eff.setRange(0, 100)
+        self._chp_elec_eff.setDecimals(1)
+        self._chp_elec_eff.setSuffix(" %")
+        self._chp_elec_eff.setValue(getattr(self._asset, "chp_elec_efficiency", 0.0) * 100)
+        self._chp_elec_eff.setToolTip(
+            "Electrical efficiency of the CHP unit (fuel input to electricity).\n"
+            "44% means 44 kWh electricity per 100 kWh of gas (HHV).\n"
+            "Set to 0 to disable CHP spark-spread scheduling."
+        )
+        gf.addRow("CHP elec. efficiency:", self._chp_elec_eff)
+
+        self._chp_heat_eff = QDoubleSpinBox()
+        self._chp_heat_eff.setRange(0, 100)
+        self._chp_heat_eff.setDecimals(1)
+        self._chp_heat_eff.setSuffix(" %")
+        self._chp_heat_eff.setValue(getattr(self._asset, "chp_heat_efficiency", 0.0) * 100)
+        self._chp_heat_eff.setToolTip(
+            "Recoverable exhaust heat fraction (fuel input to useful heat).\n"
+            "45% means 45 kWh heat recovered per 100 kWh of gas.\n"
+            "This heat offsets the building thermal load."
+        )
+        gf.addRow("CHP heat efficiency:", self._chp_heat_eff)
+
+        self._gas_price_chp = QDoubleSpinBox()
+        self._gas_price_chp.setRange(0, 10)
+        self._gas_price_chp.setDecimals(4)
+        self._gas_price_chp.setSuffix(" EUR/m3")
+        self._gas_price_chp.setValue(getattr(self._asset, "gas_price_eur_m3", 0.35))
+        self._gas_price_chp.setToolTip(
+            "Cost of natural gas per cubic metre.\n"
+            "Used to compute the spark spread and fuel cost."
+        )
+        gf.addRow("Gas price:", self._gas_price_chp)
+
+        self._gas_energy_chp = QDoubleSpinBox()
+        self._gas_energy_chp.setRange(0, 20)
+        self._gas_energy_chp.setDecimals(2)
+        self._gas_energy_chp.setSuffix(" kWh/m3")
+        self._gas_energy_chp.setValue(getattr(self._asset, "gas_energy_kwh_m3", 9.8))
+        self._gas_energy_chp.setToolTip(
+            "Calorific value of gas (Higher Heating Value).\n"
+            "Natural gas ~9.8 kWh/m3.  Biogas ~6.5 kWh/m3."
+        )
+        gf.addRow("Gas calorific value:", self._gas_energy_chp)
 
         layout.addWidget(self._gen_frame)
 
@@ -572,6 +687,7 @@ class AssetEditorDialog(QDialog):
             return
         self._asset.name = name
         self._asset.asset_type = self._type.currentData()
+        self._asset.category = self._category.currentData()
         self._asset.icon = self._icon.currentData()
         self._asset.enabled = self._enabled.isChecked()
 
@@ -582,6 +698,10 @@ class AssetEditorDialog(QDialog):
             self._asset.daily_energy_kwh = self._shift_daily.value()
             self._asset.ramp_up_pct_per_hour = self._ramp_up.value()
             self._asset.ramp_down_pct_per_hour = self._ramp_down.value()
+            self._asset.baseline_start_hour = self._baseline_start.value()
+            self._asset.baseline_end_hour = self._baseline_end.value()
+            self._asset.flex_start_hour = self._flex_start.value()
+            self._asset.flex_end_hour = self._flex_end.value()
         elif atype == GENERATOR:
             self._asset.capacity_kwp = self._capacity.value()
             self._asset.solar_csv = self._solar_csv.text().strip()
@@ -591,6 +711,10 @@ class AssetEditorDialog(QDialog):
                 None if decouple_val <= -10_000 else decouple_val
             )
             self._asset.startup_cost_eur = self._startup_cost.value()
+            self._asset.chp_elec_efficiency = self._chp_elec_eff.value() / 100.0
+            self._asset.chp_heat_efficiency = self._chp_heat_eff.value() / 100.0
+            self._asset.gas_price_eur_m3 = self._gas_price_chp.value()
+            self._asset.gas_energy_kwh_m3 = self._gas_energy_chp.value()
         elif atype == FIXED_LOAD:
             self._asset.csv_column = self._fixed_csv_col.text().strip()
             self._asset.daily_energy_kwh = self._daily_energy.value()

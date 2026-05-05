@@ -3,23 +3,6 @@
 
 ---
 
-## Thesis Responsibility Split
-
-> **You (the student) are responsible for the BACKEND only.**  
-> The frontend (PyQt6 UI, graphs, dialogs) was scaffolded generically and is NOT part of the thesis contribution.
-
-| Layer | Your responsibility? | Description |
-|-------|---------------------|-------------|
-| **Backend — Optimisation** | ✅ YES | SMPC solver, LP scheduler, energy asset model |
-| **Backend — Data pipeline** | ✅ YES | Price/weather/solar data fetching and prediction |
-| **Backend — Configuration** | ✅ YES | Config schema, persistence, constants |
-| **Frontend — Dashboard UI** | ❌ NO | PyQt6 window, columns, widgets |
-| **Frontend — Dialogs** | ❌ NO | Asset editor, historical analysis dialog |
-| **Frontend — Graphs** | ❌ NO | QPainter graph rendering |
-| **Frontend — Styles** | ❌ NO | QSS stylesheets |
-
----
-
 ## File Overview
 
 ### BACKEND files (thesis contribution)

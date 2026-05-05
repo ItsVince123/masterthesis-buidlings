@@ -33,8 +33,50 @@ from energy_assets import (
     EnergyAsset, EXTRA_COST_EUR_MWH, GENERATOR, SHIFTABLE_LOAD,
     GAS_HEATER, HEAT_PUMP,
 )
+from dashboard_config import load_dashboard_config as _load_cfg
 
 logger = logging.getLogger(__name__)
+
+
+# ===================================================================
+# Thermal config cache — read from dashboard_config.json once,
+# always reflects the latest GUI-saved settings.
+# ===================================================================
+
+def _read_thermal_cfg() -> dict:
+    """Return the smpc.building.thermal block from dashboard_config.json."""
+    try:
+        return _load_cfg().get("smpc", {}).get("building", {}).get("thermal", {})
+    except Exception:
+        return {}
+
+_THERMAL_CFG: dict = _read_thermal_cfg()
+
+
+def reload_thermal_config() -> None:
+    """Re-read thermal settings from disk (call after GUI saves)."""
+    global _THERMAL_CFG
+    _THERMAL_CFG = _read_thermal_cfg()
+
+
+# ===================================================================
+# Utility
+# ===================================================================
+
+def _in_window(h: int, start_h: int, end_h: int) -> bool:
+    """Return True if hour *h* is inside [start_h, end_h) with midnight wrap.
+
+    Handles overnight windows (start_h > end_h), e.g. 21–07:
+      _in_window(23, 21, 7) → True   _in_window(3, 21, 7) → True
+      _in_window(10, 21, 7) → False
+    A degenerate window (start_h == end_h) is treated as empty → False.
+    """
+    if start_h == end_h:
+        return False
+    if start_h < end_h:
+        return start_h <= h < end_h   # normal window
+    # Overnight: e.g. 21 → 7  means h >= 21 OR h < 7
+    return h >= start_h or h < end_h
 
 
 # ===================================================================
@@ -156,6 +198,8 @@ def simulate_building_thermal(
     prices: np.ndarray | None = None,
     beo_initial_temp_c: float = 12.0,
     chp_heat_kw: np.ndarray | None = None,
+    gas_price_eur_m3: float = 0.35,
+    price_aware: bool = False,
 ) -> dict:
     """Simulate building temperature over a horizon with heating assets.
 
@@ -180,6 +224,9 @@ def simulate_building_thermal(
     prices : optional price array for cost tracking
     beo_initial_temp_c : starting BEO-veld ground temperature
     chp_heat_kw : optional array of CHP exhaust thermal power per step [kW]
+    price_aware : if True, use price-aware deadband pre-heating (heat when cheap,
+        defer when expensive within the deadband flex zone).  If False (default),
+        always heat whenever temperature falls below setpoint (baseline rule).
 
     Returns
     -------
@@ -195,6 +242,8 @@ def simulate_building_thermal(
     heating_kw = np.zeros(n_steps)
     beo_temp = np.zeros(n_steps)
     heating_cost = np.zeros(n_steps)
+    hp_elec_kwh_per_step = np.zeros(n_steps)
+    gas_heater_cost_per_step = np.zeros(n_steps)
     gas_total = 0.0
     elec_total = 0.0
 
@@ -212,6 +261,28 @@ def simulate_building_thermal(
             beo_cap = hp.beo_capacity_kwh
             break
 
+    # ── Physical parameters for price-aware look-ahead ──────────────
+    drift_per_step = cooldown_rate_c_per_hour * dt_hours  # °C lost per step (no heating)
+
+    # Total installed heating capacity across all enabled assets [kW]
+    total_heating_cap_kw = (
+        sum(a.heating_capacity_kw for a in heat_pumps)
+        + sum(a.thermal_output_kw for a in gas_heaters)
+    )
+    # Temperature rise per step at full heating capacity [°C/step]
+    heat_rate_per_step = (
+        total_heating_cap_kw * dt_hours / thermal_mass_kwh_per_c
+        if thermal_mass_kwh_per_c > 0 and total_heating_cap_kw > 0
+        else float("inf")
+    )
+    # Net rise per step = heating rate minus concurrent drift
+    net_heat_rate = max(heat_rate_per_step - drift_per_step, 1e-6)
+    # Steps needed to recover from lower_limit back to setpoint.
+    # Subtract 1 because heating fires within the triggered step itself,
+    # so a full-step head-start is not required — this ensures at least 1
+    # slot of defer flexibility even with high-capacity / coarse time resolution.
+    steps_to_recover = max(0, int(np.ceil(deadband_c / net_heat_rate)) - 1)
+
     for t in range(n_steps):
         # Natural cooling
         current_temp -= cooldown_rate_c_per_hour * dt_hours
@@ -223,13 +294,44 @@ def simulate_building_thermal(
             if thermal_mass_kwh_per_c > 0:
                 current_temp += chp_kwh / thermal_mass_kwh_per_c
 
-        # Check if heating is needed
+        # Determine how much heating is needed this step
         heat_needed_c = 0.0
-        if current_temp < setpoint_c - deadband_c:
-            heat_needed_c = setpoint_c - current_temp
-        elif current_temp < setpoint_c:
-            # Gentle heating to reach setpoint
-            heat_needed_c = (setpoint_c - current_temp) * 0.5
+        if price_aware:
+            # Dynamic look-ahead using physical thermal parameters:
+            #
+            #  lower_limit = setpoint - deadband  (comfort floor, e.g. 20 °C)
+            #  steps_until_forced = how long temp can drift before hitting floor
+            #  steps_to_recover   = steps needed to heat from floor → setpoint
+            #                       at full capacity (accounts for thermal mass)
+            #  defer_window       = steps_until_forced - steps_to_recover
+            #                       → the slots we can still choose to defer into
+            #
+            # Heat NOW only if current slot is the cheapest in defer_window.
+            # If defer_window ≤ 0 the recovery deadline has arrived — heat now.
+            lower_limit = setpoint_c - deadband_c
+            if current_temp < lower_limit:
+                # Past comfort floor — forced heat regardless of price
+                heat_needed_c = setpoint_c - current_temp
+            elif current_temp < setpoint_c and prices is not None:
+                slack = current_temp - lower_limit          # °C above floor
+                steps_until_forced = (
+                    int(slack / drift_per_step) if drift_per_step > 0 else n_steps
+                )
+                defer_window = max(0, steps_until_forced - steps_to_recover)
+                if defer_window == 0:
+                    # Must start heating now to make it back to setpoint in time
+                    heat_needed_c = setpoint_c - current_temp
+                else:
+                    # Look ahead over the deferrable window and heat only if
+                    # the current price is the cheapest available slot
+                    lookahead_end = min(t + defer_window + 1, n_steps)
+                    if float(prices[t]) <= float(np.min(prices[t:lookahead_end])):
+                        heat_needed_c = setpoint_c - current_temp
+                    # else: cheaper slot is coming — defer
+        else:
+            # Baseline (constant thermostat): always heat to setpoint
+            if current_temp < setpoint_c:
+                heat_needed_c = setpoint_c - current_temp
 
         heat_delivered_kwh = 0.0
         step_heating_kw = 0.0
@@ -239,33 +341,47 @@ def simulate_building_thermal(
         if heat_needed_c > 0:
             heat_needed_kwh = heat_needed_c * thermal_mass_kwh_per_c
 
-            # 1. Gas heaters
+            # Cost-aware dispatch: sort all heating sources cheapest-first
+            # per unit of thermal energy delivered this step.
+            elec_price_kwh = (
+                prices[t] / 1000.0
+                if prices is not None and t < len(prices)
+                else 0.15
+            )
+
+            candidates: list[tuple[float, str, object]] = []
             for gh in gas_heaters:
-                if heat_delivered_kwh >= heat_needed_kwh:
-                    break
-                avail = gh.thermal_output_kw * dt_hours  # kWh this step
-                deliver = min(avail, heat_needed_kwh - heat_delivered_kwh)
-                heat_delivered_kwh += deliver
-                step_heating_kw += deliver / dt_hours
-                gas_m3 = (deliver / gh.gas_efficiency) / 9.8 if gh.gas_efficiency > 0 else 0
-                step_gas_m3 += gas_m3
-
-            # 2. Heat pumps
+                gp  = getattr(gh, "gas_price_eur_m3",  0.0) or gas_price_eur_m3
+                hv  = getattr(gh, "gas_energy_kwh_m3", 9.8) or 9.8
+                eff = gh.gas_efficiency if gh.gas_efficiency > 0 else 1.0
+                candidates.append((gp / (hv * eff), "gas", gh))
             for hp in heat_pumps:
+                cop = hp.cop if hp.cop > 0 else 1.0
+                candidates.append((elec_price_kwh / cop, "hp", hp))
+            candidates.sort(key=lambda x: x[0])  # cheapest first
+
+            for _cost, kind, a in candidates:
                 if heat_delivered_kwh >= heat_needed_kwh:
                     break
-                avail = hp.heating_capacity_kw * dt_hours  # kWh this step
-                deliver = min(avail, heat_needed_kwh - heat_delivered_kwh)
-                heat_delivered_kwh += deliver
-                step_heating_kw += deliver / dt_hours
-                elec_kwh = deliver / hp.cop if hp.cop > 0 else deliver
-                step_elec_kwh += elec_kwh
-
-                # BEO-veld interaction for ground-source
-                if hp.is_ground_source:
-                    extracted = deliver - elec_kwh  # heat from ground
-                    if beo_cap > 0:
-                        current_beo -= extracted / (beo_cap / 50.0)  # simplified
+                if kind == "gas":
+                    avail = a.thermal_output_kw * dt_hours
+                    deliver = min(avail, heat_needed_kwh - heat_delivered_kwh)
+                    heat_delivered_kwh += deliver
+                    step_heating_kw += deliver / dt_hours
+                    hv = getattr(a, "gas_energy_kwh_m3", 9.8) or 9.8
+                    gas_m3 = (deliver / a.gas_efficiency) / hv if a.gas_efficiency > 0 else 0.0
+                    step_gas_m3 += gas_m3
+                else:  # heat pump
+                    avail = a.heating_capacity_kw * dt_hours
+                    deliver = min(avail, heat_needed_kwh - heat_delivered_kwh)
+                    heat_delivered_kwh += deliver
+                    step_heating_kw += deliver / dt_hours
+                    elec_kwh = deliver / a.cop if a.cop > 0 else deliver
+                    step_elec_kwh += elec_kwh
+                    if a.is_ground_source:
+                        extracted = deliver - elec_kwh
+                        if beo_cap > 0:
+                            current_beo -= extracted / (beo_cap / 50.0)
 
         # Apply heating to building temperature
         if thermal_mass_kwh_per_c > 0:
@@ -278,16 +394,20 @@ def simulate_building_thermal(
         elec_total += step_elec_kwh
 
         # Cost: gas + electricity
-        gas_cost = step_gas_m3 * 0.35  # default gas price
+        gas_cost = step_gas_m3 * gas_price_eur_m3
         elec_price = prices[t] / 1000.0 if prices is not None and t < len(prices) else 0.05
         elec_cost = step_elec_kwh * elec_price
         heating_cost[t] = gas_cost + elec_cost
+        gas_heater_cost_per_step[t] = gas_cost
+        hp_elec_kwh_per_step[t] = step_elec_kwh
 
     return {
         "temp_profile": temp,
         "heating_kw": heating_kw,
         "beo_temp": beo_temp,
         "heating_cost": heating_cost,
+        "gas_heater_cost": gas_heater_cost_per_step,
+        "hp_elec_kwh_per_step": hp_elec_kwh_per_step,
         "gas_used_m3": gas_total,
         "elec_used_kwh": elec_total,
     }
@@ -311,7 +431,7 @@ def load_historical_csv(path: Path) -> dict[str, list[dict]]:
     Expected columns (semicolon-separated, European decimals)::
 
         From Timestamp;TotalUsage;NetUsage;ProductionWKK;
-        TotalChiller;RemainingUsage;PricesElec;ExtraCost;TotalPrices
+        TotalChiller;RemainingUsage;PricesElec;ExtraCost;TotalPrices;ChillerBanks
 
     Returns ``{day_str: [row_dict, …]}`` keyed by ``"D/MM/YYYY"``.
     """
@@ -321,13 +441,14 @@ def load_historical_csv(path: Path) -> dict[str, list[dict]]:
         for raw in reader:
             row = {
                 "timestamp":       raw["From Timestamp"].strip(),
-                "total_usage":     parse_eu_float(raw["TotalUsage"]),
-                "net_usage":       parse_eu_float(raw["NetUsage"]),
-                "production_wkk":  parse_eu_float(raw["ProductionWKK"]),
-                "total_chiller":   parse_eu_float(raw["TotalChiller"]),
-                "remaining_usage": parse_eu_float(raw["RemainingUsage"]),
-                "prices_elec":     parse_eu_float(raw["PricesElec"]),
-                "extra_cost":      parse_eu_float(raw["ExtraCost"]),
+                "total_usage":     parse_eu_float(raw.get("TotalUsage", "0")),
+                "net_usage":       parse_eu_float(raw.get("NetUsage", "0")),
+                "production_wkk":  parse_eu_float(raw.get("ProductionWKK", "0")),
+                "total_chiller":   parse_eu_float(raw.get("TotalChiller", "0")),
+                "chiller_banks":   parse_eu_float(raw.get("ChillerBanks", "0")),
+                "remaining_usage": parse_eu_float(raw.get("RemainingUsage", "0")),
+                "prices_elec":     parse_eu_float(raw.get("PricesElec", "0")),
+                "extra_cost":      parse_eu_float(raw.get("ExtraCost", "0")),
             }
             day_key = row["timestamp"].split(" ")[0]
             days.setdefault(day_key, []).append(row)
@@ -383,177 +504,387 @@ def find_day_rows(
 
 
 # ===================================================================
-# Historical day simulation (asset-driven)
+# CHP scheduling helper
 # ===================================================================
 
-# Column name → parsed row-dict key mapping
-_COL_MAP = {
-    "TotalChiller":  "total_chiller",
-    "ProductionWKK": "production_wkk",
-}
+def _chp_optimal_schedule(
+    n: int,
+    total_price: np.ndarray,
+    asset: EnergyAsset,
+    dt_hours: float = 1.0,
+) -> np.ndarray:
+    """Compute the LP-optimal CHP firing schedule based on spark spread.
 
-
-def simulate_day(
-    day_rows: list[dict],
-    assets: list[EnergyAsset],
-    solar_hours: dict[str, list[float]],
-    day_keys: list[str],
-) -> dict:
-    """Compare baseline vs LP-optimised cost for one historical day.
+    The CHP fires only in hours where the market electricity price exceeds
+    the variable gas cost of generating that electricity, minus any startup
+    cost amortised over each consecutive run block.
 
     Parameters
     ----------
-    day_rows : list[dict]
-        Parsed rows from :func:`load_historical_csv` for a single day.
-    assets : list[EnergyAsset]
-        Enabled energy assets.
-    solar_hours : dict
-        ``{day_key: [kwh_h0, …]}`` solar production lookup (from CSV).
-    day_keys : list[str]
-        Candidate day-key strings for solar lookups.
+    n           : number of time slots
+    total_price : total electricity price per slot [EUR/MWh] (spot + fees)
+    asset       : EnergyAsset with ``chp_elec_efficiency > 0``
+    dt_hours    : slot duration in hours
 
     Returns
     -------
-    dict with keys:
-        baseline, optimised          — per-hour cost arrays (EUR)
-        baseline_load_kwh, optimised_load_kwh — per-hour load arrays
-        baseline_grid_kwh, optimised_grid_kwh — per-hour grid draw arrays
-        prices_elec                  — per-hour spot price array
-        load_shifted                 — total shiftable kWh
-        total_generation             — effective generation kWh
-        n_slots                      — number of hourly slots
+    gen_kwh : np.ndarray — electrical output per slot [kWh]
     """
-    n = len(day_rows)
-    # Extract hourly arrays from the historical CSV rows
-    remaining   = np.array([r["remaining_usage"] for r in day_rows])  # non-shiftable base load [kWh]
-    net_usage   = np.array([r["net_usage"]       for r in day_rows])  # actual grid draw (baseline reference)
-    prices_elec = np.array([r["prices_elec"]     for r in day_rows])  # ENTSO-E spot price [EUR/MWh]
+    if asset.chp_elec_efficiency <= 0 or asset.gas_energy_kwh_m3 <= 0:
+        return np.zeros(n)
 
-    # Total cost per kWh = spot price + fixed grid/distribution fee
-    # EXTRA_COST_EUR_MWH = 50 EUR/MWh covering network charges, taxes, etc.
+    gp = asset.gas_price_eur_m3 if asset.gas_price_eur_m3 > 0 else 0.35
+
+    # Variable gas cost to generate 1 kWh electrical [EUR/kWh → EUR/MWh]
+    var_gas_cost_mwh = gp / (asset.gas_energy_kwh_m3 * asset.chp_elec_efficiency) * 1000.0
+
+    cap_kwh = asset.capacity_kwp * dt_hours  # max kWh output per slot
+
+    # Step 1: fire in every profitable slot
+    schedule = np.where(total_price > var_gas_cost_mwh, cap_kwh, 0.0)
+
+    # Step 2: prune run-blocks whose gross profit does not cover startup cost
+    if asset.startup_cost_eur > 0 and cap_kwh > 0:
+        on = schedule > 0
+        i = 0
+        while i < n:
+            if on[i]:
+                j = i + 1
+                while j < n and on[j]:
+                    j += 1
+                # Gross profit of this block (EUR)
+                block_profit = float(
+                    np.sum((total_price[i:j] - var_gas_cost_mwh) * cap_kwh / 1000.0)
+                )
+                if block_profit < asset.startup_cost_eur:
+                    schedule[i:j] = 0.0
+                i = j
+            else:
+                i += 1
+
+    return schedule
+
+
+# ===================================================================
+# Unified LP simulation core
+# ===================================================================
+
+def simulate_slots(
+    n: int,
+    prices_elec: np.ndarray,
+    base_load: np.ndarray,
+    assets: list[EnergyAsset],
+    *,
+    solar_hours: dict | None = None,
+    day_keys: list[str] | None = None,
+    start_hour: float = 0.0,
+    dt_hours: float = 1.0,
+    baseline_gen_override: dict | None = None,
+    baseline_load_override: dict | None = None,
+    thermal_params: dict | None = None,
+) -> dict:
+    """Asset-driven LP simulation over arbitrary time slots.
+
+    This is the **unified simulation core** used by both the historical
+    analysis dialog (via :func:`simulate_day`) and the future simulation
+    dialog (via direct call with a synthetic load profile).
+
+    The two use cases differ only in how the input arrays are built:
+
+    * **Historical** — ``base_load`` and ``prices_elec`` come from the
+      building CSV.  ``baseline_gen_override`` / ``baseline_load_override``
+      contain measured production / load data for the baseline comparison.
+    * **Future** — ``base_load`` is a synthetic sinusoidal profile;
+      ``prices_elec`` comes from the user-supplied price CSV.  No
+      override dicts are passed, so baselines are built from the
+      configured ``baseline_start_hour`` / ``baseline_end_hour`` windows.
+
+    Parameters
+    ----------
+    n : int
+        Number of time slots.
+    prices_elec : np.ndarray
+        Spot electricity price per slot [EUR/MWh].
+    base_load : np.ndarray
+        Fixed (non-shiftable) building load per slot [kWh].
+    assets : list[EnergyAsset]
+        Enabled energy assets from the configuration.
+    solar_hours : dict, optional
+        ``{day_key: [kwh_h0, …]}`` from a solar archive CSV.
+    day_keys : list[str], optional
+        Candidate day-key strings for solar archive lookups.
+    start_hour : float
+        Hour-of-day index of slot 0 (0.0 = midnight).
+    dt_hours : float
+        Slot duration in hours (1.0 for hourly data).
+    baseline_gen_override : dict, optional
+        ``{asset.name: np.ndarray}`` — measured generation used as the
+        *baseline* generator schedule (historical mode).
+    baseline_load_override : dict, optional
+        ``{asset.name: np.ndarray}`` — measured shiftable load used as
+        the *baseline* schedule (historical mode).
+    thermal_params : dict, optional
+        Building thermal model overrides.  Supported keys:
+        ``initial_temp_c``, ``setpoint_c``, ``deadband_c``,
+        ``cooldown_rate_c_per_hour``, ``thermal_mass_kwh_per_c``,
+        ``beo_initial_temp_c``.
+
+    Returns
+    -------
+    dict
+        Same structure as :func:`simulate_day`.
+    """
     total_price = prices_elec + EXTRA_COST_EUR_MWH
 
+    # Infer gas price from first asset that has it configured
+    gas_price_eur_m3 = 0.35
+    for a in assets:
+        if a.enabled and getattr(a, "gas_price_eur_m3", 0.0) > 0:
+            gas_price_eur_m3 = a.gas_price_eur_m3
+            break
+
+    bgo = baseline_gen_override  or {}
+    blo = baseline_load_override or {}
+
     # ── Shiftable loads ─────────────────────────────────────────────
-    # For each shiftable load (e.g. ice bank chiller):
-    #   - baseline: keep the actual historical schedule
-    #   - optimised: run greedy_lp to reschedule to cheapest hours
     baseline_shiftable = np.zeros(n)
-    lp_shiftable = np.zeros(n)
-    total_daily_charged = 0.0
+    lp_shiftable       = np.zeros(n)
+    asset_loads: dict[str, dict] = {}
 
     for asset in assets:
-        if asset.asset_type != SHIFTABLE_LOAD or not asset.csv_column:
+        if asset.asset_type != SHIFTABLE_LOAD or not asset.enabled:
             continue
-        col = _COL_MAP.get(asset.csv_column, asset.csv_column)
-        actual = np.array([r.get(col, 0.0) for r in day_rows])  # historical kWh per hour
-        daily_sum = float(np.sum(actual))                        # total kWh consumed that day
-        total_daily_charged += daily_sum
-        # Allow the LP to charge up to the observed peak (or the configured limit)
-        hourly_max = max(asset.hourly_max_kwh, float(np.max(actual)))
 
+        # Baseline: historical CSV data if available, else synthetic block
+        if asset.name in blo:
+            actual = blo[asset.name].copy()
+        else:
+            actual = np.zeros(n)
+            if asset.daily_energy_kwh > 0:
+                start_h  = int(asset.baseline_start_hour)
+                end_h    = int(asset.baseline_end_hour)
+                if start_h < end_h:
+                    window_h = end_h - start_h
+                elif start_h > end_h:
+                    window_h = (24 - start_h) + end_h
+                else:
+                    window_h = 0
+                window_h = max(1, window_h)
+                load_per_h = min(
+                    asset.hourly_max_kwh,
+                    asset.daily_energy_kwh / window_h,
+                )
+                for t in range(n):
+                    h = int((start_hour + t * dt_hours)) % 24
+                    if _in_window(h, start_h, end_h):
+                        actual[t] = load_per_h
+
+        daily_sum = float(np.sum(actual))
+        if daily_sum <= 0:
+            continue
+
+        hourly_max = max(asset.hourly_max_kwh, float(np.max(actual)))
         baseline_shiftable += actual
-        # The LP keeps the same TOTAL daily energy but redistributes it
-        # to hours with the lowest total_price → cost saving via time-shifting
-        lp_shiftable += greedy_lp_ramped(
-            n, total_price, daily_sum, hourly_max,
+
+        # Optional flex window: restrict LP to certain hours only
+        fs = int(getattr(asset, "flex_start_hour", 0))
+        fe = int(getattr(asset, "flex_end_hour", 24))
+        if fs == 0 and fe == 24:
+            sched_prices = total_price
+        else:
+            sched_prices = total_price.astype(float).copy()
+            for t in range(n):
+                h = int((start_hour + t * dt_hours)) % 24
+                if not _in_window(h, fs, fe):
+                    sched_prices[t] = np.inf
+
+        lp_sched = greedy_lp_ramped(
+            n, sched_prices, daily_sum, hourly_max,
             ramp_up_pct=asset.ramp_up_pct_per_hour,
             ramp_down_pct=asset.ramp_down_pct_per_hour,
         )
+        lp_shiftable += lp_sched
 
-    # Baseline grid draw = non-shiftable base + actual shiftable schedule
-    baseline_load = remaining + baseline_shiftable
-    baseline_grid = net_usage                                    # use recorded net usage as-is
-    baseline_cost = baseline_grid * total_price / 1000.0        # EUR (price is per MWh → /1000)
+        asset_loads[asset.name] = {
+            "baseline":        actual.copy(),
+            "optimised":       lp_sched.copy(),
+            "daily_kwh":       daily_sum,
+            "cost_saving_eur": float(np.sum((actual - lp_sched) * total_price / 1000.0)),
+        }
 
     # ── Generators ──────────────────────────────────────────────────
-    # Aggregate on-site generation for the LP scenario (solar + CHP/WKK).
-    # Generator output reduces the net grid draw, lowering cost.
+    total_gen_baseline    = np.zeros(n)
     total_gen_lp_effective = np.zeros(n)
+    asset_generators: dict[str, dict] = {}
+    chp_heat_kw_lp = np.zeros(n)  # LP CHP exhaust heat → fed to thermal model
+    chp_gas_cost_baseline = np.zeros(n)  # Fuel cost of baseline CHP operation [EUR/slot]
+    chp_gas_cost_lp       = np.zeros(n)  # Fuel cost of LP CHP operation [EUR/slot]
 
     for asset in assets:
-        if asset.asset_type != GENERATOR:
+        if asset.asset_type != GENERATOR or not asset.enabled:
             continue
 
-        gen_kwh = np.zeros(n)
+        gen_full = np.zeros(n)  # baseline generation
 
-        # Solar: look up from the solar archive CSV (pre-computed)
+        # ─ Solar ──────────────────────────────────────────────────
         if asset.solar_csv:
-            for k in day_keys:
-                if k in solar_hours:
-                    arr = np.array(solar_hours[k][:n])
-                    if len(arr) < n:
-                        arr = np.pad(arr, (0, n - len(arr)))
-                    gen_kwh += arr
-                    break
+            if solar_hours and day_keys:
+                for k in day_keys:
+                    if k in solar_hours:
+                        arr = np.array(solar_hours[k][:n])
+                        if len(arr) < n:
+                            arr = np.pad(arr, (0, n - len(arr)))
+                        gen_full += arr
+                        break
+            else:
+                # Synthetic sinusoidal solar model (future mode)
+                cap = asset.capacity_kwp * dt_hours
+                for t in range(n):
+                    h = (start_hour + t * dt_hours) % 24
+                    if 6 <= h <= 18:
+                        gen_full[t] = max(0.0, np.sin(np.pi * (h - 6) / 12)) * cap
 
-        # CHP / WKK: read historical production from building CSV
-        if asset.csv_gen_column:
-            col = _COL_MAP.get(asset.csv_gen_column, asset.csv_gen_column)
-            gen_kwh += np.array([r.get(col, 0.0) for r in day_rows])
+            gen_lp = gen_full.copy()
+            if asset.decouple_below_eur_mwh is not None:
+                gen_lp = np.where(total_price >= asset.decouple_below_eur_mwh, gen_lp, 0.0)
 
-        # Price-based decoupling: some generators (e.g. solar feed-in) can be
-        # disabled when the spot price drops below a configured threshold.
-        # This models arbitrage decisions (e.g. don't export to grid at negative prices).
+            total_gen_baseline    += gen_full
+            total_gen_lp_effective += gen_lp
+            asset_generators[asset.name] = {
+                "gen_kwh":          gen_lp.copy(),
+                "gen_kwh_baseline": gen_full.copy(),
+                "cost_saving_eur":  float(np.sum((gen_lp - gen_full) * total_price / 1000.0)),
+            }
+            continue
+
+        # ─ CHP (spark-spread scheduled) ───────────────────────────
+        if asset.chp_elec_efficiency > 0:
+            gen_lp = _chp_optimal_schedule(n, total_price, asset, dt_hours)
+
+            # Baseline: historical CSV production OR synthetic window schedule
+            if asset.name in bgo:
+                gen_full = bgo[asset.name].copy()
+            else:
+                start_h = int(asset.baseline_start_hour)
+                end_h   = int(asset.baseline_end_hour)
+                cap_kwh = asset.capacity_kwp * dt_hours
+                for t in range(n):
+                    h = int((start_hour + t * dt_hours)) % 24
+                    if _in_window(h, start_h, end_h):
+                        gen_full[t] = cap_kwh
+
+            total_gen_baseline    += gen_full
+            total_gen_lp_effective += gen_lp
+
+            # Exhaust heat from LP CHP schedule
+            if asset.chp_heat_efficiency > 0:
+                heat_ratio = asset.chp_heat_efficiency / asset.chp_elec_efficiency
+                chp_heat_kw_lp += gen_lp * heat_ratio / dt_hours  # kW
+
+            # Gas fuel cost — subtract from savings so only the spark spread is shown
+            gp = asset.gas_price_eur_m3 if asset.gas_price_eur_m3 > 0 else 0.35
+            hv = asset.gas_energy_kwh_m3 if asset.gas_energy_kwh_m3 > 0 else 9.8
+            gas_cost_per_kwh_elec = gp / (hv * asset.chp_elec_efficiency)  # EUR/kWh
+            chp_gas_cost_baseline += gen_full * gas_cost_per_kwh_elec
+            chp_gas_cost_lp       += gen_lp   * gas_cost_per_kwh_elec
+
+            asset_generators[asset.name] = {
+                "gen_kwh":          gen_lp.copy(),
+                "gen_kwh_baseline": gen_full.copy(),
+                # Net saving = electricity value of extra generation minus extra gas cost
+                "cost_saving_eur":  float(np.sum(
+                    (gen_lp - gen_full) * (total_price / 1000.0 - gas_cost_per_kwh_elec)
+                )),
+            }
+            continue
+
+        # ─ Other generators (fixed CSV or capacity-based) ─────────
+        if asset.name in bgo:
+            gen_full = bgo[asset.name].copy()
+        elif asset.capacity_kwp > 0:
+            # Fixed-output generator — run during baseline window
+            start_h = int(asset.baseline_start_hour)
+            end_h   = int(asset.baseline_end_hour)
+            cap_kwh = asset.capacity_kwp * dt_hours
+            for t in range(n):
+                h = int((start_hour + t * dt_hours)) % 24
+                if _in_window(h, start_h, end_h):
+                    gen_full[t] = cap_kwh
+
+        gen_lp = gen_full.copy()
         if asset.decouple_below_eur_mwh is not None:
-            gen_kwh = np.where(
-                total_price >= asset.decouple_below_eur_mwh,
-                gen_kwh, 0.0,
-            )
-        total_gen_lp_effective += gen_kwh
+            gen_lp = np.where(total_price >= asset.decouple_below_eur_mwh, gen_lp, 0.0)
 
-    # ── Startup costs for generators ────────────────────────────────
-    # Count on/off transitions and multiply by configured startup cost.
+        total_gen_baseline    += gen_full
+        total_gen_lp_effective += gen_lp
+        asset_generators[asset.name] = {
+            "gen_kwh":          gen_lp.copy(),
+            "gen_kwh_baseline": gen_full.copy(),
+            "cost_saving_eur":  float(np.sum((gen_lp - gen_full) * total_price / 1000.0)),
+        }
+
+    # ── Startup costs ────────────────────────────────────────────────
     total_startup_cost = 0.0
     for asset in assets:
-        if asset.asset_type != GENERATOR or asset.startup_cost_eur <= 0:
+        if asset.asset_type != GENERATOR or asset.startup_cost_eur <= 0 or not asset.enabled:
             continue
-        gen_kwh = np.zeros(n)
-        if asset.csv_gen_column:
-            col = _COL_MAP.get(asset.csv_gen_column, asset.csv_gen_column)
-            gen_kwh = np.array([r.get(col, 0.0) for r in day_rows])
+        gen_kwh = asset_generators.get(asset.name, {}).get("gen_kwh", np.zeros(n))
         on = gen_kwh > 0
         starts = int(np.sum(on[1:] & ~on[:-1]))
-        if on[0]:
+        if len(on) > 0 and on[0]:
             starts += 1
         total_startup_cost += starts * asset.startup_cost_eur
 
-    # ── CHP exhaust heat for building thermal model ───────────────
-    # CHP heat output = gas_burned [m³] × calorific_value [kWh/m³] × heat_eff
-    # For historical sim, read CHP production from CSV and estimate gas burned.
-    chp_heat_kw = np.zeros(n)
-    for asset in assets:
-        if asset.asset_type != GENERATOR or not asset.csv_gen_column:
-            continue
-        col = _COL_MAP.get(asset.csv_gen_column, asset.csv_gen_column)
-        chp_elec = np.array([r.get(col, 0.0) for r in day_rows])  # kWh elec per hour
-        # Estimate heat from CHP: heat_eff / elec_eff × elec output
-        # Default: 0.45 / 0.40 = 1.125 kWh heat per kWh electricity
-        chp_heat_kw += chp_elec * (0.45 / 0.40)  # kW (hourly steps → kWh=kW)
+    # ── Building thermal simulation ──────────────────────────────────
+    # Priority: explicit thermal_params arg → GUI-saved config (disk) → hardcoded
+    tp = thermal_params or {}
+    def _tp(key: str, fallback: float) -> float:
+        if key in tp:
+            return tp[key]
+        if key in _THERMAL_CFG:
+            return _THERMAL_CFG[key]
+        return fallback
 
-    # ── Building thermal simulation ─────────────────────────────────
-    thermal_result = simulate_building_thermal(
+    thermal_common = dict(
         n_steps=n,
-        dt_hours=1.0,  # hourly steps for historical
-        initial_temp_c=21.0,  # default; overridden by config in dialog
-        setpoint_c=21.0,
-        deadband_c=1.0,
-        cooldown_rate_c_per_hour=0.5,
-        thermal_mass_kwh_per_c=500.0,
+        dt_hours=dt_hours,
+        initial_temp_c=_tp("initial_temp_c", 21.0),
+        setpoint_c=_tp("setpoint_c", 21.0),
+        deadband_c=_tp("deadband_c", 1.0),
+        cooldown_rate_c_per_hour=_tp("cooldown_rate_c_per_hour", 0.5),
+        thermal_mass_kwh_per_c=_tp("thermal_mass_kwh_per_c", 50.0),
         assets=assets,
         prices=total_price,
-        chp_heat_kw=chp_heat_kw,
+        beo_initial_temp_c=_tp("beo_initial_temp_c", 12.0),
+        chp_heat_kw=chp_heat_kw_lp,
+        gas_price_eur_m3=gas_price_eur_m3,
     )
+    # Baseline thermal: constant rule — always maintain setpoint
+    baseline_thermal = simulate_building_thermal(**thermal_common, price_aware=False)
+    # LP thermal: price-aware — pre-heat during cheap slots
+    thermal_result = simulate_building_thermal(**thermal_common, price_aware=True)
 
-    # ── LP result ───────────────────────────────────────────────────
-    # Net grid draw under the LP schedule = base load + shifted demand - generation
-    lp_load = remaining + lp_shiftable
-    lp_grid = lp_load - total_gen_lp_effective
-    lp_cost = lp_grid * total_price / 1000.0   # EUR
-    # Add startup costs to optimised total
+    # ── Costs ────────────────────────────────────────────────────────
+    baseline_load = base_load + baseline_shiftable
+    baseline_grid = np.maximum(baseline_load - total_gen_baseline, 0.0)
+    baseline_cost = baseline_grid * total_price / 1000.0 + chp_gas_cost_baseline
+    baseline_cost += baseline_thermal["heating_cost"]
+
+    lp_load = base_load + lp_shiftable
+    lp_grid = np.maximum(lp_load - total_gen_lp_effective, 0.0)
+    lp_cost = lp_grid * total_price / 1000.0 + chp_gas_cost_lp
     if n > 0 and total_startup_cost > 0:
         lp_cost[0] += total_startup_cost
-    # Add heating costs
     lp_cost += thermal_result["heating_cost"]
+
+    heating_saving_eur = float(baseline_thermal["heating_cost"].sum()) - float(thermal_result["heating_cost"].sum())
+    heating_baseline_cost_eur = float(baseline_thermal["heating_cost"].sum())
+    heating_saving_pct = (
+        (heating_saving_eur / heating_baseline_cost_eur * 100)
+        if heating_baseline_cost_eur > 0 else 0.0
+    )
+
+    total_load_shifted = sum(float(np.sum(ad["baseline"])) for ad in asset_loads.values())
 
     return {
         "baseline":           baseline_cost,
@@ -563,11 +894,78 @@ def simulate_day(
         "baseline_grid_kwh":  baseline_grid,
         "optimised_grid_kwh": lp_grid,
         "prices_elec":        prices_elec,
-        "load_shifted":       total_daily_charged,
+        "load_shifted":       total_load_shifted,
         "total_generation":   float(np.sum(total_gen_lp_effective)),
         "startup_cost":       total_startup_cost,
         "temp_profile":       thermal_result["temp_profile"],
         "heating_kw":         thermal_result["heating_kw"],
         "beo_temp":           thermal_result["beo_temp"],
+        "heating_saving_eur": heating_saving_eur,
+        "heating_saving_pct": heating_saving_pct,
+        "heating_baseline_cost_eur": heating_baseline_cost_eur,
         "n_slots":            n,
+        "asset_loads":        asset_loads,
+        "asset_generators":   asset_generators,
     }
+
+
+# ===================================================================
+# Historical day simulation (asset-driven)
+# ===================================================================
+
+# Column name → parsed row-dict key mapping
+_COL_MAP = {
+    "TotalChiller":  "total_chiller",
+    "ChillerBanks":  "chiller_banks",
+    "ProductionWKK": "production_wkk",
+}
+
+
+def simulate_day(
+    day_rows: list[dict],
+    assets: list[EnergyAsset],
+    solar_hours: dict[str, list[float]],
+    day_keys: list[str],
+    thermal_params: dict | None = None,
+) -> dict:
+    """Compare baseline vs LP-optimised cost for one historical day.
+
+    Thin wrapper around :func:`simulate_slots` that extracts input
+    arrays from the historical building CSV rows and builds baseline
+    override dicts from measured production and load data.
+    """
+    n = len(day_rows)
+    remaining   = np.array([r["remaining_usage"] for r in day_rows])
+    prices_elec = np.array([r["prices_elec"]     for r in day_rows])
+
+    # Build baseline override dicts from measured CSV data
+    bgo: dict[str, np.ndarray] = {}  # generator baselines
+    blo: dict[str, np.ndarray] = {}  # shiftable-load baselines
+
+    for asset in assets:
+        if not asset.enabled:
+            continue
+        if asset.asset_type == GENERATOR and asset.csv_gen_column:
+            col = _COL_MAP.get(asset.csv_gen_column, asset.csv_gen_column)
+            bgo[asset.name] = np.array([r.get(col, 0.0) for r in day_rows])
+        if asset.asset_type == SHIFTABLE_LOAD and asset.csv_column:
+            col = _COL_MAP.get(asset.csv_column,
+                               asset.csv_column.lower().replace(" ", "_"))
+            arr = np.array([r.get(col, 0.0) for r in day_rows])
+            # Only use CSV if it has meaningful data
+            if float(np.sum(arr)) >= asset.hourly_max_kwh * 0.5:
+                blo[asset.name] = arr
+
+    return simulate_slots(
+        n=n,
+        prices_elec=prices_elec,
+        base_load=remaining,
+        assets=assets,
+        solar_hours=solar_hours,
+        day_keys=day_keys,
+        dt_hours=1.0,
+        baseline_gen_override=bgo,
+        baseline_load_override=blo,
+        thermal_params=thermal_params,
+    )
+

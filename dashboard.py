@@ -207,8 +207,12 @@ class ScadaWindow(QMainWindow):
         *side* is ``"input"`` (power / value) or ``"output"`` (status).
         Generators get power on input, ON/OFF on output.
         Shiftable loads only appear on output with power + status.
+        Heating assets (HEAT_PUMP, GAS_HEATER) show total heating kW.
         """
-        from energy_assets import SHIFTABLE_LOAD as _SL, GENERATOR as _GEN
+        from energy_assets import (
+            SHIFTABLE_LOAD as _SL, GENERATOR as _GEN,
+            HEAT_PUMP as _HP, GAS_HEATER as _GH,
+        )
 
         uid = asset.uid
 
@@ -253,11 +257,54 @@ class ScadaWindow(QMainWindow):
                 "decimals": 1,
             }
 
+        # ── Heat pumps ───────────────────────────────────────────
+        if asset.asset_type == _HP:
+            if side == "input":
+                return {
+                    "mode": "smpc",
+                    "field": "heating_power_kw",
+                    "unit": "kW",
+                    "decimals": 1,
+                    "multiplier": 1,
+                    "color": "#f59e0b",
+                }
+            return {
+                "mode": "smpc_state",
+                "field": "heating_power_kw",
+                "threshold": 0.1,
+                "above": "HEATING",
+                "below": "IDLE",
+                "colors": {"HEATING": "#dc2626", "IDLE": "#16a34a"},
+            }
+
+        # ── Gas heaters ──────────────────────────────────────────
+        if asset.asset_type == _GH:
+            if side == "input":
+                return {
+                    "mode": "smpc",
+                    "field": "heating_power_kw",
+                    "unit": "kW",
+                    "decimals": 1,
+                    "multiplier": 1,
+                    "color": "#ef4444",
+                }
+            return {
+                "mode": "smpc_state",
+                "field": "heating_power_kw",
+                "threshold": 0.1,
+                "above": "HEATING",
+                "below": "IDLE",
+                "colors": {"HEATING": "#dc2626", "IDLE": "#16a34a"},
+            }
+
         return {}
 
     def _populate_columns(self):
         """Build input/output tag lists from energy assets and populate."""
-        from energy_assets import load_assets as _load_ea, SHIFTABLE_LOAD as _SL
+        from energy_assets import (
+            load_assets as _load_ea,
+            SHIFTABLE_LOAD as _SL, HEAT_PUMP as _HP, GAS_HEATER as _GH,
+        )
         input_tags: list[dict] = []
         output_tags: list[dict] = []
         for asset in _load_ea():
@@ -265,14 +312,18 @@ class ScadaWindow(QMainWindow):
                 "id": asset.uid,
                 "name": asset.name,
                 "icon": asset.icon,
-                "section": "CONTROLLABLE" if asset.asset_type == _SL else "GENERATION",
+                "section": (
+                    "CONTROLLABLE" if asset.asset_type == _SL
+                    else "HEATING" if asset.asset_type in (_HP, _GH)
+                    else "GENERATION"
+                ),
             }
             if asset.asset_type == _SL:
                 # Shiftable loads → output column only
                 out_tag = dict(base, simulation=self._simulation_for_asset(asset, "output"))
                 output_tags.append(out_tag)
             else:
-                # Generators → both columns (power on input, status on output)
+                # Generators + heating assets → both columns (power on input, status on output)
                 in_tag = dict(base, simulation=self._simulation_for_asset(asset, "input"))
                 out_tag = dict(base, simulation=self._simulation_for_asset(asset, "output"))
                 input_tags.append(in_tag)
@@ -463,6 +514,7 @@ class ScadaWindow(QMainWindow):
         self._update_tag_labels()
         self._update_price_for_slot()
         self._update_center()
+        self._update_thermal_labels()
 
     def wheelEvent(self, event):
         """Scroll wheel adjusts the time-slot slider."""
@@ -750,35 +802,45 @@ class ScadaWindow(QMainWindow):
     def _update_thermal_labels(self):
         """Update building temperature display from LP outputs."""
         out = self.last_lp_outputs
-        if out is not None:
-            temp = out.building_temp_c
-            sp = out.building_setpoint_c
-            heat = out.heating_power_kw
-            beo = out.beo_temp_c
+        if out is None:
+            return
 
-            # Temperature colour: green=OK, orange=near limit, red=out of band
-            diff = abs(temp - sp)
-            if diff < 1.0:
-                colour = "#16a34a"
-            elif diff < 2.0:
-                colour = "#f59e0b"
-            else:
-                colour = "#dc2626"
+        step = max(0, self._selected_step)
 
-            self.building_temp_label.setText(f"{temp:.1f} °C")
-            self.building_temp_label.setStyleSheet(value_css(colour))
+        def _plan(arr, fallback):
+            """Return plan value at `step`, falling back to first-step scalar."""
+            if arr is not None and len(arr) > step:
+                return float(arr[step])
+            return fallback
 
-            self.building_setpoint_label.setText(f"{sp:.1f} °C")
-            self.building_setpoint_label.setStyleSheet(value_css("#0f766e"))
+        temp = _plan(out.plan_building_temp_c, out.building_temp_c)
+        sp   = out.building_setpoint_c
+        heat = _plan(out.plan_heating_kw, out.heating_power_kw)
+        beo  = _plan(out.plan_beo_temp_c, out.beo_temp_c)
 
-            heat_colour = "#dc2626" if heat > 0 else "#64748b"
-            self.heating_power_label.setText(
-                f"{heat:.1f} kW" if heat > 0 else "Off"
-            )
-            self.heating_power_label.setStyleSheet(value_css(heat_colour))
+        # Temperature colour: green=OK, orange=near limit, red=out of band
+        diff = abs(temp - sp)
+        if diff < 1.0:
+            colour = "#16a34a"
+        elif diff < 2.0:
+            colour = "#f59e0b"
+        else:
+            colour = "#dc2626"
 
-            self.beo_temp_label.setText(f"{beo:.1f} °C")
-            self.beo_temp_label.setStyleSheet(value_css("#0f766e"))
+        self.building_temp_label.setText(f"{temp:.1f} °C")
+        self.building_temp_label.setStyleSheet(value_css(colour))
+
+        self.building_setpoint_label.setText(f"{sp:.1f} °C")
+        self.building_setpoint_label.setStyleSheet(value_css("#0f766e"))
+
+        heat_colour = "#dc2626" if heat > 0 else "#64748b"
+        self.heating_power_label.setText(
+            f"{heat:.1f} kW" if heat > 0 else "Off"
+        )
+        self.heating_power_label.setStyleSheet(value_css(heat_colour))
+
+        self.beo_temp_label.setText(f"{beo:.1f} °C")
+        self.beo_temp_label.setStyleSheet(value_css("#0f766e"))
 
     # ------------------------------------------------------------------
     # Centre panel updates
@@ -802,7 +864,11 @@ class ScadaWindow(QMainWindow):
                         break
             else:
                 start, end = "", ""
-            sel_idx = (idx + self._selected_step) if idx is not None and self._selected_step > 0 else None
+            if idx is not None and self._selected_step != 0:
+                _si = idx + self._selected_step
+                sel_idx = _si if 0 <= _si < len(prices) else None
+            else:
+                sel_idx = None
             gw = max(self.center_price_graph_label.width(), 300)
             gh = self.center_price_graph_label.height() or 200
             self.center_price_graph_label.setPixmap(
@@ -832,7 +898,11 @@ class ScadaWindow(QMainWindow):
                         break
             else:
                 start, end = "", ""
-            sel_idx = (idx + self._selected_step) if idx is not None and self._selected_step > 0 else None
+            if idx is not None and self._selected_step != 0:
+                _si = idx + self._selected_step
+                sel_idx = _si if 0 <= _si < len(values) else None
+            else:
+                sel_idx = None
             gw = max(self.center_solar_graph_label.width(), 300)
             gh = self.center_solar_graph_label.height() or 200
             self.center_solar_graph_label.setPixmap(
@@ -911,7 +981,12 @@ class ScadaWindow(QMainWindow):
                 base_load_kwh=base_load,
                 solar_pred_kwh=solar_kwh,
                 month=month,
+                building_temp_c=self._building_temp_c,
             )
+            # Carry building temperature forward for the next LP call.
+            # building_temp_c = temp at END of step 0 = start of next slot.
+            if self.last_lp_outputs is not None:
+                self._building_temp_c = self.last_lp_outputs.building_temp_c
         except Exception as exc:
             logger.warning("LP solve: %s", exc)
 

@@ -127,7 +127,7 @@ class SMPCConfig:
     # --- Building thermal model ---------------------------------------------
     building_setpoint_c:        float =  21.0   # Target indoor temperature [°C]
     building_deadband_c:        float =   1.0   # Acceptable deviation ± [°C]
-    building_initial_temp_c:    float =  21.0   # Start temperature when dashboard boots
+    building_initial_temp_c:    float =  18.0   # Start temperature when dashboard boots
     cooldown_rate_c_per_hour:   float =   0.5   # Natural heat loss rate [°C/h]
     thermal_mass_kwh_per_c:     float = 500.0   # Thermal inertia: kWh to raise building 1 °C
 
@@ -343,6 +343,15 @@ class SMPCOutputs:
     heating_power_kw:    float = 0.0     # Total active heating this step [kW]
     beo_temp_c:          float = 12.0    # BEO-veld ground temperature [°C]
 
+    # Shape: (horizon_steps,) — full building temperature profile
+    plan_building_temp_c: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # Shape: (horizon_steps,) — full heating power profile [kW]
+    plan_heating_kw: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # Shape: (horizon_steps,) — full BEO-veld temperature profile [°C]
+    plan_beo_temp_c: np.ndarray = field(default_factory=lambda: np.array([]))
+
 
 # ===========================================================================
 # SECTION 3: PRICE SCENARIO GENERATOR
@@ -395,7 +404,12 @@ def _generate_price_scenarios(
 # ===========================================================================
 
 
-from lp_solver import greedy_lp as _greedy_lp, greedy_lp_ramped as _greedy_lp_ramped, simulate_building_thermal as _simulate_thermal
+from lp_solver import (
+    greedy_lp as _greedy_lp,
+    greedy_lp_ramped as _greedy_lp_ramped,
+    simulate_building_thermal as _simulate_thermal,
+    _chp_optimal_schedule as _chp_schedule,
+)
 
 
 def _optimise_summer_cvxpy(
@@ -922,6 +936,7 @@ class SMPCCalculator:
         base_load_kwh: np.ndarray | None = None,
         solar_pred_kwh: np.ndarray | None = None,
         month: int = 7,
+        building_temp_c: float | None = None,
     ) -> SMPCOutputs:
         """Asset-driven greedy LP over a 24-hour rolling window.
 
@@ -1003,38 +1018,42 @@ class SMPCCalculator:
                 )
             total_gen += gen
 
-        # ── CHP / WKK scheduling (simple spark-spread rule) ─────────
-        # Run the CHP when it is profitable: the electricity it produces
-        # offsets grid import, so its value = spot + grid fee.  If that
-        # revenue exceeds the gas cost we run it at full capacity.
-        # Heat output is treated as a free byproduct — a simple rule that
-        # ignores buffer constraints.  TODO: replace with proper heat-
-        # demand-aware optimisation when real heat data is available.
+        # ── CHP / WKK scheduling via spark-spread LP ────────────────
+        # Use the same _chp_optimal_schedule() as the historical LP so
+        # the logic is identical: fire only when market price > variable
+        # gas cost, prune short blocks whose gross profit < startup cost.
         gas_plan = np.zeros(H)
         wkk_elec_plan = np.zeros(H)
-        wkk_max_gas = cfg.wkk_max_gas_m3
+        chp_heat_kw_arr = np.zeros(H)
+        chp_gas_cost_arr = np.zeros(H)   # fuel cost per step [EUR]
+        total_price_mwh = total_price * 1000.0  # EUR/kWh → EUR/MWh for _chp_schedule
 
-        if wkk_max_gas > 0:
-            gas_cost_per_m3 = cfg.gas_price_eur_m3
-            gas_energy = cfg.gas_energy_kwh_m3
-            elec_eff = cfg.wkk_elec_efficiency
-            for t in range(H):
-                # Revenue from 1 m³ gas converted to electricity
-                elec_per_m3 = gas_energy * elec_eff       # kWh per m³
-                revenue_per_m3 = elec_per_m3 * total_price[t]  # EUR per m³
-                # Simple rule: run CHP when revenue > gas cost
-                if revenue_per_m3 > gas_cost_per_m3:
-                    gas_plan[t] = wkk_max_gas
-            wkk_elec_plan = gas_plan * gas_energy * elec_eff
-            total_gen += wkk_elec_plan
+        for asset in assets:
+            if asset.asset_type != GENERATOR or not asset.enabled:
+                continue
+            elec_eff = getattr(asset, "chp_elec_efficiency", 0.0)
+            if elec_eff <= 0:
+                continue
+            gen_kwh = _chp_schedule(H, total_price_mwh, asset, dt_hours=0.25)
+            wkk_elec_plan += gen_kwh
+            gas_per_step = gen_kwh / (asset.gas_energy_kwh_m3 * elec_eff)
+            gas_plan += gas_per_step
+            gp = asset.gas_price_eur_m3 if asset.gas_price_eur_m3 > 0 else cfg.gas_price_eur_m3
+            chp_gas_cost_arr += gas_per_step * gp
+            heat_eff = getattr(asset, "chp_heat_efficiency", 0.0)
+            if heat_eff > 0:
+                # kWh thermal per 15-min step → kW
+                chp_heat_kw_arr += gen_kwh * (heat_eff / elec_eff) / 0.25
+
+        total_gen += wkk_elec_plan
 
         # ── Startup costs for generators ────────────────────────────
         total_startup_cost = 0.0
         for asset in assets:
             if asset.asset_type != GENERATOR or asset.startup_cost_eur <= 0:
                 continue
-            # For CHP: detect on/off transitions in gas_plan
-            if asset.csv_gen_column or (not asset.solar_csv):
+            # For CHP assets: detect on/off transitions in gas_plan
+            if getattr(asset, "chp_elec_efficiency", 0.0) > 0:
                 on = gas_plan > 0
             else:
                 gen_chk = solar.copy()
@@ -1047,48 +1066,41 @@ class SMPCCalculator:
                 starts += 1
             total_startup_cost += starts * asset.startup_cost_eur
 
-        # ── CHP exhaust heat for thermal model ──────────────────────
-        # CHP heat output per step [kW] = gas_plan [m³/step] × calorific [kWh/m³] × heat_eff / dt
-        chp_heat_kw = gas_plan * cfg.gas_energy_kwh_m3 * cfg.wkk_heat_efficiency / 0.25
-
         # ── Building thermal simulation ─────────────────────────────
         # Run the thermal model to track building temperature and
         # compute heating actions from gas heaters and heat pumps.
+        # CHP exhaust heat (chp_heat_kw_arr) is fed in as free heat.
+        # Use the carried-over building temperature if provided; otherwise
+        # fall back to the configured initial value (dashboard boot).
+        initial_temp = building_temp_c if building_temp_c is not None else cfg.building_initial_temp_c
         thermal_result = _simulate_thermal(
             n_steps=H,
             dt_hours=0.25,  # 15-minute steps
-            initial_temp_c=cfg.building_initial_temp_c,
+            initial_temp_c=initial_temp,
             setpoint_c=cfg.building_setpoint_c,
             deadband_c=cfg.building_deadband_c,
             cooldown_rate_c_per_hour=cfg.cooldown_rate_c_per_hour,
             thermal_mass_kwh_per_c=cfg.thermal_mass_kwh_per_c,
             assets=assets,
-            prices=total_price * 1000.0,  # convert to EUR/MWh for cost calc
-            chp_heat_kw=chp_heat_kw,
+            prices=total_price * 1000.0,  # EUR/kWh → EUR/MWh for ordering
+            chp_heat_kw=chp_heat_kw_arr,
+            gas_price_eur_m3=cfg.gas_price_eur_m3,
+            price_aware=True,
         )
 
-        # Add heat pump electrical consumption to grid draw
-        hp_elec_per_step = np.zeros(H)
-        for hp_asset in assets:
-            if hp_asset.asset_type == HEAT_PUMP and hp_asset.enabled:
-                # Distribute heat pump usage across steps based on heating_kw
-                if thermal_result["heating_kw"].sum() > 0:
-                    hp_frac = hp_asset.heating_capacity_kw / max(
-                        1.0, sum(a.heating_capacity_kw for a in assets
-                                 if a.asset_type == HEAT_PUMP and a.enabled)
-                    )
-                    hp_heat_kw = thermal_result["heating_kw"] * hp_frac
-                    hp_elec_per_step += (hp_heat_kw / hp_asset.cop) * 0.25  # kWh per 15-min
-
         # ── Cost comparison ─────────────────────────────────────────
+        # HP electrical consumption comes directly from thermal simulation
+        hp_elec_per_step = thermal_result["hp_elec_kwh_per_step"]
+
         baseline_grid = base + baseline_shiftable - total_gen
         lp_grid = base + lp_shiftable - total_gen + hp_elec_per_step
 
-        # Gas cost for CHP operation
-        gas_cost_arr = gas_plan * cfg.gas_price_eur_m3
+        # Gas costs: CHP fuel (per-asset price) + gas heater fuel
+        # HP elec cost is already embedded in lp_grid * total_price
+        gas_heater_cost_arr = thermal_result["gas_heater_cost"]
 
-        baseline_cost = baseline_grid * total_price + gas_cost_arr
-        lp_cost = lp_grid * total_price + gas_cost_arr
+        baseline_cost = baseline_grid * total_price + chp_gas_cost_arr
+        lp_cost = lp_grid * total_price + chp_gas_cost_arr + gas_heater_cost_arr
         # Add startup costs to optimised scenario
         if H > 0 and total_startup_cost > 0:
             lp_cost[0] += total_startup_cost
@@ -1112,7 +1124,7 @@ class SMPCCalculator:
             wkk_gas_setpoint_m3    = float(gas_plan[0]),
             net_power_kwh          = net_now,
             wkk_elec_kwh           = float(wkk_elec_plan[0]),
-            wkk_heat_kwh           = float(gas_plan[0] * cfg.gas_energy_kwh_m3 * cfg.wkk_heat_efficiency),
+            wkk_heat_kwh           = float(chp_heat_kw_arr[0] * 0.25) if H > 0 else 0.0,
             smpc_cost_eur          = lp_cost_now,
             baseline_cost_eur      = bl_cost_now,
             cost_saving_eur        = bl_cost_now - lp_cost_now,
@@ -1128,10 +1140,13 @@ class SMPCCalculator:
             solver_used   = "greedy_lp",
             solver_status = "optimal",
             solve_time_ms = solve_ms,
-            building_temp_c    = float(thermal_result["temp_profile"][0]) if H > 0 else cfg.building_initial_temp_c,
-            building_setpoint_c = cfg.building_setpoint_c,
-            heating_power_kw   = float(thermal_result["heating_kw"][0]) if H > 0 else 0.0,
-            beo_temp_c         = float(thermal_result["beo_temp"][0]) if H > 0 else 12.0,
+            building_temp_c      = float(thermal_result["temp_profile"][0]) if H > 0 else cfg.building_initial_temp_c,
+            building_setpoint_c  = cfg.building_setpoint_c,
+            heating_power_kw     = float(thermal_result["heating_kw"][0]) if H > 0 else 0.0,
+            beo_temp_c           = float(thermal_result["beo_temp"][0]) if H > 0 else 12.0,
+            plan_building_temp_c = thermal_result["temp_profile"],
+            plan_heating_kw      = thermal_result["heating_kw"],
+            plan_beo_temp_c      = thermal_result["beo_temp"],
         )
 
     # ------------------------------------------------------------------
@@ -1174,6 +1189,7 @@ class SMPCCalculator:
             wkk_elec = round(wkk_gas * cfg.gas_energy_kwh_m3 * cfg.wkk_elec_efficiency, 1)
             wkk_heat = round(wkk_gas * cfg.gas_energy_kwh_m3 * cfg.wkk_heat_efficiency, 1)
 
+            heating_kw = _plan_val(outputs.plan_heating_kw, step)
             d = {
                 "ice_bank_charge_kwh":     ice_charge,
                 "ice_bank_discharge_kwh":  ice_discharge,
@@ -1181,6 +1197,7 @@ class SMPCCalculator:
                 "net_power_kwh":           net_power,
                 "wkk_elec_kwh":            wkk_elec,
                 "wkk_heat_kwh":            wkk_heat,
+                "heating_power_kw":        heating_kw,
                 "smpc_cost_eur":           0.0,
                 "baseline_cost_eur":       0.0,
                 "cost_saving_eur":         0.0,
@@ -1202,6 +1219,7 @@ class SMPCCalculator:
             "net_power_kwh":           round(outputs.net_power_kwh,           1),
             "wkk_elec_kwh":            round(outputs.wkk_elec_kwh,            1),
             "wkk_heat_kwh":            round(outputs.wkk_heat_kwh,            1),
+            "heating_power_kw":        round(outputs.heating_power_kw,        1),
             "smpc_cost_eur":           round(outputs.smpc_cost_eur,           4),
             "baseline_cost_eur":       round(outputs.baseline_cost_eur,       4),
             "cost_saving_eur":         round(outputs.cost_saving_eur,         4),

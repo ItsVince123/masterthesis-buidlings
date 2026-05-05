@@ -76,6 +76,12 @@ class EnergyAsset:
     daily_energy_kwh: float = 0.0      # fixed daily energy demand (0 = from CSV)
     ramp_up_pct_per_hour: float = 100.0    # max ramp-up rate [% of hourly_max / hour]
     ramp_down_pct_per_hour: float = 100.0  # max ramp-down rate [% of hourly_max / hour]
+    # Fixed-block baseline schedule (used when csv_column is empty)
+    baseline_start_hour: int = 9           # hour index when fixed baseline starts (inclusive)
+    baseline_end_hour: int = 19            # hour index when fixed baseline ends (exclusive)
+    # Flexible hours window (optional LP constraint — 0/24 = unrestricted)
+    flex_start_hour: int = 0               # LP may only schedule from this hour (inclusive)
+    flex_end_hour: int = 24                # LP may only schedule until this hour (exclusive)
 
     # ── Generator properties ────────────────────────────────────────
     capacity_kwp: float = 0.0          # installed capacity (for solar)
@@ -83,6 +89,12 @@ class EnergyAsset:
     csv_gen_column: str = ""           # CSV column for non-solar gen (optional)
     decouple_below_eur_mwh: float | None = None  # disconnect when price < this
     startup_cost_eur: float = 0.0      # one-off cost each time unit starts up
+
+    # ── CHP / cogeneration properties (GENERATOR type) ─────────────
+    chp_elec_efficiency: float = 0.0   # electrical efficiency; >0 flags this as a CHP
+    chp_heat_efficiency: float = 0.0   # recoverable exhaust-heat fraction of fuel input
+    gas_price_eur_m3: float = 0.0      # gas price [EUR/m³] (0 → use SMPC config default)
+    gas_energy_kwh_m3: float = 9.8     # calorific value of gas [kWh/m³]
 
     # ── Storage properties ──────────────────────────────────────────
     storage_capacity_kwh: float = 0.0  # total storage capacity

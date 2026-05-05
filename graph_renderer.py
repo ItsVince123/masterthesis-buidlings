@@ -107,7 +107,7 @@ def draw_series_graph(
         painter.drawText(x_now + 4, pad_t + 12, "Now")
 
     # Selected slot marker (purple dashed line)
-    if selected_index is not None and selected_index > 0 and 0 <= selected_index < n:
+    if selected_index is not None and 0 <= selected_index < n:
         sel_pen = QPen(QColor("#7c3aed"))
         sel_pen.setWidth(2)
         sel_pen.setStyle(Qt.PenStyle.DashLine)
@@ -115,7 +115,9 @@ def draw_series_graph(
         x_sel = int(pad_l + selected_index * slot_w)
         painter.drawLine(x_sel, pad_t, x_sel, height - pad_b)
         painter.setPen(QPen(QColor("#7c3aed")))
-        painter.drawText(x_sel + 4, pad_t + 12, "\u25bc")
+        fm = painter.fontMetrics()
+        arrow_w = fm.horizontalAdvance("\u25bc")
+        painter.drawText(x_sel - arrow_w // 2, pad_t + 12, "\u25bc")
 
     # Axis labels
     text_pen = QPen(QColor("#334155"))
