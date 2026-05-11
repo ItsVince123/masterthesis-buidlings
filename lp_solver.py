@@ -59,6 +59,39 @@ def reload_thermal_config() -> None:
     _THERMAL_CFG = _read_thermal_cfg()
 
 
+def _read_hw_cfg() -> dict:
+    """Return hot water tank settings — from a HOT_WATER_HEATER asset if one
+    exists, otherwise fall back to smpc.building.hot_water_tank in config."""
+    try:
+        from energy_assets import load_assets, HOT_WATER_HEATER
+        for a in load_assets():
+            if a.asset_type == HOT_WATER_HEATER and a.enabled:
+                return {
+                    "enabled":          True,
+                    "tank_volume_l":    a.hw_tank_volume_l,
+                    "min_temp_c":       a.hw_min_temp_c,
+                    "max_temp_c":       a.hw_max_temp_c,
+                    "initial_temp_c":   a.hw_initial_temp_c,
+                    "heat_loss_w":      a.hw_heat_loss_w,
+                    "heater_power_kw":  a.hw_heater_power_kw,
+                }
+    except Exception:
+        pass
+    try:
+        return _load_cfg().get("smpc", {}).get("building", {}).get("hot_water_tank", {})
+    except Exception:
+        return {}
+
+
+_HW_CFG: dict = _read_hw_cfg()
+
+
+def reload_hw_config() -> None:
+    """Re-read hot water tank settings from disk (call after GUI saves)."""
+    global _HW_CFG
+    _HW_CFG = _read_hw_cfg()
+
+
 # ===================================================================
 # Utility
 # ===================================================================
@@ -182,6 +215,30 @@ def greedy_lp_ramped(
     return schedule
 
 
+def _effective_prices(
+    total_price: np.ndarray,
+    gen_surplus: np.ndarray,
+    max_per_step: float,
+) -> np.ndarray:
+    """Return prices reduced where free solar/CHP generation creates a surplus.
+
+    For each slot, the fraction ``min(surplus, max_per_step) / max_per_step``
+    of any scheduled load is covered by zero-marginal-cost generation.
+    The effective marginal grid cost is scaled down accordingly, making
+    surplus slots appear cheaper to the greedy LP scheduler.
+
+    Parameters
+    ----------
+    total_price  : grid price array [any consistent units, e.g. EUR/MWh]
+    gen_surplus  : free generation above fixed base load per slot [kWh]
+    max_per_step : maximum shiftable load per slot for this asset [kWh]
+    """
+    if max_per_step <= 0:
+        return total_price
+    frac_free = np.minimum(gen_surplus, max_per_step) / max_per_step
+    return total_price * np.maximum(0.0, 1.0 - frac_free)
+
+
 # ===================================================================
 # Building thermal simulation
 # ===================================================================
@@ -200,6 +257,8 @@ def simulate_building_thermal(
     chp_heat_kw: np.ndarray | None = None,
     gas_price_eur_m3: float = 0.35,
     price_aware: bool = False,
+    outside_temp_c: np.ndarray | None = None,
+    ua_kwh_per_c_per_h: float = 2.5,
 ) -> dict:
     """Simulate building temperature over a horizon with heating assets.
 
@@ -262,6 +321,10 @@ def simulate_building_thermal(
             break
 
     # ── Physical parameters for price-aware look-ahead ──────────────
+    # drift_per_step is the fixed-rate fallback used to pre-compute
+    # steps_to_recover (a conservative worst-case estimate).
+    # Per-step drift is computed dynamically in the loop using Newton's law
+    # when outside_temp_c is provided.
     drift_per_step = cooldown_rate_c_per_hour * dt_hours  # °C lost per step (no heating)
 
     # Total installed heating capacity across all enabled assets [kW]
@@ -284,8 +347,15 @@ def simulate_building_thermal(
     steps_to_recover = max(0, int(np.ceil(deadband_c / net_heat_rate)) - 1)
 
     for t in range(n_steps):
-        # Natural cooling
-        current_temp -= cooldown_rate_c_per_hour * dt_hours
+        # Natural cooling — Newton's law when outside temp is available,
+        # else fall back to fixed rate.
+        if (outside_temp_c is not None and t < len(outside_temp_c)
+                and thermal_mass_kwh_per_c > 0):
+            _delta_out = current_temp - float(outside_temp_c[t])
+            step_drift = ua_kwh_per_c_per_h * _delta_out * dt_hours / thermal_mass_kwh_per_c
+        else:
+            step_drift = cooldown_rate_c_per_hour * dt_hours
+        current_temp -= step_drift
 
         # CHP exhaust heat (free heating from cogeneration)
         chp_kwh = 0.0
@@ -315,7 +385,7 @@ def simulate_building_thermal(
             elif current_temp < setpoint_c and prices is not None:
                 slack = current_temp - lower_limit          # °C above floor
                 steps_until_forced = (
-                    int(slack / drift_per_step) if drift_per_step > 0 else n_steps
+                    int(slack / step_drift) if step_drift > 0 else n_steps
                 )
                 defer_window = max(0, steps_until_forced - steps_to_recover)
                 if defer_window == 0:
@@ -410,6 +480,128 @@ def simulate_building_thermal(
         "hp_elec_kwh_per_step": hp_elec_kwh_per_step,
         "gas_used_m3": gas_total,
         "elec_used_kwh": elec_total,
+    }
+
+
+# ===================================================================
+# Hot water tank simulation (electric, COP = 1)
+# ===================================================================
+
+def simulate_hot_water_tank(
+    n_steps: int,
+    dt_hours: float,
+    initial_temp_c: float,
+    min_temp_c: float,
+    max_temp_c: float,
+    heat_loss_w: float,
+    heater_power_kw: float,
+    tank_volume_l: float,
+    prices: np.ndarray | None = None,
+    price_aware: bool = False,
+) -> dict:
+    """Simulate a domestic hot water tank with price-aware electric heating.
+
+    The heating element has COP = 1 (pure electric resistance).
+
+    Physics
+    -------
+    - Thermal mass: C_water ≈ 1.163 Wh/(L·°C)  →  mass = volume × C_water [kWh/°C]
+    - Heat loss per step: heat_loss_w / 1000 × dt_hours [kWh]
+    - Max heat per step: heater_power_kw × dt_hours [kWh]
+    - Temperature boundary: [min_temp_c, max_temp_c]
+
+    Price-aware logic mirrors the building thermal model:
+    - Baseline: heat whenever temperature is below max_temp_c (naive thermostat)
+    - LP: pre-heat during cheapest slots; defer when a cheaper slot is
+      available within the remaining thermal slack window.
+
+    Parameters
+    ----------
+    n_steps         : number of time steps
+    dt_hours        : step duration [h]
+    initial_temp_c  : starting water temperature [°C]
+    min_temp_c      : minimum allowed temperature — safety / comfort floor [°C]
+    max_temp_c      : target / maximum temperature [°C]
+    heat_loss_w     : constant standby heat loss [W]
+    heater_power_kw : rated heater power [kW]  (COP = 1 → elec = thermal)
+    tank_volume_l   : tank size [L]
+    prices          : total electricity price per slot [EUR/MWh]
+    price_aware     : if True use LP look-ahead; else naive thermostat
+
+    Returns
+    -------
+    dict with:
+        temp_profile    — water temperature at each step [°C]
+        elec_kwh        — electricity consumed per step [kWh]
+        heating_cost    — electricity cost per step [EUR]
+        total_elec_kwh  — total electricity consumed over horizon [kWh]
+    """
+    C_WATER_KWH_PER_L_PER_C = 1.163e-3           # kWh / (L · °C)
+    thermal_mass = max(tank_volume_l * C_WATER_KWH_PER_L_PER_C, 1e-9)  # kWh/°C
+
+    heat_loss_kwh_per_step = heat_loss_w / 1000.0 * dt_hours   # kWh lost per step
+    heat_loss_c_per_step   = heat_loss_kwh_per_step / thermal_mass  # °C drop per step
+
+    max_heat_kwh = heater_power_kw * dt_hours           # max thermal kWh per step
+    max_heat_c   = max_heat_kwh / thermal_mass          # max °C rise per step
+
+    deadband_c    = max_temp_c - min_temp_c
+    net_heat_rate = max(max_heat_c - heat_loss_c_per_step, 1e-6)  # °C net rise/step at full power
+    steps_to_recover = max(0, int(np.ceil(deadband_c / net_heat_rate)) - 1)
+
+    temp         = np.zeros(n_steps)
+    elec_kwh     = np.zeros(n_steps)
+    heating_cost = np.zeros(n_steps)
+
+    current_temp = float(initial_temp_c)
+
+    for t in range(n_steps):
+        # Standby heat loss
+        current_temp -= heat_loss_c_per_step
+
+        # Determine heating need
+        heat_needed_c = 0.0
+        if price_aware and prices is not None:
+            if current_temp < min_temp_c:
+                # Past safety floor — force heat regardless of price
+                heat_needed_c = max_temp_c - current_temp
+            elif current_temp < max_temp_c:
+                slack = current_temp - min_temp_c
+                steps_until_forced = (
+                    int(slack / heat_loss_c_per_step)
+                    if heat_loss_c_per_step > 0 else n_steps
+                )
+                defer_window = max(0, steps_until_forced - steps_to_recover)
+                if defer_window == 0:
+                    heat_needed_c = max_temp_c - current_temp
+                else:
+                    lookahead_end = min(t + defer_window + 1, n_steps)
+                    if float(prices[t]) <= float(np.min(prices[t:lookahead_end])):
+                        heat_needed_c = max_temp_c - current_temp
+                    # else: cheaper slot ahead — defer
+        else:
+            # Naive thermostat: always heat to max when below it
+            if current_temp < max_temp_c:
+                heat_needed_c = max_temp_c - current_temp
+
+        # Apply heating  (COP = 1 → electrical kWh = thermal kWh delivered)
+        if heat_needed_c > 0:
+            heat_needed_kwh  = heat_needed_c * thermal_mass
+            heat_deliver_kwh = min(heat_needed_kwh, max_heat_kwh)
+            current_temp    += heat_deliver_kwh / thermal_mass
+            elec_kwh[t]      = heat_deliver_kwh
+            elec_price        = prices[t] / 1000.0 if prices is not None else 0.15
+            heating_cost[t]  = heat_deliver_kwh * elec_price
+
+        # Clamp to physical range (sanity guard against floating-point drift)
+        current_temp = min(max(current_temp, min_temp_c - 20.0), max_temp_c + 5.0)
+        temp[t] = current_temp
+
+    return {
+        "temp_profile":   temp,
+        "elec_kwh":       elec_kwh,
+        "heating_cost":   heating_cost,
+        "total_elec_kwh": float(elec_kwh.sum()),
     }
 
 
@@ -582,6 +774,7 @@ def simulate_slots(
     baseline_gen_override: dict | None = None,
     baseline_load_override: dict | None = None,
     thermal_params: dict | None = None,
+    outside_temp_c: np.ndarray | None = None,
 ) -> dict:
     """Asset-driven LP simulation over arbitrary time slots.
 
@@ -627,7 +820,10 @@ def simulate_slots(
         Building thermal model overrides.  Supported keys:
         ``initial_temp_c``, ``setpoint_c``, ``deadband_c``,
         ``cooldown_rate_c_per_hour``, ``thermal_mass_kwh_per_c``,
-        ``beo_initial_temp_c``.
+        ``beo_initial_temp_c``, ``ua_kwh_per_c_per_h``.
+    outside_temp_c : np.ndarray, optional
+        Outside air temperature per slot [°C].  When provided the thermal
+        model uses Newton’s law of cooling instead of the fixed rate.
 
     Returns
     -------
@@ -645,6 +841,35 @@ def simulate_slots(
 
     bgo = baseline_gen_override  or {}
     blo = baseline_load_override or {}
+
+    # ── Pre-compute LP generation for surplus-aware pricing ──────────
+    # Solar and CHP produce at zero/low marginal cost.  Slots where their
+    # output already exceeds the fixed base load create a surplus that can
+    # cover shiftable demand for free — those slots should appear cheaper.
+    _pre_gen_lp = np.zeros(n)
+    for _a in assets:
+        if _a.asset_type != GENERATOR or not _a.enabled:
+            continue
+        if _a.solar_csv:
+            if solar_hours and day_keys:
+                for _k in day_keys:
+                    if _k in solar_hours:
+                        _arr = np.array(solar_hours[_k][:n])
+                        if len(_arr) < n:
+                            _arr = np.pad(_arr, (0, n - len(_arr)))
+                        _pre_gen_lp += _arr
+                        break
+            else:
+                _cap = _a.capacity_kwp * dt_hours
+                for _t in range(n):
+                    _h = (start_hour + _t * dt_hours) % 24
+                    if 6 <= _h <= 18:
+                        _pre_gen_lp[_t] += max(0.0, np.sin(np.pi * (_h - 6) / 12)) * _cap
+            if _a.decouple_below_eur_mwh is not None:
+                _pre_gen_lp = np.where(total_price >= _a.decouple_below_eur_mwh, _pre_gen_lp, 0.0)
+        elif _a.chp_elec_efficiency > 0:
+            _pre_gen_lp += _chp_optimal_schedule(n, total_price, _a, dt_hours)
+    _gen_surplus = np.maximum(0.0, _pre_gen_lp - base_load)
 
     # ── Shiftable loads ─────────────────────────────────────────────
     baseline_shiftable = np.zeros(n)
@@ -689,10 +914,11 @@ def simulate_slots(
         # Optional flex window: restrict LP to certain hours only
         fs = int(getattr(asset, "flex_start_hour", 0))
         fe = int(getattr(asset, "flex_end_hour", 24))
+        eff_price = _effective_prices(total_price, _gen_surplus, hourly_max)
         if fs == 0 and fe == 24:
-            sched_prices = total_price
+            sched_prices = eff_price
         else:
-            sched_prices = total_price.astype(float).copy()
+            sched_prices = eff_price.copy()
             for t in range(n):
                 h = int((start_hour + t * dt_hours)) % 24
                 if not _in_window(h, fs, fe):
@@ -858,17 +1084,47 @@ def simulate_slots(
         beo_initial_temp_c=_tp("beo_initial_temp_c", 12.0),
         chp_heat_kw=chp_heat_kw_lp,
         gas_price_eur_m3=gas_price_eur_m3,
+        outside_temp_c=outside_temp_c,
+        ua_kwh_per_c_per_h=_tp("ua_kwh_per_c_per_h", 2.5),
     )
     # Baseline thermal: constant rule — always maintain setpoint
     baseline_thermal = simulate_building_thermal(**thermal_common, price_aware=False)
     # LP thermal: price-aware — pre-heat during cheap slots
     thermal_result = simulate_building_thermal(**thermal_common, price_aware=True)
 
+    # ── Hot water tank simulation ─────────────────────────────────────
+    # Config is read from _HW_CFG (refreshed by reload_hw_config after GUI save).
+    _hw_enabled = bool(_HW_CFG.get("enabled", False))
+    if _hw_enabled:
+        _hw_common = dict(
+            n_steps=n,
+            dt_hours=dt_hours,
+            initial_temp_c=float(_HW_CFG.get("initial_temp_c", 55.0)),
+            min_temp_c=float(_HW_CFG.get("min_temp_c", 45.0)),
+            max_temp_c=float(_HW_CFG.get("max_temp_c", 60.0)),
+            heat_loss_w=float(_HW_CFG.get("heat_loss_w", 50.0)),
+            heater_power_kw=float(_HW_CFG.get("heater_power_kw", 3.0)),
+            tank_volume_l=float(_HW_CFG.get("tank_volume_l", 200.0)),
+            prices=total_price,
+        )
+        baseline_hw = simulate_hot_water_tank(**_hw_common, price_aware=False)
+        lp_hw       = simulate_hot_water_tank(**_hw_common, price_aware=True)
+    else:
+        _zero_hw: dict = {
+            "heating_cost": np.zeros(n),
+            "elec_kwh": np.zeros(n),
+            "temp_profile": np.zeros(n),
+            "total_elec_kwh": 0.0,
+        }
+        baseline_hw = _zero_hw
+        lp_hw       = _zero_hw
+
     # ── Costs ────────────────────────────────────────────────────────
     baseline_load = base_load + baseline_shiftable
     baseline_grid = np.maximum(baseline_load - total_gen_baseline, 0.0)
     baseline_cost = baseline_grid * total_price / 1000.0 + chp_gas_cost_baseline
     baseline_cost += baseline_thermal["heating_cost"]
+    baseline_cost += baseline_hw["heating_cost"]
 
     lp_load = base_load + lp_shiftable
     lp_grid = np.maximum(lp_load - total_gen_lp_effective, 0.0)
@@ -876,12 +1132,20 @@ def simulate_slots(
     if n > 0 and total_startup_cost > 0:
         lp_cost[0] += total_startup_cost
     lp_cost += thermal_result["heating_cost"]
+    lp_cost += lp_hw["heating_cost"]
 
     heating_saving_eur = float(baseline_thermal["heating_cost"].sum()) - float(thermal_result["heating_cost"].sum())
     heating_baseline_cost_eur = float(baseline_thermal["heating_cost"].sum())
     heating_saving_pct = (
         (heating_saving_eur / heating_baseline_cost_eur * 100)
         if heating_baseline_cost_eur > 0 else 0.0
+    )
+
+    hw_saving_eur = float(baseline_hw["heating_cost"].sum()) - float(lp_hw["heating_cost"].sum())
+    hw_baseline_cost_eur = float(baseline_hw["heating_cost"].sum())
+    hw_saving_pct = (
+        (hw_saving_eur / hw_baseline_cost_eur * 100)
+        if hw_baseline_cost_eur > 0 else 0.0
     )
 
     total_load_shifted = sum(float(np.sum(ad["baseline"])) for ad in asset_loads.values())
@@ -903,6 +1167,11 @@ def simulate_slots(
         "heating_saving_eur": heating_saving_eur,
         "heating_saving_pct": heating_saving_pct,
         "heating_baseline_cost_eur": heating_baseline_cost_eur,
+        "hw_temp_profile":    lp_hw["temp_profile"],
+        "hw_elec_kwh":        lp_hw["elec_kwh"],
+        "hw_saving_eur":      hw_saving_eur,
+        "hw_saving_pct":      hw_saving_pct,
+        "hw_baseline_cost_eur": hw_baseline_cost_eur,
         "n_slots":            n,
         "asset_loads":        asset_loads,
         "asset_generators":   asset_generators,

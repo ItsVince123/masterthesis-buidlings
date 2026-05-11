@@ -16,15 +16,35 @@ spacing without digging through widget code.
 # Main window & widget base styles
 # ---------------------------------------------------------------------------
 MAIN_WINDOW_STYLE = """
-QMainWindow {
+QMainWindow, QWidget {
     background-color: #eef3f9;
-}
-
-QWidget {
     color: #1f2937;
     font-family: 'Segoe UI';
     font-size: 11pt;
 }
+
+QScrollArea, QScrollArea > QWidget > QWidget {
+    background-color: #eef3f9;
+    color: #1f2937;
+}
+
+QScrollBar:vertical {
+    background: #e2e8f0; width: 8px; border-radius: 4px;
+}
+QScrollBar::handle:vertical {
+    background: #94a3b8; border-radius: 4px; min-height: 20px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+
+QScrollBar:horizontal {
+    background: #e2e8f0; height: 8px; border-radius: 4px;
+}
+QScrollBar::handle:horizontal {
+    background: #94a3b8; border-radius: 4px; min-width: 20px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
 
 QFrame#ColumnContainer {
     background-color: #ffffff;
@@ -93,6 +113,13 @@ QLabel#SectionHeader {
     font-weight: 800;
     letter-spacing: 1px;
     padding: 6px 2px 2px 2px;
+}
+
+QLabel#BaselineLabel {
+    color: #64748b;
+    font-size: 9pt;
+    font-style: italic;
+    padding: 1px 2px;
 }
 
 QFrame#SectionDivider {

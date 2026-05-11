@@ -26,23 +26,29 @@ Architecture
 """
 
 import logging
+import multiprocessing as _mp
+import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Must be set before any cvxpy/HIGHS import to prevent OpenMP ↔ Qt thread conflict
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("HIGHS_NUM_THREADS", "1")
 
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QMainWindow,
     QPushButton, QScrollArea, QSizePolicy, QSlider, QVBoxLayout, QWidget,
 )
 
-from asset_dialogs import AssetManagerDialog
 from dashboard_config import load_dashboard_config
 from data_manager import DataManager, current_slot
-from graph_renderer import draw_price_graph, draw_solar_graph
+from graph_renderer import draw_price_graph, draw_solar_graph, draw_temperature_graph, draw_thermal_graph
 from future_dialog import FutureSimulationDialog
 from historical_dialog import HistoricalAnalysisDialog
-from thermal_dialog import BuildingThermalDialog
 from settings import INTERVAL_MINUTES, LOCAL_TZ
 from smpc_calculator import SMPCCalculator
 from styles import (
@@ -71,6 +77,62 @@ _ICON_LEGACY = {
 }
 
 SIDE_COL_MIN_W = 260
+
+
+# ===================================================================
+# Async subprocess helper for LP solve
+# (HIGHS DLL conflicts with Qt on Windows when both are in the same process.
+#  multiprocessing.Pool(spawn) re-imports dashboard.py → Qt loads in worker
+#  → same conflict.  Solution: use a standalone _lp_worker.py script via
+#  subprocess.Popen so Qt is never imported in the solver process.)
+# ===================================================================
+
+_LP_WORKER = Path(__file__).parent / "_lp_worker.py"
+
+
+class _AsyncSubprocessResult:
+    """Run _lp_worker.py in a subprocess; expose .ready() / .get() interface."""
+
+    def __init__(self, *args):
+        import pickle
+        import subprocess
+        import threading
+
+        self._result = None
+        self._error: Exception | None = None
+        self._done = threading.Event()
+
+        payload = pickle.dumps(args)
+
+        def _run():
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(_LP_WORKER)],
+                    input=payload,
+                    capture_output=True,
+                    timeout=120,
+                )
+                if proc.returncode == 0:
+                    self._result = pickle.loads(proc.stdout)
+                else:
+                    self._error = RuntimeError(
+                        f"LP worker exited {proc.returncode}: "
+                        f"{proc.stderr.decode(errors='replace')[:500]}"
+                    )
+            except Exception as exc:
+                self._error = exc
+            finally:
+                self._done.set()
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def ready(self) -> bool:
+        return self._done.is_set()
+
+    def get(self):
+        if self._error:
+            raise self._error
+        return self._result
 
 
 # ===================================================================
@@ -106,20 +168,28 @@ class ScadaWindow(QMainWindow):
         self.value_labels: dict = {}
         self.tag_definitions: dict = {"input": {}, "output": {}}
 
-        # Slot preview slider (0 = Now, 1..95 = future 15-min steps)
+        # Slot preview slider (0 = Now, negative = past, positive = future 15-min steps)
         self._selected_step: int = 0
+        self._lp_now_idx:    int = 0   # steps from midnight to current slot in the LP plan
 
         # Widget references (populated during UI build)
         self.clock_label = None
         self.price_current_label = None
         self.price_avg_label = None
-        self.actual_yield_label = None
+        self.predicted_solar_label = None
         self.center_price_graph_label = None
         self.center_solar_graph_label = None
+        self.center_temp_graph_label = None
         self.center_uv_value_label = None
         self.center_solar_value_label = None
         self.slot_slider = None
         self.slot_label = None
+
+        # ── Next-day LP solve state ──────────────────────────────────
+        self.last_lp_next_day_outputs = None     # SMPCOutputs for tomorrow
+        self._nd_lp_async_result = None          # pending subprocess result
+        self._nd_lp_submit_time  = None          # monotonic time of submit
+        self._nd_lp_last_date: str | None = None # date string "YYYY-MM-DD" already solved
 
     def _init_data(self):
         """Create the DataManager (handles all fetching and caching).
@@ -133,23 +203,26 @@ class ScadaWindow(QMainWindow):
         """Create the LP calculator and load building parameters.
 
         BACKEND CALL: SMPCCalculator lives in smpc_calculator.py (backend).
-        Building parameters (base_load_kw, peak_load_kw) come from
-        dashboard_config.json → 'smpc' → 'building'.
+        base_load_kw / peak_load_kw stay in 'smpc.building' for DataManager
+        compatibility.  Building thermal + HW state come from the 'mpc' block.
         """
         raw = load_dashboard_config()
-        building = raw.get("smpc", {}).get("building", {})
+        building_smpc = raw.get("smpc", {}).get("building", {})
+        self.base_load_kw = building_smpc.get("base_load_kw", 80)
+        self.peak_load_kw = building_smpc.get("peak_load_kw", 200)
 
-        self.lp = SMPCCalculator()
+        mpc_raw = raw.get("mpc", {})
+        self._building_temp_c      = float(mpc_raw.get("building", {}).get("T_init_c", 20.0))
+        self._building_setpoint_c  = float(mpc_raw.get("building", {}).get("Tset_c",   21.0))
+        self._hw_temp_c            = float(mpc_raw.get("hot_water_tank", {}).get("T_init_c", 55.0))
+
+        _cfg_abs = str(Path(__file__).parent / "dashboard_config.json")
+        self.lp = SMPCCalculator(_cfg_abs)
         self.lp_last_slot = None
         self.last_lp_outputs = None
-
-        self.base_load_kw = building.get("base_load_kw", 80)
-        self.peak_load_kw = building.get("peak_load_kw", 200)
-
-        # Building thermal state
-        thermal = building.get("thermal", {})
-        self._building_temp_c = thermal.get("initial_temp_c", 21.0)
-        self._building_setpoint_c = thermal.get("setpoint_c", 21.0)
+        self.last_lp_next_day_outputs = None
+        self._lp_async_result = None   # pending AsyncResult from the pool
+        self._lp_submit_time  = None   # monotonic time of last submit (for timeout warning)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -188,154 +261,192 @@ class ScadaWindow(QMainWindow):
 
         self._populate_columns()
 
-        # "Add" buttons
-        for container, label, key in [
-            (self.input_col, "+ Add input", "input"),
-            (self.output_col, "+ Add output", "output"),
-        ]:
-            btn = QPushButton(label)
+        # "⊕ Manage Assets" buttons (one per column, both open same dialog)
+        for container in (self.input_col, self.output_col):
+            btn = QPushButton("⊕  Manage Assets")
             btn.setMinimumHeight(52)
             btn.setMinimumWidth(50)
             btn.setStyleSheet(COLUMN_BUTTON_STYLE)
-            btn.clicked.connect(lambda _=False, k=key: self._open_popup(k))
+            btn.clicked.connect(self._open_mpc_asset_manager)
             container.layout().addWidget(btn)
 
-    @staticmethod
-    def _simulation_for_asset(asset, side):
-        """Return simulation config dict for a known asset.
 
-        *side* is ``"input"`` (power / value) or ``"output"`` (status).
-        Generators get power on input, ON/OFF on output.
-        Shiftable loads only appear on output with power + status.
-        Heating assets (HEAT_PUMP, GAS_HEATER) show total heating kW.
-        """
-        from energy_assets import (
-            SHIFTABLE_LOAD as _SL, GENERATOR as _GEN,
-            HEAT_PUMP as _HP, GAS_HEATER as _GH,
-        )
-
-        uid = asset.uid
-
-        # ── Generators ──────────────────────────────────────────
-        if asset.asset_type == _GEN:
-            if uid == "solar":
-                if side == "input":
-                    return {"mode": "predicted_solar", "unit": "kW", "decimals": 1, "color": "#f59e0b"}
-                return {
-                    "mode": "smpc_state",
-                    "field": "net_power_kwh",
-                    "threshold": 0.0,
-                    "above": "PRODUCING",
-                    "below": "IDLE",
-                    "colors": {"PRODUCING": "#16a34a", "IDLE": "#64748b"},
-                }
-            # Generic generator (CHP / WKK / any new one)
-            if side == "input":
-                return {
-                    "mode": "smpc",
-                    "field": "wkk_elec_kwh",
-                    "unit": "kW",
-                    "decimals": 1,
-                    "multiplier": 4,
-                    "color": "#0e7490",
-                }
-            return {
-                "mode": "smpc_state",
-                "field": "wkk_elec_kwh",
-                "threshold": 0.1,
-                "above": "ON",
-                "below": "OFF",
-                "colors": {"ON": "#16a34a", "OFF": "#dc2626"},
-            }
-
-        # ── Shiftable loads (output side only) ──────────────────
-        if asset.asset_type == _SL:
-            return {
-                "mode": "asset_power",
-                "uid": uid,
-                "unit": "kW",
-                "decimals": 1,
-            }
-
-        # ── Heat pumps ───────────────────────────────────────────
-        if asset.asset_type == _HP:
-            if side == "input":
-                return {
-                    "mode": "smpc",
-                    "field": "heating_power_kw",
-                    "unit": "kW",
-                    "decimals": 1,
-                    "multiplier": 1,
-                    "color": "#f59e0b",
-                }
-            return {
-                "mode": "smpc_state",
-                "field": "heating_power_kw",
-                "threshold": 0.1,
-                "above": "HEATING",
-                "below": "IDLE",
-                "colors": {"HEATING": "#dc2626", "IDLE": "#16a34a"},
-            }
-
-        # ── Gas heaters ──────────────────────────────────────────
-        if asset.asset_type == _GH:
-            if side == "input":
-                return {
-                    "mode": "smpc",
-                    "field": "heating_power_kw",
-                    "unit": "kW",
-                    "decimals": 1,
-                    "multiplier": 1,
-                    "color": "#ef4444",
-                }
-            return {
-                "mode": "smpc_state",
-                "field": "heating_power_kw",
-                "threshold": 0.1,
-                "above": "HEATING",
-                "below": "IDLE",
-                "colors": {"HEATING": "#dc2626", "IDLE": "#16a34a"},
-            }
-
-        return {}
 
     def _populate_columns(self):
-        """Build input/output tag lists from energy assets and populate."""
-        from energy_assets import (
-            load_assets as _load_ea,
-            SHIFTABLE_LOAD as _SL, HEAT_PUMP as _HP, GAS_HEATER as _GH,
-        )
-        input_tags: list[dict] = []
-        output_tags: list[dict] = []
-        for asset in _load_ea():
-            base = {
-                "id": asset.uid,
-                "name": asset.name,
-                "icon": asset.icon,
-                "section": (
-                    "CONTROLLABLE" if asset.asset_type == _SL
-                    else "HEATING" if asset.asset_type in (_HP, _GH)
-                    else "GENERATION"
-                ),
-            }
-            if asset.asset_type == _SL:
-                # Shiftable loads → output column only
-                out_tag = dict(base, simulation=self._simulation_for_asset(asset, "output"))
-                output_tags.append(out_tag)
-            else:
-                # Generators + heating assets → both columns (power on input, status on output)
-                in_tag = dict(base, simulation=self._simulation_for_asset(asset, "input"))
-                out_tag = dict(base, simulation=self._simulation_for_asset(asset, "output"))
-                input_tags.append(in_tag)
-                output_tags.append(out_tag)
+        """Build input/output tag rows from asset_instances config.
 
-        norm_in = self._normalise_tags(input_tags)
+        Layout
+        ------
+        INPUTS:   Time & Price | Generation (PV, CHP) | Heating (COP, Bld-temp, Tank)
+        OUTPUTS:  Heating (HP kW, Boiler kW) | Hot Water | Flex | Storage | Grid
+        """
+        from dashboard_config import load_dashboard_config as _ldc
+        raw      = _ldc()
+        instances = raw.get("mpc", {}).get("asset_instances", [])
+
+        # Fallback: if no instances defined yet, derive from mpc_cfg flags
+        if not instances:
+            cfg = self.lp.mpc_cfg
+            if cfg.pv_enabled:
+                instances.append({"id":"pv_1","type":"pv","name":"Solar Panels","enabled":True,"baseline_mode":"always_off","baseline_power_kw":0.0})
+            if cfg.hp_enabled:
+                instances.append({"id":"hp_1","type":"heat_pump","name":"Heat Pump","enabled":True,"baseline_mode":"constant","baseline_power_kw":30.0})
+            if cfg.boiler_enabled:
+                instances.append({"id":"boiler_1","type":"gas_boiler","name":"Gas Boiler","enabled":True,"baseline_mode":"constant","baseline_power_kw":50.0})
+            if cfg.chp_enabled:
+                instances.append({"id":"chp_1","type":"chp","name":"CHP","enabled":True,"baseline_mode":"always_off","baseline_power_kw":0.0})
+            if cfg.bat_enabled:
+                instances.append({"id":"bat_1","type":"battery","name":"Battery","enabled":True,"baseline_mode":"always_off","baseline_power_kw":0.0})
+            if cfg.flex_enabled:
+                instances.append({"id":"flex_1","type":"flex","name":"Flex Load","enabled":True,"baseline_mode":"always_off","baseline_power_kw":0.0})
+            if cfg.hw_enabled:
+                instances.append({"id":"hw_1","type":"hot_water","name":"Hot Water Tank","enabled":True,"baseline_mode":"constant","baseline_power_kw":2.0})
+
+        enabled = [i for i in instances if i.get("enabled", True)]
+
+        input_tags:  list[dict] = []
+        output_tags: list[dict] = []
+
+        # ── INPUT: GENERATION ─────────────────────────────────────────────
+        for inst in enabled:
+            iid   = inst["id"]
+            itype = inst.get("type", "")
+            iname = inst.get("name", iid)
+            if itype == "pv":
+                input_tags.append({
+                    "id": f"{iid}_solar", "name": "Solar Predicted", "icon": "sun",
+                    "section": "GENERATION",
+                    "simulation": {"mode": "predicted_solar",
+                                   "unit": "kW", "decimals": 1, "color": "#f59e0b"},
+                })
+            elif itype == "chp":
+                input_tags.append({
+                    "id": f"{iid}_elec_kw", "name": f"{iname} Elec", "icon": "lightning",
+                    "section": "GENERATION",
+                    "simulation": {"mode": "mpc_scalar", "field": "chp_elec_kw",
+                                   "plan_field": "plan_chp_elec_kw",
+                                   "unit": "kW", "decimals": 1, "color": "#0e7490"},
+                })
+                input_tags.append({
+                    "id": f"{iid}_heat_kw", "name": f"{iname} Heat", "icon": "fire",
+                    "section": "GENERATION",
+                    "simulation": {"mode": "mpc_scalar", "field": "chp_heat_kw",
+                                   "plan_field": "plan_chp_heat_kw",
+                                   "unit": "kW", "decimals": 1, "color": "#f97316"},
+                })
+
+        # ── INPUT: HEATING ─────────────────────────────────────────────────
+        for inst in enabled:
+            iid   = inst["id"]
+            itype = inst.get("type", "")
+            if itype == "heat_pump":
+                input_tags.append({
+                    "id": f"{iid}_cop", "name": "Heat Pump COP", "icon": "gear",
+                    "section": "HEATING",
+                    "simulation": {"mode": "mpc_scalar", "field": "cop_now",
+                                   "unit": "", "decimals": 2, "color": "#16a34a",
+                                   "plan_field": "plan_COP"},
+                })
+
+        # Building temperature always shown in HEATING
+        input_tags.append({
+            "id": "bld_temp", "name": "Building Temp", "icon": "thermo",
+            "section": "HEATING",
+            "simulation": {"mode": "mpc_building_temp",
+                           "plan_field": "plan_building_temp_c"},
+        })
+
+        for inst in enabled:
+            iid   = inst["id"]
+            itype = inst.get("type", "")
+            if itype == "hot_water":
+                input_tags.append({
+                    "id": f"{iid}_temp", "name": "Water Tank", "icon": "thermo",
+                    "section": "HEATING",
+                    "simulation": {"mode": "mpc_scalar", "field": "hw_temp_c",
+                                   "unit": "\u00b0C", "decimals": 1, "color": "#0891b2",
+                                   "plan_field": "plan_hw_temp_c"},
+                })
+
+        # ── OUTPUT: HEATING ────────────────────────────────────────────────
+        for inst in enabled:
+            iid   = inst["id"]
+            itype = inst.get("type", "")
+            if itype == "heat_pump":
+                output_tags.append({
+                    "id": f"{iid}_kw", "name": "Heat Pump", "icon": "heat",
+                    "section": "HEATING",
+                    "simulation": {"mode": "asset_power", "uid": "heat_pump",
+                                   "unit": "kW", "decimals": 1, "color": "#f59e0b"},
+                })
+            elif itype == "gas_boiler":
+                output_tags.append({
+                    "id": f"{iid}_kw", "name": "Gas Boiler", "icon": "fire",
+                    "section": "HEATING",
+                    "simulation": {"mode": "asset_power", "uid": "gas_boiler",
+                                   "unit": "kW", "decimals": 1, "color": "#ef4444"},
+                })
+
+        # ── OUTPUT: HOT WATER ──────────────────────────────────────────────
+        for inst in enabled:
+            iid   = inst["id"]
+            itype = inst.get("type", "")
+            if itype == "hot_water":
+                output_tags.append({
+                    "id": f"{iid}_heater_kw", "name": "HW Heater", "icon": "lightning",
+                    "section": "HOT WATER",
+                    "simulation": {"mode": "asset_power", "uid": "hot_water_tank",
+                                   "unit": "kW", "decimals": 1, "color": "#dc2626"},
+                })
+
+        # ── OUTPUT: FLEX ───────────────────────────────────────────────────
+        for inst in enabled:
+            iid   = inst["id"]
+            itype = inst.get("type", "")
+            iname = inst.get("name", iid)
+            if itype == "flex":
+                output_tags.append({
+                    "id": f"{iid}_kw", "name": iname, "icon": "lightning",
+                    "section": "FLEX",
+                    "simulation": {"mode": "asset_power", "uid": "flexible_load",
+                                   "unit": "kW", "decimals": 1, "color": "#0891b2"},
+                })
+
+        # ── OUTPUT: STORAGE ────────────────────────────────────────────────
+        for inst in enabled:
+            iid   = inst["id"]
+            itype = inst.get("type", "")
+            iname = inst.get("name", iid)
+            if itype == "battery":
+                output_tags.append({
+                    "id": f"{iid}_status", "name": iname, "icon": "battery",
+                    "section": "STORAGE",
+                    "simulation": {"mode": "mpc_battery_status"},
+                })
+
+        # ── OUTPUT: GRID ───────────────────────────────────────────────────
+        output_tags += [
+            {
+                "id": "grid_import", "name": "Grid Import", "icon": "plug",
+                "section": "GRID",
+                "simulation": {"mode": "mpc_scalar", "field": "pgrid_kw",
+                               "unit": "kW", "decimals": 1, "color": "#dc2626",
+                               "plan_field": "plan_pgrid_kw"},
+            },
+            {
+                "id": "cost_saving", "name": "Saving Today", "icon": "leaf",
+                "section": "GRID",
+                "simulation": {"mode": "mpc_scalar", "field": "cost_saving_eur",
+                               "unit": "\u20ac", "decimals": 3, "color": "#16a34a"},
+            },
+        ]
+
+        norm_in  = self._normalise_tags(input_tags)
         norm_out = self._normalise_tags(output_tags)
-        self._register_definitions("input", norm_in)
+        self._register_definitions("input",  norm_in)
         self._register_definitions("output", norm_out)
 
         self._add_price_widgets(self.input_content)
-        self._add_thermal_widgets(self.input_content)
         self._add_grouped_tags(
             self.input_content,
             self._group_by_section(norm_in, "INPUTS"),
@@ -414,6 +525,11 @@ class ScadaWindow(QMainWindow):
         self.center_solar_graph_label = self._graph_card(
             lay, "Predicted Solar Graph", "Loading solar graph\u2026",
         )
+        # Temperature / thermal graph card (taller to fit heating bars)
+        self.center_temp_graph_label = self._graph_card(
+            lay, "Outside Temperature (48h)", "Loading temperature graph\u2026",
+            height=280,
+        )
 
         # Metrics card
         metrics = QFrame()
@@ -445,8 +561,10 @@ class ScadaWindow(QMainWindow):
         sl.addLayout(slider_header)
 
         self.slot_slider = QSlider(Qt.Orientation.Horizontal)
-        self.slot_slider.setMinimum(-96)
-        self.slot_slider.setMaximum(191)
+        self.slot_slider.setMinimum(0)
+        _horizon = getattr(getattr(self, "lp", None), "mpc_cfg", None)
+        _max = _horizon.horizon_steps - 1 if _horizon else 23
+        self.slot_slider.setMaximum(_max)
         self.slot_slider.setValue(0)
         self.slot_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.slot_slider.setTickInterval(4)  # tick every hour
@@ -480,17 +598,6 @@ class ScadaWindow(QMainWindow):
         future_btn.clicked.connect(self._open_future)
         lay.addWidget(future_btn)
 
-        # Building thermal settings button
-        thermal_btn = QPushButton("\U0001f321\ufe0f  Building Thermal Settings")
-        thermal_btn.setMinimumHeight(44)
-        thermal_btn.setStyleSheet(
-            "QPushButton { background: #7c3aed; color: white; border: none; "
-            "border-radius: 8px; font-weight: 700; font-size: 10pt; } "
-            "QPushButton:hover { background: #6d28d9; }"
-        )
-        thermal_btn.clicked.connect(self._open_thermal_settings)
-        lay.addWidget(thermal_btn)
-
         lay.addStretch()
 
         scroll.setWidget(content)
@@ -498,39 +605,30 @@ class ScadaWindow(QMainWindow):
         return panel
 
     def _on_slot_slider_changed(self, value: int):
-        """Handle slider position change."""
+        """Handle slider position change — updates all three panels."""
         self._selected_step = value
         if value == 0:
             self.slot_label.setText("Now")
             self.slot_label.setStyleSheet(value_css("#0e7490"))
-        else:
-            from datetime import timedelta
+        elif value > 0:
             target = current_slot() + timedelta(minutes=value * INTERVAL_MINUTES)
-            self.slot_label.setText(target.strftime("%H:%M"))
-            if value < 0:
-                self.slot_label.setStyleSheet(value_css("#94a3b8"))
-            else:
-                self.slot_label.setStyleSheet(value_css("#7c3aed"))
+            self.slot_label.setText(f"+{value}  ({target.strftime('%H:%M')})")
+            self.slot_label.setStyleSheet(value_css("#7c3aed"))
+        else:
+            target = current_slot() + timedelta(minutes=value * INTERVAL_MINUTES)
+            self.slot_label.setText(f"{value}  ({target.strftime('%H:%M')})")
+            self.slot_label.setStyleSheet(value_css("#94a3b8"))
+        # Update ALL panels (inputs, outputs, centre)
         self._update_tag_labels()
         self._update_price_for_slot()
         self._update_center()
-        self._update_thermal_labels()
-
-    def wheelEvent(self, event):
-        """Scroll wheel adjusts the time-slot slider."""
-        delta = event.angleDelta().y()
-        if delta == 0:
-            return super().wheelEvent(event)
-        step = 1 if delta > 0 else -1
-        self.slot_slider.setValue(self.slot_slider.value() + step)
-        event.accept()
 
     # ------------------------------------------------------------------
     # Reusable widget builders
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _graph_card(parent_layout, title_text: str, placeholder: str) -> QLabel:
+    def _graph_card(parent_layout, title_text: str, placeholder: str, height: int = 200) -> QLabel:
         """Add a titled graph card to *parent_layout*; return the graph label."""
         card = QFrame()
         card.setObjectName("TagRow")
@@ -542,7 +640,7 @@ class ScadaWindow(QMainWindow):
         cl.addWidget(t)
         lbl = QLabel(placeholder)
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setFixedHeight(200)
+        lbl.setFixedHeight(height)
         lbl.setObjectName("TagValue")
         cl.addWidget(lbl)
         parent_layout.addWidget(card)
@@ -582,7 +680,7 @@ class ScadaWindow(QMainWindow):
         return v
 
     def _add_price_widgets(self, container):
-        """Add clock, current-price, 48 h average, and yield rows."""
+        """Add clock, current-price and 48 h average rows."""
         self.clock_label = self._info_row(
             container, "\U0001f552  Local time", "--",
         )
@@ -592,25 +690,7 @@ class ScadaWindow(QMainWindow):
         self.price_avg_label = self._info_row(
             container, "\U0001f4c8  48h average", "-- EUR/MWh",
         )
-        self.actual_yield_label = self._info_row(
-            container, "\U0001f506  Actual Yield", "-- kWh",
-        )
         self._update_clock()
-
-    def _add_thermal_widgets(self, container):
-        """Add building temperature, setpoint, and BEO-veld info rows."""
-        self.building_temp_label = self._info_row(
-            container, "\U0001f321\ufe0f  Building temp", "-- °C",
-        )
-        self.building_setpoint_label = self._info_row(
-            container, "\U0001f3af  Setpoint", "-- °C",
-        )
-        self.heating_power_label = self._info_row(
-            container, "\U0001f525  Heating", "-- kW",
-        )
-        self.beo_temp_label = self._info_row(
-            container, "\U0001f30d  BEO-veld", "-- °C",
-        )
 
     # ------------------------------------------------------------------
     # Tag handling
@@ -740,12 +820,16 @@ class ScadaWindow(QMainWindow):
         ORDER OF OPERATIONS (important):
         1. Update clock display (cheap, always runs)
         2. DataManager.tick() — check if data refresh is due (backend)
-        3. _run_lp_if_needed() — run backend LP solver if we're in a new slot
-        4. _update_all_widgets() — propagate results to the UI labels (frontend)
+        3. _collect_lp_result() — pick up finished async LP result (non-blocking)
+        4. _run_lp_if_needed() — submit new LP solve to subprocess (non-blocking)
+        5. _update_all_widgets() — propagate results to the UI labels (frontend)
         """
         self._update_clock()
         self.data.tick()               # may refresh prices/predictions/weather
-        self._run_lp_if_needed()       # runs once per 15-min slot
+        self._collect_lp_result()      # grab result if the subprocess finished
+        self._collect_next_day_lp_result()   # grab next-day result if ready
+        self._run_lp_if_needed()       # submit async LP once per 15-min slot
+        self._run_next_day_lp_if_needed()    # submit next-day LP when prices available
         self._update_all_widgets()
 
     # ------------------------------------------------------------------
@@ -757,7 +841,6 @@ class ScadaWindow(QMainWindow):
         self._update_predict_labels()
         self._update_center()
         self._update_tag_labels()
-        self._update_thermal_labels()
 
     def _update_price_labels(self):
         dm = self.data
@@ -795,52 +878,15 @@ class ScadaWindow(QMainWindow):
             self.price_current_label.setStyleSheet(value_css("#64748b"))
 
     def _update_predict_labels(self):
-        if self.actual_yield_label:
-            self.actual_yield_label.setText("-- kWh")
-            self.actual_yield_label.setStyleSheet(value_css("#64748b"))
-
-    def _update_thermal_labels(self):
-        """Update building temperature display from LP outputs."""
-        out = self.last_lp_outputs
-        if out is None:
-            return
-
-        step = max(0, self._selected_step)
-
-        def _plan(arr, fallback):
-            """Return plan value at `step`, falling back to first-step scalar."""
-            if arr is not None and len(arr) > step:
-                return float(arr[step])
-            return fallback
-
-        temp = _plan(out.plan_building_temp_c, out.building_temp_c)
-        sp   = out.building_setpoint_c
-        heat = _plan(out.plan_heating_kw, out.heating_power_kw)
-        beo  = _plan(out.plan_beo_temp_c, out.beo_temp_c)
-
-        # Temperature colour: green=OK, orange=near limit, red=out of band
-        diff = abs(temp - sp)
-        if diff < 1.0:
-            colour = "#16a34a"
-        elif diff < 2.0:
-            colour = "#f59e0b"
-        else:
-            colour = "#dc2626"
-
-        self.building_temp_label.setText(f"{temp:.1f} °C")
-        self.building_temp_label.setStyleSheet(value_css(colour))
-
-        self.building_setpoint_label.setText(f"{sp:.1f} °C")
-        self.building_setpoint_label.setStyleSheet(value_css("#0f766e"))
-
-        heat_colour = "#dc2626" if heat > 0 else "#64748b"
-        self.heating_power_label.setText(
-            f"{heat:.1f} kW" if heat > 0 else "Off"
-        )
-        self.heating_power_label.setStyleSheet(value_css(heat_colour))
-
-        self.beo_temp_label.setText(f"{beo:.1f} °C")
-        self.beo_temp_label.setStyleSheet(value_css("#0f766e"))
+        dm = self.data
+        if self.predicted_solar_label:
+            if dm.current_power_kw is None:
+                self.predicted_solar_label.setText("-- kW")
+                self.predicted_solar_label.setStyleSheet(value_css("#64748b"))
+            else:
+                self.predicted_solar_label.setText(f"{dm.current_power_kw:.1f} kW")
+                colour = "#f59e0b" if dm.current_power_kw > 0 else "#64748b"
+                self.predicted_solar_label.setStyleSheet(value_css(colour))
 
     # ------------------------------------------------------------------
     # Centre panel updates
@@ -848,65 +894,163 @@ class ScadaWindow(QMainWindow):
 
     def _update_center(self):
         slot = current_slot()
-        slot_key = slot.strftime("%Y-%m-%d %H:%M:%S")
         dm = self.data
 
-        # Price graph
+        # ── Shared 48-h timeline: today 00:00 … tomorrow 23:45 in 15-min steps ──
+        now_local = datetime.now(LOCAL_TZ)
+        today_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        n_steps_48h = 2 * 24 * (60 // INTERVAL_MINUTES)   # 192 for 15-min slots
+        shared_times = [
+            today_midnight + timedelta(minutes=i * INTERVAL_MINUTES)
+            for i in range(n_steps_48h)
+        ]
+        shared_keys = [t.strftime("%Y-%m-%d %H:%M:%S") for t in shared_times]
+        start_label = shared_times[0].strftime("%d/%m %H:%M")
+        end_label   = shared_times[-1].strftime("%d/%m %H:%M")
+
+        # Current-slot index and selected-slot index in the shared timeline
+        now_idx = next(
+            (i for i, t in enumerate(shared_times) if t == slot), None
+        )
+        if now_idx is None:
+            # Clamp to closest past entry
+            for i, t in reversed(list(enumerate(shared_times))):
+                if t <= slot:
+                    now_idx = i
+                    break
+
+        target_ts = slot + timedelta(minutes=self._selected_step * INTERVAL_MINUTES)
+        sel_idx = next(
+            (i for i, t in enumerate(shared_times) if t == target_ts), None
+        )
+        if sel_idx is None:
+            # Clamp to closest past entry for the selected slot
+            for i, t in reversed(list(enumerate(shared_times))):
+                if t <= target_ts:
+                    sel_idx = i
+                    break
+
+        # Price graph — map price_rows onto the shared timeline
         if self.center_price_graph_label is not None:
-            prices = [p for _, p, _ in dm.price_rows]
-            idx = None
-            if dm.price_rows:
-                start = dm.price_rows[0][0].astimezone(LOCAL_TZ).strftime("%d/%m %H:%M")
-                end = dm.price_rows[-1][0].astimezone(LOCAL_TZ).strftime("%d/%m %H:%M")
-                for i, (ts, _, _) in enumerate(dm.price_rows):
-                    if ts.astimezone(LOCAL_TZ).replace(second=0, microsecond=0) == slot:
-                        idx = i
-                        break
-            else:
-                start, end = "", ""
-            if idx is not None and self._selected_step != 0:
-                _si = idx + self._selected_step
-                sel_idx = _si if 0 <= _si < len(prices) else None
-            else:
-                sel_idx = None
+            price_map: dict = {}
+            for ts, p, _ in dm.price_rows:
+                ts_loc = ts.astimezone(LOCAL_TZ).replace(second=0, microsecond=0)
+                price_map[ts_loc.strftime("%Y-%m-%d %H:%M:%S")] = p
+            # Forward-fill: each slot gets the most recent known price
+            last_p = None
+            prices = []
+            for key in shared_keys:
+                if key in price_map:
+                    last_p = price_map[key]
+                prices.append(last_p if last_p is not None else float("nan"))
             gw = max(self.center_price_graph_label.width(), 300)
             gh = self.center_price_graph_label.height() or 200
             self.center_price_graph_label.setPixmap(
-                draw_price_graph(prices, start, end, idx, sel_idx, gw, gh),
+                draw_price_graph(prices, start_label, end_label,
+                                 now_idx, sel_idx, gw, gh),
             )
-            # Clamp slider to remaining future data
-            if idx is not None:
-                max_future = max(len(prices) - 1 - idx, 0)
+            # Slider range: from midnight (negative) to end of tomorrow (positive)
+            if now_idx is not None:
+                max_future = n_steps_48h - 1 - now_idx
+                min_past   = -now_idx
                 if self.slot_slider.maximum() != max_future:
                     self.slot_slider.setMaximum(max(max_future, 1))
+                if self.slot_slider.minimum() != min_past:
+                    self.slot_slider.setMinimum(min_past)
 
-        # Solar graph
+        # Solar graph — map predictions onto the shared timeline
         if self.center_solar_graph_label is not None:
-            items = sorted(dm.predictions.items())
-            values = [pw for _, (pw, _) in items]
-            idx = None
-            if items:
-                start = datetime.strptime(
-                    items[0][0], "%Y-%m-%d %H:%M:%S",
-                ).strftime("%d/%m %H:%M")
-                end = datetime.strptime(
-                    items[-1][0], "%Y-%m-%d %H:%M:%S",
-                ).strftime("%d/%m %H:%M")
-                for i, (k, _) in enumerate(items):
-                    if k == slot_key:
-                        idx = i
-                        break
-            else:
-                start, end = "", ""
-            if idx is not None and self._selected_step != 0:
-                _si = idx + self._selected_step
-                sel_idx = _si if 0 <= _si < len(values) else None
-            else:
-                sel_idx = None
+            solar_values = [
+                dm.predictions[key][0] if key in dm.predictions else 0.0
+                for key in shared_keys
+            ]
             gw = max(self.center_solar_graph_label.width(), 300)
             gh = self.center_solar_graph_label.height() or 200
             self.center_solar_graph_label.setPixmap(
-                draw_solar_graph(values, start, end, idx, sel_idx, gw, gh),
+                draw_solar_graph(solar_values, start_label, end_label,
+                                 now_idx, sel_idx, gw, gh),
+            )
+
+        # Temperature / heating graph — overlay LP building temp + heating sources
+        if self.center_temp_graph_label is not None:
+            # Outside temperature (forward-filled from weather.csv)
+            temp_values = []
+            last_t = None
+            for key in shared_keys:
+                v = dm.temp_data.get(key)
+                if v is not None:
+                    last_t = v
+                temp_values.append(last_t if last_t is not None else float("nan"))
+
+            # Helper: build a 192-step list from today's + tomorrow's LP plan arrays
+            H    = self.lp.mpc_cfg.horizon_steps  # typically 96
+            dt_h = self.lp.mpc_cfg.dt_hours        # step duration [h]
+            # Each LP step spans n_sub fifteen-minute slots on the shared timeline.
+            # e.g. dt=0.25h → n_sub=1;  dt=1.0h → n_sub=4
+            _n_sub = max(1, round(dt_h * 60 / INTERVAL_MINUTES))
+
+            def _lp_plan_48h(attr: str, scale: float = 1.0) -> list[float]:
+                """Concatenate today's and tomorrow's plan array into 192 fifteen-min slots.
+
+                Each LP step of dt_hours is expanded to n_sub consecutive 15-min slots
+                so the graph always covers the correct wall-clock duration.
+                """
+                result = [float("nan")] * n_steps_48h
+                for offs, out in (
+                    (0,  self.last_lp_outputs),
+                    (96, self.last_lp_next_day_outputs),
+                ):
+                    if out is None:
+                        continue
+                    arr = getattr(out, attr, None)
+                    if arr is None or len(arr) == 0:
+                        continue
+                    for j, v in enumerate(arr):
+                        for s in range(_n_sub):
+                            idx = offs + j * _n_sub + s
+                            if idx < n_steps_48h:
+                                result[idx] = float(v) * scale
+                return result
+
+            bld_temps   = _lp_plan_48h("plan_building_temp_c")
+            heat_chp_kw = _lp_plan_48h("plan_chp_heat_kw")
+
+            # asset_schedules values are in kWh/step; convert to kW: ÷ dt_hours
+            _kw_factor = 1.0 / max(dt_h, 1e-9)
+            # asset_schedules is a dict, not a plain array — handle separately
+            heat_hp_kw     = [float("nan")] * n_steps_48h
+            heat_boiler_kw = [float("nan")] * n_steps_48h
+            for offs, out in (
+                (0,  self.last_lp_outputs),
+                (96, self.last_lp_next_day_outputs),
+            ):
+                if out is None:
+                    continue
+                for result_list, sched_key in (
+                    (heat_hp_kw,     "heat_pump"),
+                    (heat_boiler_kw, "gas_boiler"),
+                ):
+                    sched = out.asset_schedules.get(sched_key)
+                    if sched is None:
+                        continue
+                    for j, v in enumerate(sched):   # use full array length
+                        for s in range(_n_sub):
+                            idx = offs + j * _n_sub + s
+                            if idx < n_steps_48h:
+                                result_list[idx] = float(v) * _kw_factor
+
+            setpoint = (
+                self.last_lp_outputs.building_setpoint_c
+                if self.last_lp_outputs is not None else 21.0
+            )
+            gw = max(self.center_temp_graph_label.width(), 300)
+            gh = self.center_temp_graph_label.height() or 280
+            self.center_temp_graph_label.setPixmap(
+                draw_thermal_graph(
+                    temp_values, bld_temps, setpoint,
+                    heat_hp_kw, heat_boiler_kw, heat_chp_kw,
+                    start_label, end_label, now_idx, sel_idx, gw, gh,
+                ),
             )
 
         # Scalar metrics
@@ -945,6 +1089,35 @@ class ScadaWindow(QMainWindow):
     # LP integration (called once per 15-min slot)
     # ------------------------------------------------------------------
 
+    def _collect_lp_result(self):
+        """Pick up a finished async LP result without blocking."""
+        if self._lp_async_result is None:
+            return
+        # Warn if subprocess hasn't returned after 30 seconds
+        submit_time = getattr(self, "_lp_submit_time", None)
+        if submit_time is not None:
+            elapsed = __import__("time").monotonic() - submit_time
+            if elapsed > 30 and not self._lp_async_result.ready():
+                logger.warning("LP subprocess still running after %.0f s — possible hang", elapsed)
+                self._lp_submit_time = None   # warn once
+        if not self._lp_async_result.ready():
+            return                     # subprocess still solving — check next tick
+        try:
+            result = self._lp_async_result.get()
+            self.last_lp_outputs = result
+            # Reset next-day date guard so it re-solves with the updated
+            # end-of-day temperature as the correct initial condition.
+            self._nd_lp_last_date = None
+            logger.info(
+                "LP result collected: status=%s solver=%s",
+                getattr(result, "solver_status", "?"),
+                getattr(result, "solver_used", "?"),
+            )
+        except Exception as exc:
+            logger.warning("LP result error: %s", exc)
+        finally:
+            self._lp_async_result = None
+
     def _run_lp_if_needed(self):
         """Run the LP solver at the start of each new 15-minute interval.
 
@@ -965,34 +1138,182 @@ class ScadaWindow(QMainWindow):
             return                     # already solved for this interval
         self.lp_last_slot = slot
 
-        H = self.lp.cfg.horizon_steps          # 96 steps = 24 hours
+        H    = self.lp.mpc_cfg.horizon_steps   # MPC horizon steps
+        dt_h = self.lp.mpc_cfg.dt_hours          # step duration [h]
         month = datetime.now(LOCAL_TZ).month
 
-        # Build forecasts from cached data (backend call)
-        price_fc = self.data.build_price_forecast(slot, H)
-        base_load, solar_kwh = self.data.build_load_and_solar(
-            slot, H, self.base_load_kw, self.peak_load_kw,
+        # Always plan from today midnight so the full day is visible
+        today_midnight = slot.replace(hour=0, minute=0, second=0, microsecond=0)
+        lp_slot = today_midnight
+
+        # Steps from midnight to current slot (used by display methods)
+        self._lp_now_idx = int(
+            (slot - today_midnight).total_seconds() / (INTERVAL_MINUTES * 60)
         )
 
+        # Horizon: from midnight to end of known price data
+        if self.data.price_rows:
+            last_ts = (self.data.price_rows[-1][0]
+                       .astimezone(LOCAL_TZ).replace(second=0, microsecond=0))
+            known_steps = max(1, int(
+                (last_ts - today_midnight).total_seconds() / (INTERVAL_MINUTES * 60)
+            ) + 1)
+            H = min(H, known_steps)
+
+        # Build forecasts from cached data (backend call)
+        price_fc = self.data.build_price_forecast(lp_slot, H)
+        base_load, solar_kwh = self.data.build_load_and_solar(
+            lp_slot, H, self.base_load_kw, self.peak_load_kw, dt_hours=dt_h,
+        )
+        outside_temp = self.data.build_outside_temp(lp_slot, H, dt_hours=dt_h)
+
+        # ── Submit async LP solve to subprocess (non-blocking) ──────────
+        # _lp_worker.py is a standalone script that only imports smpc_calculator
+        # (no Qt), so HIGHS DLLs never clash with Qt DLLs.
         try:
-            # ── BACKEND CALL: run the greedy LP optimiser ──────────
-            self.last_lp_outputs = self.lp.solve_lp(
-                price_forecast_eur_kwh=price_fc,
-                base_load_kwh=base_load,
-                solar_pred_kwh=solar_kwh,
-                month=month,
-                building_temp_c=self._building_temp_c,
+            _cfg = self.lp.mpc_cfg
+            logger.info("LP submit: slot=%s H=%d lp_now_idx=%d", slot, H, self._lp_now_idx)
+            self._lp_async_result = _AsyncSubprocessResult(
+                self.lp.config_path,
+                price_fc,
+                base_load,
+                solar_kwh,
+                month,
+                _cfg.T_init_c,
+                outside_temp,
+                _cfg.hw_T_init_c,
             )
-            # Carry building temperature forward for the next LP call.
-            # building_temp_c = temp at END of step 0 = start of next slot.
-            if self.last_lp_outputs is not None:
-                self._building_temp_c = self.last_lp_outputs.building_temp_c
+            self._lp_submit_time = __import__("time").monotonic()
+            logger.info("LP worker subprocess started")
         except Exception as exc:
-            logger.warning("LP solve: %s", exc)
+            logger.warning("LP submit failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Next-day LP (runs once when tomorrow's prices become available)
+    # ------------------------------------------------------------------
+
+    def _collect_next_day_lp_result(self):
+        """Pick up the finished next-day async LP result without blocking."""
+        if self._nd_lp_async_result is None:
+            return
+        submit_time = self._nd_lp_submit_time
+        if submit_time is not None:
+            elapsed = __import__("time").monotonic() - submit_time
+            if elapsed > 30 and not self._nd_lp_async_result.ready():
+                logger.warning(
+                    "Next-day LP subprocess still running after %.0f s", elapsed
+                )
+                self._nd_lp_submit_time = None
+        if not self._nd_lp_async_result.ready():
+            return
+        try:
+            result = self._nd_lp_async_result.get()
+            self.last_lp_next_day_outputs = result
+            logger.info(
+                "Next-day LP result collected: status=%s solver=%s",
+                getattr(result, "solver_status", "?"),
+                getattr(result, "solver_used", "?"),
+            )
+        except Exception as exc:
+            logger.warning("Next-day LP result error: %s", exc)
+        finally:
+            self._nd_lp_async_result = None
+
+    def _run_next_day_lp_if_needed(self):
+        """Solve the LP for all of tomorrow when next-day prices are available.
+
+        ENTSO-E publishes tomorrow's day-ahead prices around 13:00 CET.
+        Once prices.csv contains data for tomorrow midnight onwards, this
+        method submits a 96-step LP covering 00:00–23:45 tomorrow.
+
+        The solve runs once per calendar day (tracked by self._nd_lp_last_date).
+        A pending async result is never replaced — we wait for it first.
+        """
+        if self._nd_lp_async_result is not None:
+            return                      # a solve is already in flight
+
+        now = datetime.now(LOCAL_TZ)
+        tomorrow = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        tomorrow_key = tomorrow.strftime("%Y-%m-%d")
+
+        if self._nd_lp_last_date == tomorrow_key:
+            return                      # already solved for tomorrow today
+
+        # Check whether prices exist for tomorrow midnight
+        has_tomorrow = any(
+            ts.astimezone(LOCAL_TZ).replace(second=0, microsecond=0) >= tomorrow
+            for ts, _, _ in self.data.price_rows
+        )
+        if not has_tomorrow:
+            return                      # prices not yet published — check next tick
+
+        H    = self.lp.mpc_cfg.horizon_steps
+        dt_h = self.lp.mpc_cfg.dt_hours
+        month = tomorrow.month
+
+        price_fc    = self.data.build_price_forecast(tomorrow, H)
+        base_load, solar_kwh = self.data.build_load_and_solar(
+            tomorrow, H, self.base_load_kw, self.peak_load_kw, dt_hours=dt_h,
+        )
+        outside_temp = self.data.build_outside_temp(tomorrow, H, dt_hours=dt_h)
+
+        try:
+            _cfg = self.lp.mpc_cfg
+            # Use the predicted end-of-today temps as initial conditions for tomorrow,
+            # so the building/HW temperature lines connect smoothly at midnight.
+            today_out = self.last_lp_outputs
+            if (today_out is not None
+                    and len(getattr(today_out, "plan_building_temp_c", [])) > 0):
+                t_init = float(today_out.plan_building_temp_c[-1])
+            else:
+                t_init = _cfg.T_init_c
+            if (today_out is not None
+                    and len(getattr(today_out, "plan_hw_temp_c", [])) > 0):
+                hw_t_init = float(today_out.plan_hw_temp_c[-1])
+            else:
+                hw_t_init = _cfg.hw_T_init_c
+            logger.info("Next-day LP submit: date=%s H=%d T_init=%.1f hw_T_init=%.1f",
+                        tomorrow_key, H, t_init, hw_t_init)
+            self._nd_lp_async_result = _AsyncSubprocessResult(
+                self.lp.config_path,
+                price_fc,
+                base_load,
+                solar_kwh,
+                month,
+                t_init,
+                outside_temp,
+                hw_t_init,
+            )
+            self._nd_lp_submit_time = __import__("time").monotonic()
+            self._nd_lp_last_date   = tomorrow_key
+            logger.info("Next-day LP worker subprocess started")
+        except Exception as exc:
+            logger.warning("Next-day LP submit failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Tag value simulation
     # ------------------------------------------------------------------
+
+    def _lp_for_abs_step(self, abs_step: int):
+        """Return (SMPCOutputs, plan_step) for an absolute step from today midnight.
+
+        Today's LP covers plan indices 0 … H-1.
+        Next-day LP covers plan indices 0 … H-1 of tomorrow, mapped to
+        abs_step H … 2H-1 in the shared 48-h timeline.
+        Returns (None, 0) if no result is available for that range.
+        """
+        H = self.lp.mpc_cfg.horizon_steps   # typically 96
+        if abs_step < H:
+            return self.last_lp_outputs, abs_step
+        nd = self.last_lp_next_day_outputs
+        if nd is not None:
+            return nd, abs_step - H
+        # next-day LP not solved yet — clamp to last step of today
+        if self.last_lp_outputs is not None:
+            return self.last_lp_outputs, min(abs_step, H - 1)
+        return None, 0
 
     def _sim_value(self, defn):
         """Determine the display text and colour for a single tag.
@@ -1019,7 +1340,7 @@ class ScadaWindow(QMainWindow):
             return self._sim_predicted_solar(sim)
         if mode == "smpc":
             return self._sim_smpc(sim)
-        if mode == "smpc_state":
+        if mode in ("smpc_state", "mpc_state"):
             return self._sim_smpc_state(sim)
         if mode == "smpc_ice_status":
             return self._sim_ice_status(sim)
@@ -1027,6 +1348,15 @@ class ScadaWindow(QMainWindow):
             return self._sim_setpoint(sim)
         if mode == "asset_power":
             return self._sim_asset_power(sim)
+        # ── MPC modes ────────────────────────────────────────────────
+        if mode == "mpc_scalar":
+            return self._sim_mpc_scalar(sim)
+        if mode == "mpc_battery_status":
+            return self._sim_mpc_battery_status(sim)
+        if mode == "mpc_building_temp":
+            return self._sim_mpc_building_temp(sim)
+        if mode == "mpc_text":
+            return self._sim_mpc_text(sim)
         return "--", "#64748b"
 
     def _sim_predicted_solar(self, sim):
@@ -1113,25 +1443,21 @@ class ScadaWindow(QMainWindow):
 
     def _sim_asset_power(self, sim):
         """Show per-asset scheduled power from the LP solution."""
-        uid = sim.get("uid", "")
+        uid  = sim.get("uid", "")
         unit = sim.get("unit", "kW")
-        dec = int(sim.get("decimals", 1))
-        if self.last_lp_outputs is None:
+        dec  = int(sim.get("decimals", 1))
+        col  = sim.get("color", "#0e7490")
+        abs_step = max(0, self._lp_now_idx + self._selected_step)
+        out, plan_step = self._lp_for_abs_step(abs_step)
+        if out is None:
             return f"-- {unit}", "#64748b"
-        out = self.last_lp_outputs
-        step = self._selected_step
-        # Use per-asset full schedule if looking at a future step
-        if step > 0:
-            sched = out.asset_schedules.get(uid)
-            if sched is not None and len(sched) > step:
-                kw = float(sched[step]) * 4.0  # kWh/15min → kW
-            else:
-                kw = 0.0
+        sched = out.asset_schedules.get(uid)
+        if sched is not None and len(sched) > plan_step:
+            kw = float(sched[plan_step]) * 4.0   # kWh/15-min step → kW
         else:
             kw = out.asset_power_kw.get(uid, 0.0)
-        if kw < 0.1:
-            return "IDLE", "#16a34a"
-        return f"{kw:.{dec}f} {unit}", "#0e7490"
+        col_out = col if kw >= 0.1 else "#64748b"
+        return f"{kw:.{dec}f} {unit}", col_out
 
     def _sim_setpoint(self, sim):
         cols = sim.get("colors", {
@@ -1148,6 +1474,93 @@ class ScadaWindow(QMainWindow):
             state = "Normal"
         return state, cols.get(state, "#0e7490")
 
+    # ── New MPC simulation modes ─────────────────────────────────────
+
+    def _sim_mpc_scalar(self, sim: dict):
+        """Read a named SMPCOutputs field from the plan array at the selected slot."""
+        field      = sim.get("field", "")
+        plan_field = sim.get("plan_field", "")
+        unit       = sim.get("unit", "")
+        dec        = int(sim.get("decimals", 1))
+        mult       = float(sim.get("multiplier", 1.0))
+        col        = sim.get("color", "#0e7490")
+
+        placeholder = (f"-- {unit}".strip()) or "--"
+
+        abs_step = max(0, self._lp_now_idx + self._selected_step)
+        out, plan_step = self._lp_for_abs_step(abs_step)
+        if out is None:
+            return placeholder, col
+
+        # Always prefer plan array (covers past, now, and future)
+        if plan_field:
+            arr = getattr(out, plan_field, None)
+            if arr is not None and len(arr) > plan_step:
+                val = float(arr[plan_step]) * mult
+                txt = f"{val:.{dec}f}"
+                if unit:
+                    txt += f" {unit}"
+                return txt, col
+
+        # Fallback: scalar attribute on SMPCOutputs
+        val = getattr(out, field, None)
+        if val is None:
+            kpis = SMPCCalculator.outputs_to_dashboard_dict(out, step=0)
+            val  = kpis.get(field)
+        if val is None:
+            return placeholder, col
+
+        val = float(val) * mult
+        txt = f"{val:.{dec}f}"
+        if unit:
+            txt += f" {unit}"
+        return txt, col
+
+    def _sim_mpc_battery_status(self, sim: dict):
+        """Show CHARGING / DISCHARGING / IDLE with power and SOC."""
+        abs_step = max(0, self._lp_now_idx + self._selected_step)
+        out, plan_step = self._lp_for_abs_step(abs_step)
+        if out is None:
+            return "--", "#64748b"
+        sched_ch  = out.asset_schedules.get("battery_charge")
+        sched_dis = out.asset_schedules.get("battery_discharge")
+        charge    = float(sched_ch[plan_step])  * 4.0 if (sched_ch  is not None and len(sched_ch)  > plan_step) else 0.0
+        discharge = float(sched_dis[plan_step]) * 4.0 if (sched_dis is not None and len(sched_dis) > plan_step) else 0.0
+        soc_arr   = out.plan_SOC
+        soc = float(soc_arr[abs_step]) if (soc_arr is not None and len(soc_arr) > abs_step) else out.battery_soc_kwh
+        if charge > 0.1:
+            return f"CHARGING  {charge:.1f} kW", "#0891b2"
+        if discharge > 0.1:
+            return f"DISCHARGING  {discharge:.1f} kW", "#f59e0b"
+        return f"IDLE  ({soc:.0f} kWh)", "#16a34a"
+
+    def _sim_mpc_building_temp(self, sim: dict):
+        """Building temperature coloured by distance from comfort setpoint."""
+        if self.last_lp_outputs is None:
+            return "-- \u00b0C", "#64748b"
+        abs_step   = max(0, self._lp_now_idx + self._selected_step)
+        out, plan_step = self._lp_for_abs_step(abs_step)
+        if out is None:
+            return "-- \u00b0C", "#64748b"
+        plan_field = sim.get("plan_field", "plan_building_temp_c")
+        arr = getattr(out, plan_field, None)
+        if arr is not None and len(arr) > plan_step:
+            temp = float(arr[plan_step])
+        else:
+            temp = float(out.building_temp_c)
+        sp   = float(out.building_setpoint_c)
+        diff = abs(temp - sp)
+        col  = "#16a34a" if diff < 1.0 else "#f59e0b" if diff < 2.0 else "#dc2626"
+        return f"{temp:.1f} \u00b0C", col
+
+    def _sim_mpc_text(self, sim: dict):
+        """Display a plain-text string field from SMPCOutputs."""
+        field = sim.get("field", "")
+        if self.last_lp_outputs is None:
+            return "--", "#64748b"
+        val = getattr(self.last_lp_outputs, field, None)
+        return (str(val) if val is not None else "--"), "#0f766e"
+
     # ------------------------------------------------------------------
     # Dialogs / popups
     # ------------------------------------------------------------------
@@ -1158,19 +1571,33 @@ class ScadaWindow(QMainWindow):
     def _open_future(self):
         FutureSimulationDialog(self).exec()
 
-    def _open_thermal_settings(self):
-        dlg = BuildingThermalDialog(self)
-        if dlg.exec():
-            # Reload thermal config into running state
-            cfg = load_dashboard_config()
-            th = cfg.get("smpc", {}).get("building", {}).get("thermal", {})
-            self._building_setpoint_c = th.get("setpoint_c", 21.0)
-            self._building_temp_c = th.get("initial_temp_c", 21.0)
-
-    def _open_popup(self, key):
-        dlg = AssetManagerDialog(category=key, parent=self)
+    def _open_building_settings(self):
+        """Open MPC Settings dialog for general building & solver configuration."""
+        from mpc_config_dialog import MpcConfigDialog
+        dlg = MpcConfigDialog(self)
         dlg.exec()
-        if dlg.changed:
+        # Reload all building state from updated config
+        cfg = self.lp.mpc_cfg
+        self._building_setpoint_c = cfg.Tset_c
+        self._building_temp_c     = cfg.T_init_c
+        self._hw_temp_c           = cfg.hw_T_init_c
+        # Reload electrical load profile (lives in smpc.building in JSON)
+        raw = load_dashboard_config()
+        bld_smpc = raw.get("smpc", {}).get("building", {})
+        self.base_load_kw = float(bld_smpc.get("base_load_kw", self.base_load_kw))
+        self.peak_load_kw = float(bld_smpc.get("peak_load_kw", self.peak_load_kw))
+        # Resize slider to new horizon
+        if self.slot_slider:
+            self.slot_slider.setMaximum(cfg.horizon_steps - 1)
+            self.slot_slider.setValue(0)
+        # Force LP re-solve with new settings at the next tick
+        self.lp_last_slot = None
+
+    def _open_mpc_asset_manager(self):
+        """Open the asset selector dialog; rebuild columns if user saved."""
+        from mpc_config_dialog import MPCAssetSelectorDialog
+        dlg = MPCAssetSelectorDialog(self)
+        if dlg.exec():
             self._rebuild_columns()
 
     def _rebuild_columns(self):
@@ -1196,13 +1623,30 @@ class ScadaWindow(QMainWindow):
 def main():
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+        format="%(asctime)s  %(levelname)-8s  %(name)s \u2014 %(message)s",
     )
     app = QApplication(sys.argv)
+    # Force Fusion light style so OS dark mode cannot bleed through the
+    # hardcoded light-colour stylesheet.
+    app.setStyle("Fusion")
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window,          QColor("#eef3f9"))
+    pal.setColor(QPalette.ColorRole.WindowText,      QColor("#1f2937"))
+    pal.setColor(QPalette.ColorRole.Base,            QColor("#ffffff"))
+    pal.setColor(QPalette.ColorRole.AlternateBase,   QColor("#f8fbff"))
+    pal.setColor(QPalette.ColorRole.Text,            QColor("#1f2937"))
+    pal.setColor(QPalette.ColorRole.Button,          QColor("#d6dfeb"))
+    pal.setColor(QPalette.ColorRole.ButtonText,      QColor("#1f2937"))
+    pal.setColor(QPalette.ColorRole.Highlight,       QColor("#2563eb"))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    pal.setColor(QPalette.ColorRole.ToolTipBase,     QColor("#ffffff"))
+    pal.setColor(QPalette.ColorRole.ToolTipText,     QColor("#1f2937"))
+    app.setPalette(pal)
     window = ScadaWindow()
     window.show()
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
+    _mp.freeze_support()   # required for Windows frozen executables
     main()

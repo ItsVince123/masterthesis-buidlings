@@ -55,8 +55,8 @@
       ]
     },
     "building": {
-      "base_load_kw": 1850,
-      "peak_load_kw": 2900,
+      "base_load_kw": 1000.0,
+      "peak_load_kw": 1200.0,
       "wkk_max_gas_m3": 89,
       "heat_demand_base_kwh": 350,
       "thermal": {
@@ -65,8 +65,175 @@
         "initial_temp_c": 20.0,
         "cooldown_rate_c_per_hour": 0.5,
         "thermal_mass_kwh_per_c": 2000.0
+      },
+      "hot_water_tank": {
+        "enabled": true,
+        "tank_volume_l": 200.0,
+        "min_temp_c": 45.0,
+        "max_temp_c": 60.0,
+        "initial_temp_c": 55.0,
+        "heat_loss_w": 50.0,
+        "heater_power_kw": 3.0
       }
     }
+  },
+  "mpc": {
+    "horizon": {
+      "steps": 96,
+      "dt_hours": 0.25
+    },
+    "grid": {
+      "Pgrid_max_kw": 500.0,
+      "fee_eur_kwh": 0.05,
+      "cap_tariff_peak_kw": 0.0,
+      "cap_tariff_eur_mwh": 0.0
+    },
+    "battery": {
+      "enabled": false,
+      "SOC_cap_kwh": 100.0,
+      "SOC_min_kwh": 10.0,
+      "SOC_init_kwh": 50.0,
+      "SOC_end_kwh": 50.0,
+      "Pch_max_kw": 25.0,
+      "Pdis_max_kw": 25.0,
+      "eta_ch": 0.95,
+      "eta_dis": 0.95,
+      "w_bat_end": 0.1
+    },
+    "heat_pump": {
+      "enabled": true,
+      "Php_max_kw": 999.0,
+      "COP0": 4.0,
+      "T0_c": 7.0,
+      "cop_alpha": 0.02,
+      "COP_min": 1.0
+    },
+    "gas_boiler": {
+      "enabled": true,
+      "Pgas_max_kw": 5000.0,
+      "eta_boiler": 0.92,
+      "gas_price_eur_m3": 0.2,
+      "gas_HV_kwh_m3": 9.8
+    },
+    "chp": {
+      "enabled": true,
+      "Pchp_max_kw": 39.2,
+      "Fchp_max_m3_h": 20.0,
+      "eta_elec": 0.4,
+      "eta_heat": 0.45,
+      "startup_cost_eur": 50.0,
+      "gas_price_eur_m3": 0.2699999999999999,
+      "gas_HV_kwh_m3": 9.8,
+      "use_milp": true
+    },
+    "pv": {
+      "enabled": true,
+      "capacity_kwp": 100.0
+    },
+    "flexible_load": {
+      "enabled": true,
+      "Pflex_max_kw": 100.0,
+      "daily_energy_kwh": 400.0,
+      "time_start": "00:00",
+      "time_end": "23:59",
+      "ramp_up_kw": 9999.0,
+      "ramp_down_kw": 9999.0
+    },
+    "hot_water_tank": {
+      "enabled": true,
+      "Ptank_max_kw": 3.5,
+      "volume_l": 200.0,
+      "T_min_c": 45.0,
+      "T_max_c": 60.0,
+      "T_init_c": 55.0,
+      "heat_loss_w": 500.0,
+      "draw_kw": 0.5
+    },
+    "building": {
+      "Tset_c": 21.0,
+      "Tmin_c": 20.0,
+      "Tmax_c": 22.0,
+      "T_init_c": 21.0,
+      "Cth_kwh_per_c": 2000.0,
+      "UA_kw_per_c": 100.0
+    },
+    "asset_instances": [
+      {
+        "id": "pv_1",
+        "type": "pv",
+        "name": "Solar Panels",
+        "enabled": true,
+        "baseline_mode": "constant",
+        "baseline_power_kw": 0.0,
+        "capacity_kwp": 100.0
+      },
+      {
+        "id": "hp_1",
+        "type": "heat_pump",
+        "name": "Heat Pump",
+        "enabled": true,
+        "baseline_mode": "proportional",
+        "baseline_power_kw": 30.0,
+        "Php_max_kw": 999.0,
+        "COP0": 4.0,
+        "T0_c": 7.0,
+        "cop_alpha": 0.02,
+        "COP_min": 1.0
+      },
+      {
+        "id": "boiler_1",
+        "type": "gas_boiler",
+        "name": "Gas Boiler",
+        "enabled": true,
+        "baseline_mode": "constant",
+        "baseline_power_kw": 50.0,
+        "Pgas_max_kw": 5000.0,
+        "eta_boiler": 0.92,
+        "gas_price_eur_m3": 0.2,
+        "gas_HV_kwh_m3": 9.8
+      },
+      {
+        "id": "hw_1",
+        "type": "hot_water",
+        "name": "Hot Water Tank",
+        "enabled": true,
+        "baseline_mode": "constant",
+        "baseline_power_kw": 2.0,
+        "Ptank_max_kw": 3.5,
+        "volume_l": 200.0,
+        "T_min_c": 45.0,
+        "T_max_c": 60.0,
+        "T_init_c": 55.0,
+        "heat_loss_w": 500.0
+      },
+      {
+        "id": "flex_1",
+        "type": "flex",
+        "name": "Ice banks",
+        "enabled": true,
+        "baseline_mode": "constant",
+        "baseline_power_kw": 10.0,
+        "Pflex_max_kw": 100.0,
+        "daily_energy_kwh": 400.0,
+        "time_start": "00:00",
+        "time_end": "23:59",
+        "ramp_up_kw": 9999.0,
+        "ramp_down_kw": 9999.0
+      },
+      {
+        "id": "chp_1",
+        "type": "chp",
+        "name": "CHP / Cogen",
+        "enabled": true,
+        "baseline_mode": "always_off",
+        "baseline_power_kw": 0.0,
+        "Fchp_max_m3_h": 20.0,
+        "eta_elec": 0.4,
+        "eta_heat": 0.45,
+        "startup_cost_eur": 50.0,
+        "gas_price_eur_m3": 0.2699999999999999
+      }
+    ]
   },
   "energy_assets": [
     {
@@ -109,7 +276,13 @@
       "beo_capacity_kwh": 50000.0,
       "beo_extraction_rate_kw": 0.0,
       "beo_injection_rate_kw": 0.0,
-      "beo_initial_temp_c": 12.0
+      "beo_initial_temp_c": 12.0,
+      "hw_tank_volume_l": 200.0,
+      "hw_min_temp_c": 45.0,
+      "hw_max_temp_c": 60.0,
+      "hw_initial_temp_c": 55.0,
+      "hw_heat_loss_w": 50.0,
+      "hw_heater_power_kw": 3.0
     },
     {
       "uid": "solar",
@@ -151,7 +324,13 @@
       "beo_capacity_kwh": 50000.0,
       "beo_extraction_rate_kw": 0.0,
       "beo_injection_rate_kw": 0.0,
-      "beo_initial_temp_c": 12.0
+      "beo_initial_temp_c": 12.0,
+      "hw_tank_volume_l": 200.0,
+      "hw_min_temp_c": 45.0,
+      "hw_max_temp_c": 60.0,
+      "hw_initial_temp_c": 55.0,
+      "hw_heat_loss_w": 50.0,
+      "hw_heater_power_kw": 3.0
     },
     {
       "uid": "ev_charging",
@@ -193,7 +372,13 @@
       "beo_capacity_kwh": 50000.0,
       "beo_extraction_rate_kw": 0.0,
       "beo_injection_rate_kw": 0.0,
-      "beo_initial_temp_c": 12.0
+      "beo_initial_temp_c": 12.0,
+      "hw_tank_volume_l": 200.0,
+      "hw_min_temp_c": 45.0,
+      "hw_max_temp_c": 60.0,
+      "hw_initial_temp_c": 55.0,
+      "hw_heat_loss_w": 50.0,
+      "hw_heater_power_kw": 3.0
     },
     {
       "uid": "d450458d4b0e",
@@ -235,7 +420,61 @@
       "beo_capacity_kwh": 50000.0,
       "beo_extraction_rate_kw": 0.0,
       "beo_injection_rate_kw": 0.0,
-      "beo_initial_temp_c": 12.0
+      "beo_initial_temp_c": 12.0,
+      "hw_tank_volume_l": 200.0,
+      "hw_min_temp_c": 45.0,
+      "hw_max_temp_c": 60.0,
+      "hw_initial_temp_c": 55.0,
+      "hw_heat_loss_w": 50.0,
+      "hw_heater_power_kw": 3.0
+    },
+    {
+      "uid": "d511f30b70db",
+      "name": "Sanitair warm water",
+      "asset_type": "hot_water_heater",
+      "category": "output",
+      "icon": "plug",
+      "enabled": true,
+      "csv_column": "",
+      "hourly_max_kwh": 720.0,
+      "daily_energy_kwh": 0.0,
+      "ramp_up_pct_per_hour": 100.0,
+      "ramp_down_pct_per_hour": 100.0,
+      "baseline_start_hour": 9,
+      "baseline_end_hour": 19,
+      "flex_start_hour": 0,
+      "flex_end_hour": 24,
+      "capacity_kwp": 0.0,
+      "solar_csv": "",
+      "csv_gen_column": "",
+      "decouple_below_eur_mwh": null,
+      "startup_cost_eur": 0.0,
+      "chp_elec_efficiency": 0.0,
+      "chp_heat_efficiency": 0.0,
+      "gas_price_eur_m3": 0.0,
+      "gas_energy_kwh_m3": 9.8,
+      "storage_capacity_kwh": 0.0,
+      "charge_rate_kw": 0.0,
+      "discharge_rate_kw": 0.0,
+      "efficiency": 0.9,
+      "thermal_output_kw": 0.0,
+      "gas_efficiency": 0.92,
+      "gas_consumption_m3_per_hour": 0.0,
+      "cop": 3.5,
+      "electrical_input_kw": 0.0,
+      "heating_capacity_kw": 0.0,
+      "cooling_capacity_kw": 0.0,
+      "is_ground_source": false,
+      "beo_capacity_kwh": 50000.0,
+      "beo_extraction_rate_kw": 0.0,
+      "beo_injection_rate_kw": 0.0,
+      "beo_initial_temp_c": 12.0,
+      "hw_tank_volume_l": 2000.0,
+      "hw_min_temp_c": 55.0,
+      "hw_max_temp_c": 70.0,
+      "hw_initial_temp_c": 60.0,
+      "hw_heat_loss_w": 50.0,
+      "hw_heater_power_kw": 7.0
     }
   ]
 }

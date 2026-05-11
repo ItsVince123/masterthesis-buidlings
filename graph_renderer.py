@@ -167,6 +167,198 @@ def draw_solar_graph(
     )
 
 
+def draw_temperature_graph(
+    temps: list[float],
+    start_label: str,
+    end_label: str,
+    current_index: int | None = None,
+    selected_index: int | None = None,
+    width: int = 420,
+    height: int = 200,
+) -> QPixmap:
+    """Line graph styled for outside temperature (teal/green). Legacy wrapper."""
+    return draw_series_graph(
+        temps, "°C", start_label, end_label, "#0d9488", current_index,
+        selected_index, width, height,
+    )
+
+
+def draw_thermal_graph(
+    outdoor_temps: list[float],
+    building_temps: list[float],
+    setpoint_c: float,
+    heat_hp_kw: list[float],
+    heat_boiler_kw: list[float],
+    heat_chp_kw: list[float],
+    start_label: str,
+    end_label: str,
+    current_index: int | None = None,
+    selected_index: int | None = None,
+    width: int = 420,
+    height: int = 280,
+) -> QPixmap:
+    """Dual-axis step-line graph: temperatures (left °C) + heating sources (right kW).
+
+    Left Y-axis  (°C):  outdoor temp (teal), building temp (orange), setpoint (dashed gray)
+    Right Y-axis (kW):  CHP heat (amber), boiler (red), heat pump (green)
+    """
+    import math
+
+    def _clean(lst: list[float]) -> list[float | None]:
+        """Replace NaN/None with None for safe rendering."""
+        out = []
+        for v in lst:
+            out.append(v if (v is not None and not math.isnan(v)) else None)
+        return out
+
+    n = max(len(outdoor_temps), len(building_temps),
+            len(heat_hp_kw), len(heat_boiler_kw), len(heat_chp_kw), 1)
+
+    out_t  = _clean(outdoor_temps)
+    bld_t  = _clean(building_temps)
+    hp_kw  = _clean(heat_hp_kw)
+    bl_kw  = _clean(heat_boiler_kw)
+    chp_kw = _clean(heat_chp_kw)
+
+    def _get(lst, i):
+        return lst[i] if i < len(lst) else None
+
+    pixmap = QPixmap(width, height)
+    pixmap.fill(QColor("#f8fbff"))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    pad_l, pad_r, pad_t, pad_b = 46, 46, 14, 36
+    dw = width  - pad_l - pad_r
+    dh = height - pad_t - pad_b
+    slot_w = dw / max(n, 1)
+
+    # ── Left Y scale: °C ──────────────────────────────────────────────
+    all_t = [v for v in out_t + bld_t if v is not None] + [setpoint_c]
+    t_min = (min(all_t) - 2.0) if all_t else -5.0
+    t_max = (max(all_t) + 2.0) if all_t else 30.0
+    t_span = max(t_max - t_min, 1e-6)
+
+    def ly_t(v: float) -> int:
+        return int(pad_t + dh - (v - t_min) / t_span * dh)
+
+    # ── Right Y scale: kW ─────────────────────────────────────────────
+    all_kw = [v for v in hp_kw + bl_kw + chp_kw if v is not None]
+    kw_max = max(max(all_kw) * 1.10, 1.0) if all_kw else 1.0
+    kw_min = 0.0
+
+    def ry_kw(v: float) -> int:
+        return int(pad_t + dh - (v - kw_min) / kw_max * dh)
+
+    # ── Grid lines ────────────────────────────────────────────────────
+    grid_pen = QPen(QColor("#e2ecf7"))
+    grid_pen.setWidth(1)
+    painter.setPen(grid_pen)
+    for i in range(5):
+        y = int(pad_t + i * dh / 4)
+        painter.drawLine(pad_l, y, width - pad_r, y)
+
+    # ── Helper: draw one step-line series, skipping None gaps ─────────
+    def _draw_step_line(series: list, y_fn, pen: QPen):
+        painter.setPen(pen)
+        prev = None
+        for i in range(n):
+            v = _get(series, i)
+            x0 = int(pad_l + i * slot_w)
+            x1 = int(pad_l + (i + 1) * slot_w)
+            if v is not None:
+                y = y_fn(v)
+                painter.drawLine(x0, y, x1, y)          # horizontal segment
+                if prev is not None:
+                    painter.drawLine(x0, y_fn(prev), x0, y)  # vertical step
+            prev = v if v is not None else prev          # forward-fill across gaps
+
+    # ── Setpoint dashed line ──────────────────────────────────────────
+    sp_pen = QPen(QColor("#94a3b8"))
+    sp_pen.setWidth(1)
+    sp_pen.setStyle(Qt.PenStyle.DashLine)
+    painter.setPen(sp_pen)
+    y_sp = ly_t(setpoint_c)
+    painter.drawLine(pad_l, y_sp, width - pad_r, y_sp)
+
+    # ── Heating lines (right axis) ────────────────────────────────────
+    _draw_step_line(chp_kw, ry_kw, QPen(QColor("#f59e0b"), 2))
+    _draw_step_line(bl_kw,  ry_kw, QPen(QColor("#ef4444"), 2))
+    _draw_step_line(hp_kw,  ry_kw, QPen(QColor("#16a34a"), 2))
+
+    # ── Temperature lines (left axis) — drawn on top ──────────────────
+    _draw_step_line(out_t, ly_t, QPen(QColor("#0d9488"), 2))
+    _draw_step_line(bld_t, ly_t, QPen(QColor("#f97316"), 2))
+
+    # ── Now / selected markers ────────────────────────────────────────
+    if current_index is not None and 0 <= current_index < n:
+        now_pen = QPen(QColor("#dc2626"), 2)
+        painter.setPen(now_pen)
+        x_now = int(pad_l + current_index * slot_w)
+        painter.drawLine(x_now, pad_t, x_now, height - pad_b)
+        painter.setPen(QPen(QColor("#dc2626")))
+        painter.drawText(x_now + 3, pad_t + 11, "Now")
+
+    if selected_index is not None and 0 <= selected_index < n:
+        sel_pen = QPen(QColor("#7c3aed"), 2)
+        sel_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(sel_pen)
+        x_sel = int(pad_l + selected_index * slot_w)
+        painter.drawLine(x_sel, pad_t, x_sel, height - pad_b)
+        painter.setPen(QPen(QColor("#7c3aed")))
+        fm = painter.fontMetrics()
+        painter.drawText(x_sel - fm.horizontalAdvance("▼") // 2, pad_t + 11, "▼")
+
+    # ── Axis tick labels ──────────────────────────────────────────────
+    text_pen = QPen(QColor("#475569"))
+    painter.setPen(text_pen)
+    # Left: °C
+    for frac, val in ((0.0, t_max), (0.5, (t_max + t_min) / 2), (1.0, t_min)):
+        y = int(pad_t + frac * dh)
+        painter.drawText(2, y + 4, f"{val:.0f}°")
+    # Right: kW
+    for frac, val in ((0.0, kw_max), (0.5, kw_max / 2), (1.0, 0.0)):
+        y = int(pad_t + frac * dh)
+        lbl = f"{val:.0f}kW"
+        painter.drawText(width - pad_r + 3, y + 4, lbl)
+
+    # ── Border lines (left + bottom) ─────────────────────────────────
+    border_pen = QPen(QColor("#cbd5e1"), 1)
+    painter.setPen(border_pen)
+    painter.drawLine(pad_l, pad_t, pad_l, height - pad_b)
+    painter.drawLine(pad_l, height - pad_b, width - pad_r, height - pad_b)
+    painter.drawLine(width - pad_r, pad_t, width - pad_r, height - pad_b)
+
+    # ── Legend ────────────────────────────────────────────────────────
+    series_legend = [
+        ("#0d9488", "Out °C"),
+        ("#f97316", "Bld °C"),
+        ("#94a3b8", "Setpoint"),
+        ("#16a34a", "HP"),
+        ("#ef4444", "Boiler"),
+        ("#f59e0b", "CHP"),
+    ]
+    painter.setPen(text_pen)
+    fm = painter.fontMetrics()
+    lx = pad_l
+    ly = height - 6
+    for col, label in series_legend:
+        painter.fillRect(lx, ly - 8, 12, 4, QColor(col))
+        painter.drawText(lx + 15, ly, label)
+        lx += 15 + fm.horizontalAdvance(label) + 8
+        if lx + 50 > width - pad_r:
+            break  # don't overflow
+
+    # ── Time labels ───────────────────────────────────────────────────
+    painter.setPen(QPen(QColor("#94a3b8")))
+    painter.drawText(pad_l, height - pad_b + 12, start_label)
+    mid_lbl = f"{start_label.split(' ')[0]}  →  {end_label.split(' ')[0]}"
+    painter.drawText(width - pad_r - fm.horizontalAdvance(end_label), height - pad_b + 12, end_label)
+
+    painter.end()
+    return pixmap
+
+
 # ---------------------------------------------------------------------------
 # Dual-series comparison graph (used by historical analysis)
 # ---------------------------------------------------------------------------

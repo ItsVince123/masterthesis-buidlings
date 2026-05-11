@@ -43,6 +43,7 @@ FIXED_LOAD = "fixed_load"
 STORAGE = "storage"
 GAS_HEATER = "gas_heater"
 HEAT_PUMP = "heat_pump"
+HOT_WATER_HEATER = "hot_water_heater"
 
 ASSET_TYPES = {
     SHIFTABLE_LOAD: "Shiftable Load",
@@ -51,6 +52,7 @@ ASSET_TYPES = {
     STORAGE: "Storage",
     GAS_HEATER: "Gas Heater",
     HEAT_PUMP: "Heat Pump",
+    HOT_WATER_HEATER: "Hot Water Heater",
 }
 
 # Extra cost added on top of spot price (distribution fees, taxes, etc.)
@@ -119,6 +121,14 @@ class EnergyAsset:
     beo_extraction_rate_kw: float = 0.0  # max heat extraction from ground [kW]
     beo_injection_rate_kw: float = 0.0   # max heat injection into ground [kW]
     beo_initial_temp_c: float = 12.0   # initial ground temperature [°C]
+
+    # ── Hot water heater (electric, COP = 1) properties ─────────────
+    hw_tank_volume_l: float = 200.0    # tank volume [L]
+    hw_min_temp_c: float = 45.0        # minimum allowed temperature [°C]
+    hw_max_temp_c: float = 60.0        # maximum (target) temperature [°C]
+    hw_initial_temp_c: float = 55.0    # starting temperature [°C]
+    hw_heat_loss_w: float = 50.0       # standby heat loss [W]
+    hw_heater_power_kw: float = 3.0    # heater rated power [kW] (COP = 1)
 
     def __post_init__(self):
         if not self.uid:

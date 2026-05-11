@@ -58,6 +58,8 @@ _KPI_ROWS_TOP = [
     ("co2_saved_pct",        "CO\u2082 saved %"),
     ("heating_saving",       "Heating savings"),
     ("heating_saving_pct",   "Heating savings %"),
+    ("hw_saving",            "Hot water savings"),
+    ("hw_saving_pct",        "Hot water savings %"),
     ("slots",                "Time slots"),
 ]
 
@@ -608,6 +610,18 @@ class HistoricalAnalysisDialog(QDialog):
         self.kpi_labels["heating_saving_pct"].setText(f"{heat_pct:.2f}%")
         self.kpi_labels["heating_saving_pct"].setStyleSheet(heat_styled)
 
+        hw_save = results.get("hw_saving_eur", 0.0)
+        hw_pct  = results.get("hw_saving_pct",  0.0)
+        hw_colour = "#16a34a" if hw_save >= 0 else "#dc2626"
+        hw_styled = (
+            f"font-family: 'Consolas'; font-weight: 700;"
+            f" color: {hw_colour}; border: none;"
+        )
+        self.kpi_labels["hw_saving"].setText(f"\u20ac{hw_save:.2f}")
+        self.kpi_labels["hw_saving"].setStyleSheet(hw_styled)
+        self.kpi_labels["hw_saving_pct"].setText(f"{hw_pct:.2f}%")
+        self.kpi_labels["hw_saving_pct"].setStyleSheet(hw_styled)
+
         self.kpi_labels["slots"].setText(f"{results['n_slots']} hourly")
 
         # ── Per-asset breakdown ─────────────────────────────────────
@@ -708,6 +722,23 @@ class HistoricalAnalysisDialog(QDialog):
                      f"{heat_pct:.1f}%",
                      "#16a34a" if heat_pct >= 0 else "#dc2626")
 
+        # ── Hot water tank savings ───────────────────────────────────
+        hw_save = results.get("hw_saving_eur")
+        if hw_save is not None:
+            hw_bl  = results.get("hw_baseline_cost_eur", 0.0)
+            hw_pct = results.get("hw_saving_pct", 0.0)
+            _add_section("\U0001f6bf Hot water tank (smart scheduling, COP\u202f=\u202f1)")
+            _add_row("  Baseline DHW cost",
+                     f"\u20ac{hw_bl:.2f}", "#64748b")
+            _add_row("  Smart DHW cost",
+                     f"\u20ac{hw_bl - hw_save:.2f}", "#0e7490")
+            _add_row("  DHW saving",
+                     f"\u20ac{hw_save:.2f}",
+                     "#16a34a" if hw_save >= 0 else "#dc2626")
+            _add_row("  DHW saving %",
+                     f"{hw_pct:.1f}%",
+                     "#16a34a" if hw_pct >= 0 else "#dc2626")
+
     # ------------------------------------------------------------------
     # Full-year analysis
     # ------------------------------------------------------------------
@@ -761,6 +792,8 @@ class HistoricalAnalysisDialog(QDialog):
         total_co2_optimised_g = 0.0
         total_heating_saving = 0.0
         total_heating_baseline = 0.0
+        total_hw_saving = 0.0
+        total_hw_baseline = 0.0
         total_slots = 0
         days_processed = 0
         # Per-asset accumulators (keyed by asset name)
@@ -835,6 +868,8 @@ class HistoricalAnalysisDialog(QDialog):
             total_co2_optimised_g += float(np.sum(results["optimised_grid_kwh"] * co2_arr))
             total_heating_saving  += results.get("heating_saving_eur", 0.0)
             total_heating_baseline += results.get("heating_baseline_cost_eur", 0.0)
+            total_hw_saving   += results.get("hw_saving_eur", 0.0)
+            total_hw_baseline += results.get("hw_baseline_cost_eur", 0.0)
 
             days_processed += 1
             day += timedelta(days=1)
@@ -893,6 +928,20 @@ class HistoricalAnalysisDialog(QDialog):
         self.kpi_labels["heating_saving_pct"].setText(f"{heat_pct:.2f}%")
         self.kpi_labels["heating_saving_pct"].setStyleSheet(heat_styled)
 
+        hw_colour = "#16a34a" if total_hw_saving >= 0 else "#dc2626"
+        hw_styled = (
+            f"font-family: 'Consolas'; font-weight: 700;"
+            f" color: {hw_colour}; border: none;"
+        )
+        hw_pct = (
+            (total_hw_saving / total_hw_baseline * 100)
+            if total_hw_baseline > 0 else 0.0
+        )
+        self.kpi_labels["hw_saving"].setText(f"\u20ac{total_hw_saving:.2f}")
+        self.kpi_labels["hw_saving"].setStyleSheet(hw_styled)
+        self.kpi_labels["hw_saving_pct"].setText(f"{hw_pct:.2f}%")
+        self.kpi_labels["hw_saving_pct"].setStyleSheet(hw_styled)
+
         self.kpi_labels["slots"].setText(f"{total_slots} hourly")
 
         self.graph_label.setText(
@@ -909,6 +958,9 @@ class HistoricalAnalysisDialog(QDialog):
             "heating_saving_eur":          total_heating_saving,
             "heating_saving_pct":          heat_pct,
             "heating_baseline_cost_eur":   total_heating_baseline,
+            "hw_saving_eur":               total_hw_saving,
+            "hw_saving_pct":               hw_pct,
+            "hw_baseline_cost_eur":        total_hw_baseline,
         })
 
         self.status_label.setText(

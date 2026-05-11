@@ -60,6 +60,18 @@ except ImportError:
         stacklevel=2,
     )
 
+# MPC LP solver (new formulation)
+try:
+    from mpc_lp import (  # noqa: E402
+        MPCConfig, MPCInputs, MPCOutputs,
+        solve_mpc as _mpc_solve,
+        load_mpc_config as _load_mpc_config,
+    )
+    MPC_LP_AVAILABLE = True
+except ImportError as _mpc_err:
+    MPC_LP_AVAILABLE = False
+    warnings.warn(f"mpc_lp not found ({_mpc_err}) — solve_lp will raise.", stacklevel=2)
+
 
 # ===========================================================================
 # SECTION 1: CONFIGURATION
@@ -128,8 +140,9 @@ class SMPCConfig:
     building_setpoint_c:        float =  21.0   # Target indoor temperature [°C]
     building_deadband_c:        float =   1.0   # Acceptable deviation ± [°C]
     building_initial_temp_c:    float =  18.0   # Start temperature when dashboard boots
-    cooldown_rate_c_per_hour:   float =   0.5   # Natural heat loss rate [°C/h]
+    cooldown_rate_c_per_hour:   float =   0.5   # Natural heat loss rate [°C/h] (fallback)
     thermal_mass_kwh_per_c:     float = 500.0   # Thermal inertia: kWh to raise building 1 °C
+    ua_kwh_per_c_per_h:         float =   2.5   # Envelope heat loss coefficient [kWh/°C/h]
 
     # -----------------------------------------------------------------------
 
@@ -209,6 +222,7 @@ class SMPCConfig:
         d.building_initial_temp_c  = float(thermal.get("initial_temp_c",          d.building_initial_temp_c))
         d.cooldown_rate_c_per_hour = float(thermal.get("cooldown_rate_c_per_hour", d.cooldown_rate_c_per_hour))
         d.thermal_mass_kwh_per_c   = float(thermal.get("thermal_mass_kwh_per_c",  d.thermal_mass_kwh_per_c))
+        d.ua_kwh_per_c_per_h       = float(thermal.get("ua_kwh_per_c_per_h",       d.ua_kwh_per_c_per_h))
 
         return d
 
@@ -352,6 +366,46 @@ class SMPCOutputs:
     # Shape: (horizon_steps,) — full BEO-veld temperature profile [°C]
     plan_beo_temp_c: np.ndarray = field(default_factory=lambda: np.array([]))
 
+    # --- Hot water tank state ------------------------------------------------
+    hw_temp_c:       float = 55.0    # Current simulated tank temperature [°C]
+    hw_heater_kw:    float = 0.0     # Heater power active this step [kW]
+
+    # Shape: (horizon_steps,) — full HW temperature profile [°C]
+    plan_hw_temp_c: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # --- MPC LP extended outputs (new decision variables) --------------------
+    battery_soc_kwh:       float = 0.0    # Battery SOC after first step [kWh]
+    battery_charge_kw:     float = 0.0    # Battery charging power [kW]
+    battery_discharge_kw:  float = 0.0    # Battery discharging power [kW]
+    pv_used_kw:            float = 0.0    # PV power used this step [kW]
+    gas_boiler_kw:         float = 0.0    # Gas boiler thermal output [kW]
+    cop_now:               float = 4.0    # Heat pump COP at current ambient temp
+    zchp_now:              float = 0.0    # CHP on/off state (0 or 1)
+    chp_elec_kw:           float = 0.0    # CHP electrical output this step [kW]
+    chp_heat_kw:           float = 0.0    # CHP thermal output this step [kW]
+    pgrid_kw:              float = 0.0    # Grid import this step [kW] (direct from MPC Pgrid)
+
+    # Shape: (H+1,) — full SOC profile (index 0 = initial state)
+    plan_SOC: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # Shape: (H,) — full COP profile
+    plan_COP: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # Shape: (H,) — full PV power profile [kW]
+    plan_Ppv: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # Shape: (H,) — full CHP on/off profile
+    plan_zchp: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # Shape: (H,) — full CHP electrical output profile [kW]
+    plan_chp_elec_kw: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # Shape: (H,) — full CHP thermal output profile [kW]
+    plan_chp_heat_kw: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # Shape: (H,) — full grid import profile [kW] (direct from MPC plan_Pgrid)
+    plan_pgrid_kw: np.ndarray = field(default_factory=lambda: np.array([]))
+
 
 # ===========================================================================
 # SECTION 3: PRICE SCENARIO GENERATOR
@@ -409,6 +463,7 @@ from lp_solver import (
     greedy_lp_ramped as _greedy_lp_ramped,
     simulate_building_thermal as _simulate_thermal,
     _chp_optimal_schedule as _chp_schedule,
+    _effective_prices as _eff_prices,
 )
 
 
@@ -754,17 +809,40 @@ class SMPCCalculator:
     the dashboard responsible for state tracking, which is cleaner.
     """
 
-    def __init__(self, config: SMPCConfig = None):
-        if config is not None:
+    def __init__(self, config=None):
+        if isinstance(config, str):
+            # config is a filesystem path to dashboard_config.json
+            self.config_path = config
+            try:
+                from dashboard_config import load_smpc_config
+                self.cfg = load_smpc_config(config)
+            except Exception:
+                self.cfg = SMPCConfig()
+        elif config is not None:
             self.cfg = config
+            self.config_path = "dashboard_config.json"
         else:
             # Auto-load from dashboard_config.json sitting next to this file.
             # Falls back to hardcoded defaults if the file is missing.
+            self.config_path = "dashboard_config.json"
             try:
                 from dashboard_config import load_smpc_config
                 self.cfg = load_smpc_config()
             except Exception:
                 self.cfg = SMPCConfig()
+
+    @property
+    def mpc_cfg(self) -> "MPCConfig":
+        """
+        MPC LP configuration (MPCConfig).
+
+        Reloads from dashboard_config.json on every access so that GUI
+        changes (MpcConfigDialog) take effect at the next solve call
+        without restarting the dashboard.
+        """
+        if not MPC_LP_AVAILABLE:
+            raise RuntimeError("mpc_lp.py is not available")
+        return _load_mpc_config()
 
     # ------------------------------------------------------------------
     # Public API
@@ -927,7 +1005,7 @@ class SMPCCalculator:
         )
 
     # ------------------------------------------------------------------
-    # Asset-driven greedy LP (24 h rolling window)
+    # MPC LP -- receding-horizon solver (replaces greedy LP)
     # ------------------------------------------------------------------
 
     def solve_lp(
@@ -937,217 +1015,191 @@ class SMPCCalculator:
         solar_pred_kwh: np.ndarray | None = None,
         month: int = 7,
         building_temp_c: float | None = None,
+        outside_temp_c: np.ndarray | None = None,
+        hw_temp_c: float | None = None,
     ) -> SMPCOutputs:
-        """Asset-driven greedy LP over a 24-hour rolling window.
+        """
+        MPC LP/MILP solve -- receding-horizon building energy optimisation.
 
-        Reads energy-asset configuration, schedules every shiftable load
-        to the cheapest 15-minute intervals, applies generator output
-        (with price-based decoupling), and returns the first-step action
-        following the receding-horizon principle.
+        Calls mpc_lp.solve_mpc() which optimises all decision variables
+        simultaneously over the full horizon H:
 
-        Parameters
-        ----------
-        price_forecast_eur_kwh : array (H,)
-            Spot electricity prices for the next 24 h (EUR / kWh).
-        base_load_kwh : array (H,) | None
-            Non-shiftable building consumption per 15-min step (kWh).
-            Pass the *gross* load (before solar subtraction).
-        solar_pred_kwh : array (H,) | None
-            Predicted solar production per 15-min step (kWh).
-        month : int
-            Current calendar month (1-12) for season tagging.
+            Pgrid[k]      grid import power            [kW]
+            Php[k]        heat pump thermal output     [kW]
+            Pgas[k]       gas boiler thermal output    [kW]
+            Pch[k]        battery charging power       [kW]
+            Pdis[k]       battery discharging power    [kW]
+            SOC[k]        battery state of charge      [kWh]
+            Pflex[k]      flexible / shiftable load    [kW]
+            Ppv[k]        PV power actually used       [kW]
+            Ptank[k]      hot water heater power       [kW]
+            Ttank[k]      hot water tank temperature   [C]
+            Fchp[k]       CHP gas flow rate            [m3/h]
+            Pchp[k]       CHP electrical output        [kW]
+            Qchp[k]       CHP thermal output           [kW]
+            zchp[k]       CHP on/off binary            {0,1}
+            ychp[k]       CHP startup binary           {0,1}
+            Tbuilding[k]  building temperature         [C]
+
+        COP model (precomputed parameter):
+            COP[k] = COP0 x max(COP_min, 1 - cop_alpha x (Tamb[k] - T0))
+
+        All efficiencies and parameters are read from the 'mpc' block
+        in dashboard_config.json (editable via MpcConfigDialog).
+
+        Parameters match the legacy signature so the dashboard needs only
+        the change:  H = self.lp.mpc_cfg.horizon_steps
         """
         import time as _time
-        from energy_assets import (
-            load_assets, SHIFTABLE_LOAD, GENERATOR, GAS_HEATER, HEAT_PUMP,
-            EXTRA_COST_EUR_MWH,
-        )
 
-        t0 = _time.perf_counter()
-        cfg = self.cfg
-        H = cfg.horizon_steps
-
-        price_fc = self._pad_forecast(price_forecast_eur_kwh, H)
-        total_price = price_fc + cfg.grid_fee_eur_kwh        # spot + distr.
-
-        base = (self._pad_forecast(base_load_kwh, H)
-                if base_load_kwh is not None
-                else np.full(H, 20.0))
-        solar = (self._pad_forecast(solar_pred_kwh, H)
-                 if solar_pred_kwh is not None
-                 else np.zeros(H))
-
-        assets = [a for a in load_assets() if a.enabled]
-
-        # ── Shiftable loads ─────────────────────────────────────────
-        baseline_shiftable = np.zeros(H)
-        lp_shiftable = np.zeros(H)
-        total_shifted = 0.0
-        asset_schedules: dict[str, np.ndarray] = {}
-
-        for asset in assets:
-            if asset.asset_type != SHIFTABLE_LOAD:
-                continue
-            daily_kwh = asset.daily_energy_kwh
-            if daily_kwh <= 0:
-                continue
-            max_per_step = asset.hourly_max_kwh / 4.0   # hourly → 15-min
-            schedule = _greedy_lp_ramped(
-                H, total_price, daily_kwh, max_per_step,
-                ramp_up_pct=asset.ramp_up_pct_per_hour,
-                ramp_down_pct=asset.ramp_down_pct_per_hour,
+        if not MPC_LP_AVAILABLE:
+            raise RuntimeError(
+                "mpc_lp.py is not importable. "
+                "Install cvxpy: pip install cvxpy"
             )
-            baseline_shiftable += np.full(H, daily_kwh / H)
-            lp_shiftable += schedule
-            asset_schedules[asset.uid] = schedule
-            total_shifted += daily_kwh
 
-        # ── Generators ──────────────────────────────────────────────
-        total_gen = np.zeros(H)
+        t0  = _time.perf_counter()
+        cfg = self.mpc_cfg          # reloads from JSON on each call
+        H   = cfg.horizon_steps
+        dt  = cfg.dt_hours
 
-        for asset in assets:
-            if asset.asset_type != GENERATOR:
-                continue
-            gen = np.zeros(H)
-            if asset.solar_csv:
-                gen += solar
-            if asset.decouple_below_eur_mwh is not None:
-                price_mwh = total_price * 1000.0
-                gen = np.where(
-                    price_mwh >= asset.decouple_below_eur_mwh, gen, 0.0,
-                )
-            total_gen += gen
+        def _pad(arr, fallback: float = 0.0) -> np.ndarray:
+            if arr is None:
+                return np.full(H, fallback)
+            a = np.asarray(arr, dtype=float).ravel()
+            if len(a) >= H:
+                return a[:H]
+            tail = float(a[-1]) if len(a) else fallback
+            return np.concatenate([a, np.full(H - len(a), tail)])
 
-        # ── CHP / WKK scheduling via spark-spread LP ────────────────
-        # Use the same _chp_optimal_schedule() as the historical LP so
-        # the logic is identical: fire only when market price > variable
-        # gas cost, prune short blocks whose gross profit < startup cost.
-        gas_plan = np.zeros(H)
-        wkk_elec_plan = np.zeros(H)
-        chp_heat_kw_arr = np.zeros(H)
-        chp_gas_cost_arr = np.zeros(H)   # fuel cost per step [EUR]
-        total_price_mwh = total_price * 1000.0  # EUR/kWh → EUR/MWh for _chp_schedule
+        price_fc = _pad(price_forecast_eur_kwh, 0.15)
 
-        for asset in assets:
-            if asset.asset_type != GENERATOR or not asset.enabled:
-                continue
-            elec_eff = getattr(asset, "chp_elec_efficiency", 0.0)
-            if elec_eff <= 0:
-                continue
-            gen_kwh = _chp_schedule(H, total_price_mwh, asset, dt_hours=0.25)
-            wkk_elec_plan += gen_kwh
-            gas_per_step = gen_kwh / (asset.gas_energy_kwh_m3 * elec_eff)
-            gas_plan += gas_per_step
-            gp = asset.gas_price_eur_m3 if asset.gas_price_eur_m3 > 0 else cfg.gas_price_eur_m3
-            chp_gas_cost_arr += gas_per_step * gp
-            heat_eff = getattr(asset, "chp_heat_efficiency", 0.0)
-            if heat_eff > 0:
-                # kWh thermal per 15-min step → kW
-                chp_heat_kw_arr += gen_kwh * (heat_eff / elec_eff) / 0.25
+        # DataManager provides kWh/step; convert to kW for the MPC
+        if base_load_kwh is not None:
+            Pload = _pad(np.asarray(base_load_kwh, float) / max(dt, 1e-9), 50.0)
+        else:
+            t_h   = np.arange(H, dtype=float) * dt
+            Pload = 50.0 + 30.0 * np.abs(np.sin(t_h * np.pi / 12.0))
 
-        total_gen += wkk_elec_plan
+        Ppv_fc = (_pad(np.asarray(solar_pred_kwh, float) / max(dt, 1e-9), 0.0)
+                  if solar_pred_kwh is not None else np.zeros(H))
 
-        # ── Startup costs for generators ────────────────────────────
-        total_startup_cost = 0.0
-        for asset in assets:
-            if asset.asset_type != GENERATOR or asset.startup_cost_eur <= 0:
-                continue
-            # For CHP assets: detect on/off transitions in gas_plan
-            if getattr(asset, "chp_elec_efficiency", 0.0) > 0:
-                on = gas_plan > 0
-            else:
-                gen_chk = solar.copy()
-                if asset.decouple_below_eur_mwh is not None:
-                    price_mwh = total_price * 1000.0
-                    gen_chk = np.where(price_mwh >= asset.decouple_below_eur_mwh, gen_chk, 0.0)
-                on = gen_chk > 0
-            starts = int(np.sum(on[1:] & ~on[:-1]))
-            if len(on) > 0 and on[0]:
-                starts += 1
-            total_startup_cost += starts * asset.startup_cost_eur
+        Tamb = (_pad(outside_temp_c, cfg.T_init_c - 5.0)
+                if outside_temp_c is not None
+                else np.full(H, cfg.T_init_c - 5.0))
 
-        # ── Building thermal simulation ─────────────────────────────
-        # Run the thermal model to track building temperature and
-        # compute heating actions from gas heaters and heat pumps.
-        # CHP exhaust heat (chp_heat_kw_arr) is fed in as free heat.
-        # Use the carried-over building temperature if provided; otherwise
-        # fall back to the configured initial value (dashboard boot).
-        initial_temp = building_temp_c if building_temp_c is not None else cfg.building_initial_temp_c
-        thermal_result = _simulate_thermal(
-            n_steps=H,
-            dt_hours=0.25,  # 15-minute steps
-            initial_temp_c=initial_temp,
-            setpoint_c=cfg.building_setpoint_c,
-            deadband_c=cfg.building_deadband_c,
-            cooldown_rate_c_per_hour=cfg.cooldown_rate_c_per_hour,
-            thermal_mass_kwh_per_c=cfg.thermal_mass_kwh_per_c,
-            assets=assets,
-            prices=total_price * 1000.0,  # EUR/kWh → EUR/MWh for ordering
-            chp_heat_kw=chp_heat_kw_arr,
-            gas_price_eur_m3=cfg.gas_price_eur_m3,
-            price_aware=True,
+        inp = MPCInputs(
+            price_eur_kwh     = price_fc,
+            Pload_kw          = Pload,
+            Ppv_forecast_kw   = Ppv_fc,
+            Tamb_c            = Tamb,
+            SOC_init_kwh      = cfg.SOC_init_kwh,
+            T_building_init_c = (building_temp_c if building_temp_c is not None
+                                 else cfg.T_init_c),
+            T_tank_init_c     = (hw_temp_c if hw_temp_c is not None
+                                 else cfg.hw_T_init_c),
+            month             = month,
         )
 
-        # ── Cost comparison ─────────────────────────────────────────
-        # HP electrical consumption comes directly from thermal simulation
-        hp_elec_per_step = thermal_result["hp_elec_kwh_per_step"]
+        # Solve via MPC LP/MILP
+        mpc = _mpc_solve(inp, cfg)
 
-        baseline_grid = base + baseline_shiftable - total_gen
-        lp_grid = base + lp_shiftable - total_gen + hp_elec_per_step
+        # Map MPCOutputs -> SMPCOutputs (backward-compatible)
+        plan_Tbld = (mpc.plan_Tbuilding[1:]
+                     if len(mpc.plan_Tbuilding) > 1
+                     else np.full(H, mpc.Tbuilding_c))
+        plan_heat  = mpc.plan_Php + mpc.plan_Pgas + mpc.plan_Qchp
+        plan_Ttank = (mpc.plan_Ttank[1:]
+                      if len(mpc.plan_Ttank) > 1
+                      else np.full(H, mpc.Ttank_c))
 
-        # Gas costs: CHP fuel (per-asset price) + gas heater fuel
-        # HP elec cost is already embedded in lp_grid * total_price
-        gas_heater_cost_arr = thermal_result["gas_heater_cost"]
+        plan_grid = mpc.plan_Pgrid * dt
+        plan_flex = mpc.plan_Pflex * dt
+        plan_pdis = mpc.plan_Pdis  * dt
+        plan_fchp = mpc.plan_Fchp  * dt   # m3/h x h = m3/step
 
-        baseline_cost = baseline_grid * total_price + chp_gas_cost_arr
-        lp_cost = lp_grid * total_price + chp_gas_cost_arr + gas_heater_cost_arr
-        # Add startup costs to optimised scenario
-        if H > 0 and total_startup_cost > 0:
-            lp_cost[0] += total_startup_cost
+        asset_power: dict = {}
+        asset_sched: dict = {}
+        if cfg.pv_enabled:
+            asset_power["pv"]          = mpc.Ppv_kw
+            asset_sched["pv"]          = mpc.plan_Ppv * dt
+        if cfg.hp_enabled:
+            asset_power["heat_pump"]   = mpc.Php_kw
+            asset_sched["heat_pump"]   = mpc.plan_Php * dt
+        if cfg.boiler_enabled:
+            asset_power["gas_boiler"]  = mpc.Pgas_kw
+            asset_sched["gas_boiler"]  = mpc.plan_Pgas * dt
+        if cfg.chp_enabled:
+            asset_power["chp"]         = mpc.Pchp_kw
+            asset_sched["chp"]         = mpc.plan_Pchp * dt
+        if cfg.bat_enabled:
+            asset_power["battery_charge"]    = mpc.Pch_kw
+            asset_power["battery_discharge"] = mpc.Pdis_kw
+            asset_sched["battery_charge"]    = mpc.plan_Pch  * dt
+            asset_sched["battery_discharge"] = mpc.plan_Pdis * dt
+        if cfg.flex_enabled:
+            asset_power["flexible_load"] = mpc.Pflex_kw
+            asset_sched["flexible_load"] = plan_flex
+        if cfg.hw_enabled:
+            asset_power["hot_water_tank"] = mpc.Ptank_kw
+            asset_sched["hot_water_tank"] = mpc.plan_Ptank * dt
 
-        # First-step values (step 0 = current interval)
-        charge_now  = float(lp_shiftable[0])
-        net_now     = float(lp_grid[0])
-        bl_cost_now = float(baseline_cost[0])
-        lp_cost_now = float(lp_cost[0])
-
-        # Per-asset first-step power in kW (kWh per 15 min × 4)
-        asset_power = {}
-        for uid, sched in asset_schedules.items():
-            asset_power[uid] = float(sched[0]) * 4.0
-
-        solve_ms = (_time.perf_counter() - t0) * 1000
+        solve_ms = (_time.perf_counter() - t0) * 1000.0
 
         return SMPCOutputs(
-            ice_bank_charge_kwh    = charge_now,
-            ice_bank_discharge_kwh = 0.0,
-            wkk_gas_setpoint_m3    = float(gas_plan[0]),
-            net_power_kwh          = net_now,
-            wkk_elec_kwh           = float(wkk_elec_plan[0]),
-            wkk_heat_kwh           = float(chp_heat_kw_arr[0] * 0.25) if H > 0 else 0.0,
-            smpc_cost_eur          = lp_cost_now,
-            baseline_cost_eur      = bl_cost_now,
-            cost_saving_eur        = bl_cost_now - lp_cost_now,
-            ice_bank_next_kwh      = cfg.ice_bank_initial_kwh,
-            heat_buffer_next_kwh   = cfg.heat_buffer_initial_kwh,
+            ice_bank_charge_kwh    = mpc.Pflex_kw  * dt,
+            ice_bank_discharge_kwh = mpc.Pdis_kw   * dt,
+            wkk_gas_setpoint_m3    = mpc.Fchp_m3_h * dt,
+            net_power_kwh          = mpc.Pgrid_kw   * dt,
+            wkk_elec_kwh           = mpc.Pchp_kw    * dt,
+            wkk_heat_kwh           = mpc.Qchp_kw    * dt,
+            smpc_cost_eur          = mpc.mpc_cost_eur,
+            baseline_cost_eur      = mpc.baseline_cost_eur,
+            cost_saving_eur        = mpc.cost_saving_eur,
+            ice_bank_next_kwh      = mpc.SOC_kwh,
+            heat_buffer_next_kwh   = 0.0,
             asset_power_kw         = asset_power,
-            asset_schedules        = asset_schedules,
-            plan_ice_charge_kwh    = lp_shiftable,
-            plan_ice_discharge_kwh = np.zeros(H),
-            plan_wkk_gas_m3        = gas_plan,
-            plan_net_power_kwh     = lp_grid,
-            season        = _get_season(month, cfg),
-            solver_used   = "greedy_lp",
-            solver_status = "optimal",
+            asset_schedules        = asset_sched,
+            plan_ice_charge_kwh    = plan_flex,
+            plan_ice_discharge_kwh = plan_pdis,
+            plan_wkk_gas_m3        = plan_fchp,
+            plan_net_power_kwh     = plan_grid,
+            season        = "mpc",
+            solver_used   = mpc.solver_used,
+            solver_status = mpc.solver_status,
             solve_time_ms = solve_ms,
-            building_temp_c      = float(thermal_result["temp_profile"][0]) if H > 0 else cfg.building_initial_temp_c,
-            building_setpoint_c  = cfg.building_setpoint_c,
-            heating_power_kw     = float(thermal_result["heating_kw"][0]) if H > 0 else 0.0,
-            beo_temp_c           = float(thermal_result["beo_temp"][0]) if H > 0 else 12.0,
-            plan_building_temp_c = thermal_result["temp_profile"],
-            plan_heating_kw      = thermal_result["heating_kw"],
-            plan_beo_temp_c      = thermal_result["beo_temp"],
+            building_temp_c      = mpc.Tbuilding_c,
+            building_setpoint_c  = cfg.Tset_c,
+            heating_power_kw     = mpc.total_heating_kw,
+            beo_temp_c           = 12.0,
+            plan_building_temp_c = plan_Tbld,
+            plan_heating_kw      = plan_heat,
+            plan_beo_temp_c      = np.full(len(plan_Tbld), 12.0),
+            hw_temp_c      = mpc.Ttank_c,
+            hw_heater_kw   = mpc.Ptank_kw,
+            plan_hw_temp_c = plan_Ttank,
+            battery_soc_kwh      = mpc.SOC_kwh,
+            battery_charge_kw    = mpc.Pch_kw,
+            battery_discharge_kw = mpc.Pdis_kw,
+            pv_used_kw           = mpc.Ppv_kw,
+            gas_boiler_kw        = mpc.Pgas_kw,
+            cop_now              = mpc.COP_now,
+            zchp_now             = mpc.zchp,
+            chp_elec_kw          = mpc.Pchp_kw,
+            chp_heat_kw          = mpc.Qchp_kw,
+            pgrid_kw             = mpc.Pgrid_kw,
+            plan_SOC             = mpc.plan_SOC,
+            plan_COP             = mpc.plan_COP,
+            plan_Ppv             = mpc.plan_Ppv,
+            plan_zchp            = mpc.plan_zchp,
+            plan_chp_elec_kw     = mpc.plan_Pchp,
+            plan_chp_heat_kw     = mpc.plan_Qchp,
+            plan_pgrid_kw        = mpc.plan_Pgrid,
         )
+
+    # ------------------------------------------------------------------
+    # Legacy greedy LP (renamed -- kept as internal reference only)
+    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Utility
@@ -1175,17 +1227,24 @@ class SMPCCalculator:
         """
         if step > 0:
             # Read from full-horizon plan arrays
-            def _plan_val(arr, idx):
+            def _plan_val(arr, idx, decimals=1):
                 if arr is not None and len(arr) > idx:
-                    return round(float(arr[idx]), 1)
+                    return round(float(arr[idx]), decimals)
                 return 0.0
 
-            ice_charge = _plan_val(outputs.plan_ice_charge_kwh, step)
-            ice_discharge = _plan_val(outputs.plan_ice_discharge_kwh, step)
-            net_power = _plan_val(outputs.plan_net_power_kwh, step)
-            wkk_gas = _plan_val(outputs.plan_wkk_gas_m3, step)
+            def _asset_kw(uid):
+                """Convert kWh/15-min schedule entry → kW."""
+                sched = outputs.asset_schedules.get(uid)
+                if sched is not None and len(sched) > step:
+                    return round(float(sched[step]) * 4.0, 1)
+                return 0.0
 
-            cfg = SMPCConfig()  # defaults for efficiency calcs
+            ice_charge    = _plan_val(outputs.plan_ice_charge_kwh, step)
+            ice_discharge = _plan_val(outputs.plan_ice_discharge_kwh, step)
+            net_power     = _plan_val(outputs.plan_net_power_kwh, step)
+            wkk_gas       = _plan_val(outputs.plan_wkk_gas_m3, step)
+
+            cfg      = SMPCConfig()  # defaults for efficiency calcs
             wkk_elec = round(wkk_gas * cfg.gas_energy_kwh_m3 * cfg.wkk_elec_efficiency, 1)
             wkk_heat = round(wkk_gas * cfg.gas_energy_kwh_m3 * cfg.wkk_heat_efficiency, 1)
 
@@ -1204,8 +1263,22 @@ class SMPCCalculator:
                 "ice_bank_next_kwh":       0.0,
                 "heat_buffer_next_kwh":    0.0,
                 "season":                  outputs.season,
-                "solver":                  outputs.solver_used,
+                "solver_used":             outputs.solver_used,
                 "solve_time_ms":           round(outputs.solve_time_ms, 1),
+                # ── MPC-specific fields (from asset schedules / plan arrays) ──
+                "pv_used_kw":             _asset_kw("pv"),
+                "gas_boiler_kw":          _asset_kw("gas_boiler"),
+                "hw_heater_kw":           _asset_kw("hot_water_tank"),
+                "battery_charge_kw":      _asset_kw("battery_charge"),
+                "battery_discharge_kw":   _asset_kw("battery_discharge"),
+                "cop_now":                _plan_val(outputs.plan_COP,              step, 2),
+                "zchp_now":               _plan_val(outputs.plan_zchp,             step, 2),
+                "hw_temp_c":              _plan_val(outputs.plan_hw_temp_c,        step, 1),
+                "building_temp_c":        _plan_val(outputs.plan_building_temp_c,  step, 1),
+                "building_setpoint_c":    round(outputs.building_setpoint_c, 1),
+                "chp_elec_kw":            _plan_val(outputs.plan_chp_elec_kw,      step, 1),
+                "chp_heat_kw":            _plan_val(outputs.plan_chp_heat_kw,      step, 1),
+                "pgrid_kw":               _plan_val(outputs.plan_pgrid_kw,         step, 1),
             }
             for uid, sched in outputs.asset_schedules.items():
                 kw = round(float(sched[step]) * 4.0, 1) if len(sched) > step else 0.0
@@ -1226,8 +1299,23 @@ class SMPCCalculator:
             "ice_bank_next_kwh":       round(outputs.ice_bank_next_kwh,       1),
             "heat_buffer_next_kwh":    round(outputs.heat_buffer_next_kwh,    1),
             "season":                  outputs.season,
-            "solver":                  outputs.solver_used,
+            "solver_used":             outputs.solver_used,
             "solve_time_ms":           round(outputs.solve_time_ms,           1),
+            # ── New MPC fields ──────────────────────────────────────
+            "pv_used_kw":              round(outputs.pv_used_kw,              1),
+            "battery_soc_kwh":         round(outputs.battery_soc_kwh,         1),
+            "battery_charge_kw":       round(outputs.battery_charge_kw,       1),
+            "battery_discharge_kw":    round(outputs.battery_discharge_kw,    1),
+            "gas_boiler_kw":           round(outputs.gas_boiler_kw,           1),
+            "cop_now":                 round(outputs.cop_now,                 2),
+            "zchp_now":                round(outputs.zchp_now,                2),
+            "building_temp_c":         round(outputs.building_temp_c,         1),
+            "building_setpoint_c":     round(outputs.building_setpoint_c,     1),
+            "hw_temp_c":               round(outputs.hw_temp_c,               1),
+            "hw_heater_kw":            round(outputs.hw_heater_kw,            1),
+            "chp_elec_kw":             round(outputs.chp_elec_kw,             1),
+            "chp_heat_kw":             round(outputs.chp_heat_kw,             1),
+            "pgrid_kw":                round(outputs.pgrid_kw,                1),
         }
         for uid, kw in outputs.asset_power_kw.items():
             d[f"asset_{uid}_kw"] = round(kw, 1)
@@ -1235,7 +1323,37 @@ class SMPCCalculator:
 
 
 # ===========================================================================
-# SECTION 7: QUICK SELF-TEST
+# SECTION 7: SUBPROCESS ENTRY POINT
+# Called by dashboard.py via multiprocessing.Pool to isolate the HIGHS
+# MILP solver from Qt's DLL space (they conflict on Windows).
+# Must be a module-level function so it can be pickled by multiprocessing.
+# ===========================================================================
+
+def _subprocess_solve_lp(
+    config_path: str,
+    price_forecast_eur_kwh: np.ndarray,
+    base_load_kwh,
+    solar_pred_kwh,
+    month: int,
+    building_temp_c,
+    outside_temp_c,
+    hw_temp_c,
+) -> "SMPCOutputs":
+    """Run solve_lp() in a subprocess (no Qt DLLs loaded)."""
+    calc = SMPCCalculator(config_path)
+    return calc.solve_lp(
+        price_forecast_eur_kwh=price_forecast_eur_kwh,
+        base_load_kwh=base_load_kwh,
+        solar_pred_kwh=solar_pred_kwh,
+        month=month,
+        building_temp_c=building_temp_c,
+        outside_temp_c=outside_temp_c,
+        hw_temp_c=hw_temp_c,
+    )
+
+
+# ===========================================================================
+# SECTION 8: QUICK SELF-TEST
 # Runs when you execute this file directly: python smpc_calculator.py
 # ===========================================================================
 

@@ -116,7 +116,9 @@ class DataManager:
         # ── UV index (from weather.csv) ─────────────────────────────
         # Key: "YYYY-MM-DD HH:MM:SS" string → UV float (0–11 scale)
         self.uv_data: dict[str, float] = {}
-
+        # ── Outside temperature (from weather.csv) ─────────────────────
+        # Key: "YYYY-MM-DD HH:MM:SS" string → temperature in °C
+        self.temp_data: dict[str, float] = {}
         # ── Current-slot scalar values ──────────────────────────────
         # These are re-derived each tick by update_slot_values()
         self.current_price: float | None = None      # EUR/MWh at current 15-min slot
@@ -216,47 +218,93 @@ class DataManager:
     def build_load_and_solar(
         self, slot: datetime, horizon: int,
         base_kw: float, peak_kw: float,
+        dt_hours: float = INTERVAL_MINUTES / 60.0,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Return (base_load_kwh, solar_kwh) arrays for the next *horizon* 15-min steps.
+        """Return (base_load_kwh, solar_kwh) arrays for the next *horizon* MPC steps.
 
         BASE LOAD MODEL
         ---------------
-        In absence of real-time smart-meter data, building consumption is
-        approximated by a sinusoidal day/night profile:
-            - Night (outside 06:00–18:00): constant at base_kw
-            - Day  (06:00–18:00):          base_kw + peak_factor × sin(π × (h-6)/12)
-        This captures the typical office-building load shape.
-        Parameters base_kw and peak_kw come from the "building" section of
-        dashboard_config.json.
+        Building consumption is modelled as a flat constant at *base_kw* during
+        night hours (outside 06:00–18:00) and a sinusoidal ramp up to *peak_kw*
+        during daytime.  Both values are configured in the Building tab of the
+        MPC Settings dialog (smpc.building.base_load_kw / peak_load_kw).
+
+        Set base_load_kw = peak_load_kw to use a flat constant profile.
+        Set both to 0 if you have no load to model (optimiser only covers HVAC
+        and hot-water heating driven by the thermal sub-model).
 
         SOLAR
         -----
-        Solar yield is read from predict.csv (output of predict.py).
-        The forecast covers the same 15-minute slots as the price forecast.
+        Solar yield is read from predict.csv (output of predict.py), which stores
+        kWh per INTERVAL_MINUTES-minute slot.  When dt_hours differs from
+        INTERVAL_MINUTES/60 (e.g. 1-hour MPC steps), sub-slots within each MPC
+        step are summed so that the returned array is in kWh per MPC step.
         """
+        dt_min = dt_hours * 60.0                          # MPC step in minutes
+        n_sub  = max(1, round(dt_min / INTERVAL_MINUTES)) # 15-min sub-slots per MPC step
         start_h = slot.hour + slot.minute / 60.0
+
         base_load = np.zeros(horizon)
         solar = np.zeros(horizon)
+
         for t in range(horizon):
-            h = (start_h + t * 0.25) % 24     # fractional hour of day
-            if 6 <= h <= 18:
+            h = (start_h + t * dt_hours) % 24            # fractional hour at step start
+            if 6.0 <= h <= 18.0:
                 kw = base_kw + (peak_kw - base_kw) * max(
-                    0.0, np.sin(np.pi * (h - 6) / 12),
+                    0.0, np.sin(np.pi * (h - 6.0) / 12.0),
                 )
             else:
                 kw = base_kw
-            base_load[t] = kw * 0.25
-            key = (slot + timedelta(minutes=INTERVAL_MINUTES * t)).strftime(
-                "%Y-%m-%d %H:%M:%S",
-            )
-            pred = self.predictions.get(key)
-            if pred:
-                solar[t] = max(0.0, pred[1])
+            base_load[t] = kw * dt_hours                 # kWh per MPC step
+
+            # Aggregate sub-slot solar kWh into one MPC-step total
+            kwh_sum = 0.0
+            for s in range(n_sub):
+                offset_min = int(t * dt_min + s * INTERVAL_MINUTES)
+                key = (slot + timedelta(minutes=offset_min)).strftime(
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                pred = self.predictions.get(key)
+                if pred:
+                    kwh_sum += max(0.0, pred[1])          # kWh per 15-min sub-slot
+            solar[t] = kwh_sum                            # kWh per MPC step
+
         return base_load, solar
 
-    # ------------------------------------------------------------------
-    # Individual data refreshes
-    # ------------------------------------------------------------------
+    def build_outside_temp(
+        self, slot: datetime, horizon: int,
+        dt_hours: float = INTERVAL_MINUTES / 60.0,
+    ) -> np.ndarray | None:
+        """Return outside temperature [°C] for the next *horizon* MPC steps.
+
+        Reads from the cached weather.csv temperature data.  Returns ``None``
+        if no weather data is loaded so the thermal model can fall back to
+        the fixed cooling rate.
+
+        When dt_hours matches INTERVAL_MINUTES/60 (the default), each MPC
+        step maps directly to one weather record.  For longer steps (e.g.
+        1-hour MPC with 15-min weather data), the temperature is taken from
+        the first sub-slot in each MPC step (nearest-sample, not averaged).
+        """
+        if not self.temp_data:
+            return None
+        dt_min = dt_hours * 60.0
+        arr = np.zeros(horizon)
+        found_any = False
+        for t in range(horizon):
+            offset_min = int(round(t * dt_min))
+            key = (slot + timedelta(minutes=offset_min)).strftime(
+                "%Y-%m-%d %H:%M:%S",
+            )
+            val = self.temp_data.get(key)
+            if val is not None:
+                arr[t] = val
+                found_any = True
+            elif found_any and t > 0:
+                arr[t] = arr[t - 1]   # forward-fill
+            else:
+                arr[t] = 10.0         # safe fallback if nothing loaded yet
+        return arr if found_any else None
 
     def refresh_prices(self, *, force: bool = False) -> None:
         now = datetime.now(LOCAL_TZ)
@@ -298,15 +346,20 @@ class DataManager:
         if not WEATHER_CSV.exists():
             return
         try:
-            loaded: dict = {}
+            loaded_uv: dict = {}
+            loaded_temp: dict = {}
             with WEATHER_CSV.open("r", encoding="utf-8", newline="") as f:
                 for row in csv.DictReader(f, delimiter=";"):
                     ts = row.get("Timestamp", "").strip()
                     if ts:
-                        loaded[ts] = float(
+                        loaded_uv[ts] = float(
                             row.get("UV Index", "0").replace(",", "."),
                         )
-            self.uv_data = loaded
+                        temp_str = row.get("Temperature (°C)", "").strip()
+                        if temp_str:
+                            loaded_temp[ts] = float(temp_str.replace(",", "."))
+            self.uv_data = loaded_uv
+            self.temp_data = loaded_temp
             self._weather_next = next_quarter(now)
         except Exception as exc:
             logger.warning("Weather refresh failed: %s", exc)

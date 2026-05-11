@@ -39,16 +39,18 @@ from styles import HISTORICAL_DIALOG_STYLE, RUN_ANALYSIS_BUTTON_STYLE
 logger = logging.getLogger(__name__)
 
 _KPI_ROWS = [
-    ("baseline",         "Baseline cost"),
-    ("optimised",        "LP optimised cost"),
-    ("saving",           "Savings"),
-    ("saving_pct",       "Savings %"),
-    ("heating_saving",   "Heating savings"),
+    ("baseline",           "Baseline cost"),
+    ("optimised",          "LP optimised cost"),
+    ("saving",             "Savings"),
+    ("saving_pct",         "Savings %"),
+    ("heating_saving",     "Heating savings"),
     ("heating_saving_pct", "Heating savings %"),
-    ("slots",            "Time slots"),
-    ("load_shifted",     "Total load shifted"),
-    ("total_generation", "Total on-site generation"),
-    ("chp_firing",       "CHP firing hours"),
+    ("hw_saving",          "Hot water savings"),
+    ("hw_saving_pct",      "Hot water savings %"),
+    ("slots",              "Time slots"),
+    ("load_shifted",       "Total load shifted"),
+    ("total_generation",   "Total on-site generation"),
+    ("chp_firing",         "CHP firing hours"),
 ]
 
 
@@ -494,6 +496,23 @@ class FutureSimulationDialog(QDialog):
                      f"{heat_pct:.1f}%",
                      "#16a34a" if heat_pct >= 0 else "#dc2626")
 
+        # ── Hot water tank savings ───────────────────────────────────
+        hw_save = results.get("hw_saving_eur")
+        if hw_save is not None:
+            hw_bl  = results.get("hw_baseline_cost_eur", 0.0)
+            hw_pct = results.get("hw_saving_pct", 0.0)
+            _add_section("\U0001f6bf Hot water tank (smart scheduling, COP\u202f=\u202f1)")
+            _add_row("  Baseline DHW cost",
+                     f"\u20ac{hw_bl:.2f}", "#64748b")
+            _add_row("  Smart DHW cost",
+                     f"\u20ac{hw_bl - hw_save:.2f}", "#0e7490")
+            _add_row("  DHW saving",
+                     f"\u20ac{hw_save:.2f}",
+                     "#16a34a" if hw_save >= 0 else "#dc2626")
+            _add_row("  DHW saving %",
+                     f"{hw_pct:.1f}%",
+                     "#16a34a" if hw_pct >= 0 else "#dc2626")
+
     def _display_kpis(self, results: dict, n: int):
         baseline_cost = results["baseline"]
         lp_cost       = results["optimised"]
@@ -527,6 +546,18 @@ class FutureSimulationDialog(QDialog):
         self.kpi_labels["heating_saving"].setStyleSheet(heat_coloured)
         self.kpi_labels["heating_saving_pct"].setText(f"{heat_pct:.2f}%")
         self.kpi_labels["heating_saving_pct"].setStyleSheet(heat_coloured)
+
+        hw_save = results.get("hw_saving_eur", 0.0)
+        hw_pct  = results.get("hw_saving_pct",  0.0)
+        hw_colour = "#16a34a" if hw_save >= 0 else "#dc2626"
+        hw_coloured = (
+            f"font-family: 'Consolas'; font-weight: 700;"
+            f" color: {hw_colour}; border: none;"
+        )
+        self.kpi_labels["hw_saving"].setText(f"\u20ac{hw_save:.2f}")
+        self.kpi_labels["hw_saving"].setStyleSheet(hw_coloured)
+        self.kpi_labels["hw_saving_pct"].setText(f"{hw_pct:.2f}%")
+        self.kpi_labels["hw_saving_pct"].setStyleSheet(hw_coloured)
 
         self.kpi_labels["slots"].setText(f"{n} hourly")
         self.kpi_labels["load_shifted"].setText(
