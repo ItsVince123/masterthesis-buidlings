@@ -58,6 +58,7 @@ from mpc_lp import (
     load_mpc_config, solve_mpc,
     compute_baseline_arrays, compute_asset_savings, compute_cop,
 )
+from graph_renderer import draw_price_graph, draw_solar_graph, draw_thermal_graph
 from settings import DEFAULT_LATITUDE, DEFAULT_LONGITUDE
 from styles import HISTORICAL_DIALOG_STYLE, RUN_ANALYSIS_BUTTON_STYLE
 
@@ -117,7 +118,7 @@ def _fetch_weather_historical(
         "timezone":   "Europe/Brussels",
         "start_date": start_str,
         "end_date":   end_str,
-        "hourly":     ["temperature_2m", "uv_index"],
+        "hourly":     ["temperature_2m", "uv_index", "shortwave_radiation"],
     }
 
     logger.info("Fetching weather %s → %s (archive=%s)", start_str, end_str, use_archive)
@@ -126,10 +127,20 @@ def _fetch_weather_historical(
     hourly    = response.Hourly()
     temps_h   = hourly.Variables(0).ValuesAsNumpy()   # temperature_2m
     uv_h      = hourly.Variables(1).ValuesAsNumpy()   # uv_index
+    sw_h      = hourly.Variables(2).ValuesAsNumpy()   # shortwave_radiation [W/m²]
 
-    n_h = min(len(temps_h), len(uv_h))
+    n_h = min(len(temps_h), len(uv_h), len(sw_h))
     temps_h = np.where(np.isnan(temps_h[:n_h]), 10.0, temps_h[:n_h])
-    uv_h    = np.where(np.isnan(uv_h[:n_h]),    0.0,  uv_h[:n_h])
+    uv_raw  = uv_h[:n_h]
+    sw_raw  = np.where(np.isnan(sw_h[:n_h]), 0.0, sw_h[:n_h])
+    # uv_index ≈ shortwave_radiation [W/m²] / 125  (UV 8 ≈ 1000 W/m²)
+    # Use UV index where valid (> 0); fall back to shortwave-derived value otherwise.
+    uv_h = np.where(
+        np.isnan(uv_raw) | (uv_raw <= 0.0),
+        sw_raw / 125.0,
+        uv_raw,
+    )
+    uv_h = np.maximum(0.0, uv_h)
 
     # Upsample hourly → 15-min  (4 slots per hour)
     temps_15 = np.repeat(temps_h, 4)
@@ -1185,6 +1196,7 @@ class AnalysisDialog(QDialog):
         if n == 1:
             self._render_day_chart(results[0])
             self._render_comparison_graphs(results[0])
+            self._render_rt_graphs(results[0])
         elif n > 1:
             self._render_multi_day_chart(results)
             # Asset breakdown for first day as a representative sample
@@ -1643,6 +1655,88 @@ class AnalysisDialog(QDialog):
         ch_lay.addWidget(chart_lbl)
         self._results_layout.addWidget(chart_grp)
 
+    def _render_rt_graphs(self, result: dict) -> None:
+        """Render price / solar / thermal graphs identical to the real-time dashboard."""
+        from PyQt6.QtGui import QPixmap
+
+        H = len(result.get("plan_Pgrid", []))
+        if H == 0:
+            return
+
+        dt = float(result.get("dt", 0.25))
+
+        # Time labels
+        end_h  = H * dt
+        end_hh = int(end_h) % 24
+        end_mm = int((end_h % 1) * 60)
+        start_label = "00:00"
+        end_label   = f"{end_hh:02d}:{end_mm:02d}"
+
+        def _a(key, default=0.0):
+            arr = result.get(key) or []
+            out = list(arr)[:H]
+            if len(out) < H:
+                out += [default] * (H - len(out))
+            return out
+
+        prices_mwh  = [p * 1000.0 for p in _a("prices")]   # EUR/kWh → EUR/MWh
+        pgrid_mpc   = _a("plan_Pgrid")
+        ppv_mpc     = _a("plan_Ppv")
+        temps       = _a("temperature", 10.0)
+        bld_temps   = _a("plan_Tbuilding", float("nan"))
+        php_mpc     = _a("plan_Php")
+        pgas_mpc    = _a("plan_Pgas")
+
+        # Comfort-band schedules from MPC config
+        cfg = self._cfg
+        tmin_sched: list[float] = []
+        tmax_sched: list[float] = []
+        for k in range(H):
+            _hour = (k * dt) % 24.0
+            if cfg and cfg.use_night_setback and (
+                _hour >= cfg.night_start_h or _hour < cfg.night_end_h
+            ):
+                tmin_sched.append(cfg.T_set_night_c)
+                tmax_sched.append(cfg.T_cool_night_c)
+            else:
+                tmin_sched.append(cfg.Tmin_c if cfg else 20.0)
+                tmax_sched.append(cfg.Tmax_c if cfg else 23.0)
+
+        setpoint = cfg.Tmin_c if cfg else 21.0
+        W = 1020
+
+        grp = QGroupBox(f"Real-time graphs — {result['date']}")
+        grp_lay = QVBoxLayout(grp)
+
+        # Price + grid overlay
+        price_lbl = QLabel()
+        price_lbl.setPixmap(draw_price_graph(
+            prices_mwh, start_label, end_label, None, None, W, 240,
+            overlays=[{"array": pgrid_mpc, "color": "#f97316", "label": "MPC Grid [kW]"}],
+        ))
+        price_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        grp_lay.addWidget(price_lbl)
+
+        # Solar / PV
+        solar_lbl = QLabel()
+        solar_lbl.setPixmap(draw_solar_graph(ppv_mpc, start_label, end_label, None, None, W, 200))
+        solar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        grp_lay.addWidget(solar_lbl)
+
+        # Thermal: outdoor + building temp + comfort band + HP/boiler heat
+        thermal_lbl = QLabel()
+        thermal_lbl.setPixmap(draw_thermal_graph(
+            temps, bld_temps, setpoint,
+            php_mpc, pgas_mpc, [0.0] * H,
+            start_label, end_label, None, None, W, 280,
+            tmin_schedule=tmin_sched,
+            tmax_schedule=tmax_sched,
+        ))
+        thermal_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        grp_lay.addWidget(thermal_lbl)
+
+        self._results_layout.addWidget(grp)
+
     # ======================================================================
     # Export
     # ======================================================================
@@ -1656,16 +1750,26 @@ class AnalysisDialog(QDialog):
         )
         if not path:
             return
+        def _fmt(v: float) -> str:
+            """Format a float with comma decimal separator for Excel (BE/NL locale)."""
+            return f"{v:.4f}".replace(".", ",")
+
+        def _fmt2(v: float) -> str:
+            return f"{v:.2f}".replace(".", ",")
+
         try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
+            # Use semicolon delimiter + comma decimal so Excel (BE/NL locale)
+            # opens the file directly without an import wizard.
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f, delimiter=";")
                 # Header
                 writer.writerow([
                     "Date",
                     "Baseline cost (€)", "MPC cost (€)", "Total saving (€)", "Saving (%)",
                     "HP saving (€)", "Boiler saving (€)", "Flex saving (€)",
                     "Battery saving (€)", "CHP saving (€)", "HW saving (€)", "PV saving (€)",
-                    "Thermal building (€)", "HW thermal (€)", "Flex shifting (€)",
+                    "Thermal building (€)", "Fuel switching (€)", "Thermal storage (€)",
+                    "HW thermal (€)", "Flex shifting (€)",
                     "Battery arbitrage (€)", "CHP spark (€)",
                     "PV self-consumption (€)", "Peak shaving (€)",
                 ])
@@ -1677,22 +1781,24 @@ class AnalysisDialog(QDialog):
                     s     = r.get("savings", {})
                     writer.writerow([
                         r["date"],
-                        f"{bl_r:.4f}",  f"{mpc_r:.4f}",
-                        f"{sav_r:.4f}", f"{pct_r:.2f}",
-                        f"{s.get('hp_eur',      0.0):.4f}",
-                        f"{s.get('boiler_eur',  0.0):.4f}",
-                        f"{s.get('flex_eur',    0.0):.4f}",
-                        f"{s.get('battery_eur', 0.0):.4f}",
-                        f"{s.get('chp_eur',     0.0):.4f}",
-                        f"{s.get('hw_eur',      0.0):.4f}",
-                        f"{s.get('pv_eur',      0.0):.4f}",
-                        f"{s.get('thermal_building_eur',   0.0):.4f}",
-                        f"{s.get('hw_thermal_eur',         0.0):.4f}",
-                        f"{s.get('flex_shifting_eur',      0.0):.4f}",
-                        f"{s.get('battery_arbitrage_eur',  0.0):.4f}",
-                        f"{s.get('chp_spark_eur',          0.0):.4f}",
-                        f"{s.get('pv_selfconsumption_eur', 0.0):.4f}",
-                        f"{s.get('peak_shaving_eur',       0.0):.4f}",
+                        _fmt(bl_r),  _fmt(mpc_r),
+                        _fmt(sav_r), _fmt2(pct_r),
+                        _fmt(s.get("hp_eur",      0.0)),
+                        _fmt(s.get("boiler_eur",  0.0)),
+                        _fmt(s.get("flex_eur",    0.0)),
+                        _fmt(s.get("battery_eur", 0.0)),
+                        _fmt(s.get("chp_eur",     0.0)),
+                        _fmt(s.get("hw_eur",      0.0)),
+                        _fmt(s.get("pv_eur",      0.0)),
+                        _fmt(s.get("thermal_building_eur",   0.0)),
+                        _fmt(s.get("fuel_switching_eur",     0.0)),
+                        _fmt(s.get("thermal_storage_eur",    0.0)),
+                        _fmt(s.get("hw_thermal_eur",         0.0)),
+                        _fmt(s.get("flex_shifting_eur",      0.0)),
+                        _fmt(s.get("battery_arbitrage_eur",  0.0)),
+                        _fmt(s.get("chp_spark_eur",          0.0)),
+                        _fmt(s.get("pv_selfconsumption_eur", 0.0)),
+                        _fmt(s.get("peak_shaving_eur",       0.0)),
                     ])
             self._status_lbl.setText(f"Exported to {Path(path).name}")
         except Exception as exc:

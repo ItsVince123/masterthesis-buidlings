@@ -173,10 +173,9 @@ def draw_price_graph(
                 active_overlays.append({**ov, "array": arr_c})
 
     pixmap = QPixmap(width, height)
-    pixmap.fill(Qt.GlobalColor.transparent)
+    pixmap.fill(QColor("#f8fbff"))
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBackgroundMode(Qt.BGMode.TransparentMode)
 
     pad_l, pad_r, pad_t, pad_b = 54, 50, 22, 36
     dw = width  - pad_l - pad_r

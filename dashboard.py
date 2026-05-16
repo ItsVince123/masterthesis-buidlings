@@ -1126,9 +1126,7 @@ class ScadaWindow(QMainWindow):
                     _hour >= _mcfg.night_start_h or _hour < _mcfg.night_end_h
                 ):
                     tmin_sched.append(_mcfg.T_set_night_c)
-                    tmax_sched.append(
-                        _mcfg.T_cool_night_c if _mcfg.cooling_enabled else _mcfg.Tmax_c
-                    )
+                    tmax_sched.append(_mcfg.T_cool_night_c)  # relaxed upper bound at night
                 else:
                     tmin_sched.append(_mcfg.Tmin_c)
                     tmax_sched.append(_mcfg.Tmax_c)

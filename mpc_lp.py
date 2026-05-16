@@ -65,7 +65,7 @@ Objective
 ---------
   min Σ_k dt·[(λ_e[k]+fee)·Pgrid[k]
               + λ_gas_chp·Fchp[k]
-              + (λ_gas_boiler/(HV·η_boiler))·Pgas[k]]
+              + (λ_gas_boiler/η_boiler)·Pgas[k]]
       + startup_cost·Σ_k ychp[k]
       + w_peak·Σ_k slack_peak[k]²
       + w_comfort·Σ_k slack_Tmin[k]²
@@ -158,8 +158,8 @@ class MPCConfig:
     boiler_enabled: bool  = True
     Pgas_max_kw:    float = 100.0  # Max thermal output [kW]
     eta_boiler:     float =  0.92  # Thermal efficiency (fraction of gas HHV)
-    gas_price_boiler_eur_m3: float = 0.35  # Gas price [€/m³]
-    gas_HV_kwh_m3:  float =  9.8   # Gas calorific value [kWh/m³]
+    gas_price_boiler_eur_kwh: float = 0.035  # Gas price [€/kWh]
+    gas_HV_kwh_m3:  float =  9.8   # Gas calorific value [kWh/m³] (kept for backward compat)
     boiler_ramp_pct: float = 100.0  # Max boiler ramp [% of Pgas_max_kw per step]
 
     # ── CHP / cogeneration ──────────────────────────────────────────────────
@@ -211,9 +211,10 @@ class MPCConfig:
     # calculate energy cost savings attributable to the MPC.
     #
     # heat_pump / gas_boiler:
-    #   "on_off"     — bang-bang controller: run at baseline_power_kw when building
-    #                  T drops to Tmin_c, stop when T reaches Tmax_c. Both share
-    #                  one heating_on state flag (same thermostat).
+    #   "on_off"     — bang-bang controller around the active heating setpoint
+    #                  (day/night): heat below Tset_active-0.5 and stop
+    #                  above Tset_active+0.5.
+    #                  Both share one heating_on state flag (same thermostat).
     #   "constant"   — fixed power (hp_bl_power_kw / boiler_bl_power_kw) every step.
     #   "always_off" — asset not used in the baseline.
     # battery:
@@ -296,8 +297,11 @@ class MPCConfig:
         c.boiler_enabled          = bool (bl.get("enabled",          c.boiler_enabled))
         c.Pgas_max_kw             = float(bl.get("Pgas_max_kw",      c.Pgas_max_kw))
         c.eta_boiler              = float(bl.get("eta_boiler",        c.eta_boiler))
-        c.gas_price_boiler_eur_m3 = float(bl.get("gas_price_eur_m3", c.gas_price_boiler_eur_m3))
         c.gas_HV_kwh_m3           = float(bl.get("gas_HV_kwh_m3",    c.gas_HV_kwh_m3))
+        if "gas_price_eur_kwh" in bl:
+            c.gas_price_boiler_eur_kwh = float(bl["gas_price_eur_kwh"])
+        elif "gas_price_eur_m3" in bl:
+            c.gas_price_boiler_eur_kwh = float(bl["gas_price_eur_m3"]) / max(c.gas_HV_kwh_m3, 1e-9)
         c.boiler_ramp_pct         = float(bl.get("ramp_pct",         c.boiler_ramp_pct))
         c.boiler_bl_mode          = str  (bl.get("baseline_mode",     c.boiler_bl_mode))
         c.boiler_bl_power_kw      = float(bl.get("baseline_power_kw", c.boiler_bl_power_kw))
@@ -403,8 +407,7 @@ class MPCConfig:
                 "enabled":           self.boiler_enabled,
                 "Pgas_max_kw":       self.Pgas_max_kw,
                 "eta_boiler":        self.eta_boiler,
-                "gas_price_eur_m3":  self.gas_price_boiler_eur_m3,
-                "gas_HV_kwh_m3":     self.gas_HV_kwh_m3,
+                "gas_price_eur_kwh":  self.gas_price_boiler_eur_kwh,
                 "ramp_pct":          self.boiler_ramp_pct,
                 "baseline_mode":     self.boiler_bl_mode,
                 "baseline_power_kw": self.boiler_bl_power_kw,
@@ -604,6 +607,31 @@ def compute_cop(Tamb: np.ndarray, cfg: MPCConfig) -> np.ndarray:
     return np.maximum(cfg.COP_min, raw)
 
 
+def _is_night_step(k: int, dt: float, cfg: MPCConfig, start_hour: float = 0.0) -> bool:
+    """Return whether horizon step k falls in configured night period."""
+    if not cfg.use_night_setback:
+        return False
+    hour = (start_hour + k * dt) % 24.0
+    return hour >= cfg.night_start_h or hour < cfg.night_end_h
+
+
+def _active_heat_setpoint(k: int, dt: float, cfg: MPCConfig, start_hour: float = 0.0) -> float:
+    """Heating thermostat center used by rule-based controllers."""
+    return cfg.T_set_night_c if _is_night_step(k, dt, cfg, start_hour=start_hour) else cfg.Tset_c
+
+
+def _active_comfort_bounds(
+    k: int,
+    dt: float,
+    cfg: MPCConfig,
+    start_hour: float = 0.0,
+) -> tuple[float, float]:
+    """Comfort lower/upper bounds active at step k."""
+    if _is_night_step(k, dt, cfg, start_hour=start_hour):
+        return cfg.T_set_night_c, cfg.T_cool_night_c
+    return cfg.Tmin_c, cfg.Tmax_c
+
+
 # ===========================================================================
 # SECTION 4 — HEURISTIC FALLBACK
 # (used when cvxpy is unavailable or the solver fails)
@@ -615,6 +643,7 @@ def _solve_heuristic(
     COP: np.ndarray,
     H: int,
     dt: float,
+    start_hour: float = 0.0,
 ) -> dict:
     """
     Rule-based schedule when the LP solver is unavailable.
@@ -722,16 +751,17 @@ def _solve_heuristic(
 
         # ── Building thermal ─────────────────────────────────────────────────
         T_prev = Tbuilding[k]
+        _T_heat_set = _active_heat_setpoint(k, dt, cfg, start_hour=start_hour)
         # Natural drift (Newton's law)
         T_drift = (1.0 - alpha) * T_prev + alpha * float(inputs.Tamb_c[k])
-        heat_deficit_kw = max(0.0, (cfg.Tset_c - T_drift) * cfg.Cth_kwh_per_c / dt)
+        heat_deficit_kw = max(0.0, (_T_heat_set - T_drift) * cfg.Cth_kwh_per_c / dt)
         heat_deficit_kw -= Qchp[k]   # CHP provides free heat
         heat_deficit_kw  = max(0.0, heat_deficit_kw)
 
         # Satisfy heat demand: use cheapest heater first (cost-aware)
         if heat_deficit_kw > 0:
-            _c_boiler = (cfg.gas_price_boiler_eur_m3
-                         / max(cfg.gas_HV_kwh_m3 * cfg.eta_boiler, 1e-9))
+            _c_boiler = (cfg.gas_price_boiler_eur_kwh
+                         / max(cfg.eta_boiler, 1e-9))
             _c_hp = price_total[k] / max(COP[k], 1e-3)
             _hp_first = cfg.hp_enabled and (
                 not cfg.boiler_enabled or _c_hp <= _c_boiler
@@ -752,10 +782,7 @@ def _solve_heuristic(
         Q_heat = Php[k] + Pgas[k] + Qchp[k]
         # Cooling: if building is above the comfort ceiling, run cooling
         if cfg.cooling_enabled and cfg.hp_enabled:
-            _hour_k = (k * dt) % 24.0
-            _is_night_k = (cfg.use_night_setback and
-                           (_hour_k >= cfg.night_start_h or _hour_k < cfg.night_end_h))
-            _T_cool_lim = cfg.T_cool_night_c if _is_night_k else cfg.Tmax_c
+            _, _T_cool_lim = _active_comfort_bounds(k, dt, cfg, start_hour=start_hour)
             if T_prev > _T_cool_lim:
                 Php_cool[k] = min(cfg.Php_cool_max_kw,
                                   (T_prev - _T_cool_lim) * cfg.Cth_kwh_per_c / dt)
@@ -823,6 +850,7 @@ def _solve_cvxpy(
     COP: np.ndarray,
     H: int,
     dt: float,
+    start_hour: float = 0.0,
 ) -> Optional[dict]:
     """
     Build and solve the MPC LP/MILP with cvxpy.
@@ -1071,15 +1099,10 @@ def _solve_cvxpy(
         _T_max_r[_k + 1] = (1.0 - alpha) * _T_max_r[_k] + beta * _P_heat_max + alpha * _ta
         _T_min_r[_k + 1] = (1.0 - alpha) * _T_min_r[_k] - beta * _P_cool_max + alpha * _ta
     # Per-step comfort bounds — optionally tighter at night (night setback)
-    _T_lb_k = np.full(H, cfg.Tmin_c)
-    _T_ub_k = np.full(H, cfg.Tmax_c)
-    if cfg.use_night_setback:
-        for _k in range(H):
-            _hour = (_k * dt) % 24.0
-            _is_night = _hour >= cfg.night_start_h or _hour < cfg.night_end_h
-            if _is_night:
-                _T_lb_k[_k] = cfg.T_set_night_c
-                _T_ub_k[_k] = cfg.T_cool_night_c if cfg.cooling_enabled else cfg.Tmax_c
+    _T_lb_k = np.empty(H)
+    _T_ub_k = np.empty(H)
+    for _k in range(H):
+        _T_lb_k[_k], _T_ub_k[_k] = _active_comfort_bounds(_k, dt, cfg, start_hour=start_hour)
     _eff_lb = np.minimum(_T_lb_k, _T_max_r[1:])   # tightest lb still feasible
     _eff_ub = np.maximum(_T_ub_k, _T_min_r[1:])   # tightest ub still feasible
     constraints.append(Tbuilding[1:] >= _eff_lb)
@@ -1128,10 +1151,10 @@ def _solve_cvxpy(
         if cfg.chp_enabled else 0.0
     )
 
-    # Boiler gas cost: (λ_gas_boiler / (HV × η_boiler)) × Pgas[k] × dt
+    # Boiler gas cost: (λ_gas_boiler / η_boiler) × Pgas[k] × dt
     #   = marginal gas cost per kWh of thermal output
-    c_boiler = cfg.gas_price_boiler_eur_m3 / max(
-        cfg.gas_HV_kwh_m3 * cfg.eta_boiler, 1e-9
+    c_boiler = cfg.gas_price_boiler_eur_kwh / max(
+        cfg.eta_boiler, 1e-9
     )  # [€/kWh thermal]
     boiler_gas_cost = (
         cp.sum(Pgas) * c_boiler * dt
@@ -1238,220 +1261,19 @@ def _solve_cvxpy(
 # SECTION 6 — BASELINE COST SIMULATION
 # ===========================================================================
 
-def compute_baseline_cost(inputs: MPCInputs, cfg: MPCConfig) -> float:
+def compute_baseline_cost(inputs: MPCInputs, cfg: MPCConfig, start_hour: float = 0.0) -> float:
     """
-    Simulate the 'no-optimisation' rule-based baseline over the full horizon.
+    Return total baseline cost [€] for the horizon.
 
-    Each asset follows a simple, price-unaware rule according to its configured
-    baseline mode (cfg.*_bl_mode).  The resulting grid import and gas consumption
-    are costed at the same tariff as the MPC for an apples-to-apples comparison.
-
-    Asset rules
-    -----------
-    heat_pump / gas_boiler — "on_off": classic bang-bang thermostat using the
-        comfort band [Tmin_c, Tmax_c] as hysteresis.  Both share one heating_on
-        state flag.  HP fires at hp_bl_power_kw (0 → Php_max_kw); boiler fires
-        at boiler_bl_power_kw (0 → Pgas_max_kw).  No price awareness.
-        "constant": fixed power every step.
-        "always_off": asset not used.
-
-    battery — always idle (no price-arbitrage dispatch without optimisation).
-
-    chp — "always_off":  not used.
-        "heat_demand": run at max output whenever building T < Tset_c (heat-led
-        dispatch; electricity is a byproduct).  No spark-spread logic.
-        "constant": always on at max output.
-
-    hot_water_tank — "on_off": bang-bang on [hw_T_min_c, hw_T_max_c].  Heater
-        fires at hw_bl_power_kw (0 → Ptank_max_kw) when tank drops below T_min,
-        stops when it reaches T_max.
-        "constant": fixed power every step.
-        "always_off": not used.
-
-    flexible_load — "fixed_window": run at baseline_power_kw (0 → Pflex_max_kw)
-        between flex_bl_time_start and flex_bl_time_end every day.  This is a
-        separate window from the MPC dispatch window — it models a dumb load
-        that always runs during its fixed operating hours.
-        "always_off": not used.
-
-    pv — always use all available production (same as the MPC).
-
-    Returns
-    -------
-    float  Total energy cost [€] for the horizon: electricity + boiler gas +
-           CHP gas.
+    The baseline simulation logic is implemented in compute_baseline_arrays().
+    This wrapper intentionally delegates to that function so KPI cost values
+    always use the exact same physics and dispatch assumptions as the arrays
+    shown in analysis views.
     """
-    H   = cfg.horizon_steps
-    dt  = cfg.dt_hours
-
-    COP      = compute_cop(inputs.Tamb_c[:H], cfg)
-    lambda_e = inputs.price_eur_kwh[:H] + cfg.fee_eur_kwh
-    c_boiler = cfg.gas_price_boiler_eur_m3 / max(cfg.gas_HV_kwh_m3 * cfg.eta_boiler, 1e-9)
-
-    Pgrid = np.zeros(H)
-    Php   = np.zeros(H)
-    Pgas  = np.zeros(H)
-    Ptank = np.zeros(H)
-    Pflex = np.zeros(H)
-    Ppv   = np.zeros(H)
-    Fchp  = np.zeros(H)
-
-    Tbuilding    = np.zeros(H + 1)
-    Ttank        = np.zeros(H + 1)
-    Tbuilding[0] = inputs.T_building_init_c
-    Ttank[0]     = inputs.T_tank_init_c
-
-    # Building thermal coefficients
-    alpha = cfg.UA_kw_per_c * dt / max(cfg.Cth_kwh_per_c, 1e-9)
-    beta  = dt / max(cfg.Cth_kwh_per_c, 1e-9)
-
-    # Hot water tank coefficients (same model as LP solver)
-    Ctank   = max(cfg.hw_volume_l * 1.163e-3, 1e-9)
-    _hl_nom = cfg.hw_heat_loss_w / 1000.0
-    _T_ref  = 15.0
-    R_tank  = (max(cfg.hw_T_init_c, _T_ref + 1.0) - _T_ref) / max(_hl_nom, 1e-9)
-    gamma_t = dt / (Ctank * R_tank)
-    Qdraw   = cfg.hw_draw_kw
-
-    # ── Effective baseline powers (0 → use asset max) ─────────────────────
-    _php_bl   = cfg.hp_bl_power_kw   if cfg.hp_bl_power_kw   > 0 else cfg.Php_max_kw
-    _pgas_bl  = cfg.boiler_bl_power_kw if cfg.boiler_bl_power_kw > 0 else cfg.Pgas_max_kw
-    _phw_bl   = cfg.hw_bl_power_kw   if cfg.hw_bl_power_kw   > 0 else cfg.Ptank_max_kw
-    _pflex_bl = 0.0  # filled below per mode
-
-    # ── PV: always use all available ──────────────────────────────────────
-    if cfg.pv_enabled:
-        Ppv = np.minimum(inputs.Ppv_forecast_kw[:H],
-                         np.full(H, cfg.pv_capacity_kwp))
-
-    # ── Flexible load: fixed window ───────────────────────────────────────
-    if cfg.flex_enabled and cfg.flex_bl_mode == "fixed_window":
-        import datetime as _dt
-        _bl_active = np.zeros(H, dtype=bool)
-        try:
-            _t_on  = _dt.time.fromisoformat(cfg.flex_bl_time_start)
-            _t_off = _dt.time.fromisoformat(cfg.flex_bl_time_end)
-            _now   = _dt.datetime.now()
-            for _k in range(H):
-                _t = (_now + _dt.timedelta(hours=_k * dt)).time()
-                if _t_on <= _t_off:
-                    _bl_active[_k] = _t_on <= _t <= _t_off
-                else:                                        # overnight window
-                    _bl_active[_k] = _t >= _t_on or _t <= _t_off
-        except ValueError:
-            _bl_active[:] = True  # invalid time → run all day
-        # Power: use baseline_power_kw if set, else Pflex_max_kw
-        _pflex_bl = cfg.flex_bl_power_kw if cfg.flex_bl_power_kw > 0 else cfg.Pflex_max_kw
-        for _k in range(H):
-            if _bl_active[_k]:
-                Pflex[_k] = min(_pflex_bl, cfg.Pflex_max_kw)
-
-    # ── CHP: heat_demand (run at max when building needs heat) ────────────
-    # Pre-compute only the on/off pattern; actual Fchp will be filled in the
-    # step loop so it can respond to the current building temperature.
-    chp_heat_demand = cfg.chp_enabled and cfg.chp_bl_mode == "heat_demand"
-    chp_constant    = cfg.chp_enabled and cfg.chp_bl_mode == "constant"
-
-    # ── Thermostat state flags (initialise from current temperatures) ─────
-    heating_on = inputs.T_building_init_c < cfg.Tset_c  # building heating system
-    hw_on      = inputs.T_tank_init_c     < cfg.hw_T_min_c  # hot water heater
-
-    # ── Step-by-step simulation ───────────────────────────────────────────
-    for k in range(H):
-        ta      = float(inputs.Tamb_c[k])
-        T_prev  = Tbuilding[k]
-
-        # ── CHP ──────────────────────────────────────────────────────────
-        if chp_heat_demand:
-            # Fire when building is below setpoint (heat-led, electricity byproduct)
-            Fchp[k] = cfg.Fchp_max_m3_h if T_prev < cfg.Tset_c else 0.0
-        elif chp_constant:
-            Fchp[k] = cfg.Fchp_max_m3_h
-
-        Q_chp_k = float(Fchp[k]) * cfg.chp_gas_HV_kwh_m3 * cfg.chp_eta_heat
-        Pchp_k  = float(Fchp[k]) * cfg.chp_gas_HV_kwh_m3 * cfg.chp_eta_elec
-
-        # ── Building thermostat hysteresis (bang-bang on [Tmin, Tmax]) ───
-        #    Both HP and boiler share one heating_on flag.
-        if T_prev <= cfg.Tmin_c:
-            heating_on = True
-        elif T_prev >= cfg.Tmax_c:
-            heating_on = False
-
-        if heating_on:
-            # Boiler-first (traditional building baseline): fire boiler as primary
-            if cfg.boiler_bl_mode == "on_off" and cfg.boiler_enabled:
-                Pgas[k] = min(_pgas_bl, cfg.Pgas_max_kw)
-            elif cfg.boiler_bl_mode == "constant" and cfg.boiler_enabled:
-                Pgas[k] = min(cfg.boiler_bl_power_kw, cfg.Pgas_max_kw)
-            # HP supplements only if boiler alone cannot prevent T < Tmin
-            if cfg.hp_bl_mode == "on_off" and cfg.hp_enabled:
-                _T_next_boiler_only = (
-                    (1.0 - alpha) * T_prev
-                    + beta * (float(Pgas[k]) + Q_chp_k)
-                    + alpha * ta
-                )
-                if _T_next_boiler_only < cfg.Tmin_c:
-                    Php[k] = min(_php_bl, cfg.Php_max_kw)
-            elif cfg.hp_bl_mode == "constant" and cfg.hp_enabled:
-                Php[k] = min(cfg.hp_bl_power_kw, cfg.Php_max_kw)
-        else:
-            # "constant" mode ignores the thermostat flag — always on
-            if cfg.hp_bl_mode == "constant" and cfg.hp_enabled:
-                Php[k] = min(cfg.hp_bl_power_kw, cfg.Php_max_kw)
-            if cfg.boiler_bl_mode == "constant" and cfg.boiler_enabled:
-                Pgas[k] = min(cfg.boiler_bl_power_kw, cfg.Pgas_max_kw)
-
-        # Update building temperature
-        Tbuilding[k + 1] = (
-            (1.0 - alpha) * T_prev
-            + beta * (float(Php[k]) + float(Pgas[k]) + Q_chp_k)
-            + alpha * ta
-        )
-
-        # ── Hot water tank bang-bang on [hw_T_min_c, hw_T_max_c] ─────────
-        if cfg.hw_enabled:
-            T_tank_prev = Ttank[k]
-            # Update hysteresis state
-            if T_tank_prev <= cfg.hw_T_min_c:
-                hw_on = True
-            elif T_tank_prev >= cfg.hw_T_max_c:
-                hw_on = False
-
-            if cfg.hw_bl_mode == "on_off":
-                if hw_on:
-                    Ptank[k] = min(_phw_bl, cfg.Ptank_max_kw)
-            elif cfg.hw_bl_mode == "constant":
-                Ptank[k] = min(cfg.hw_bl_power_kw, cfg.Ptank_max_kw)
-            # "always_off" → Ptank[k] = 0
-
-            Ttank[k + 1] = (
-                (1.0 - gamma_t) * T_tank_prev
-                + (dt / Ctank) * (float(Ptank[k]) + ta / R_tank - Qdraw)
-            )
-            Ttank[k + 1] = float(np.clip(Ttank[k + 1], 0.0, cfg.hw_T_max_c))
-
-        # ── Grid residual (battery always idle) ───────────────────────────
-        Php_elec_k = float(Php[k]) / max(float(COP[k]), 1e-3) if cfg.hp_enabled else 0.0
-        net = (
-            float(inputs.Pload_kw[k])
-            + Php_elec_k
-            + float(Ptank[k])
-            + float(Pflex[k])
-            - float(Ppv[k])
-            - Pchp_k
-        )
-        Pgrid[k] = max(0.0, net)
-
-    # ── Total horizon cost ────────────────────────────────────────────────
-    Pchp_arr = Fchp * cfg.chp_gas_HV_kwh_m3 * cfg.chp_eta_elec   # noqa: F841 (unused but mirrors LP pattern)
-    elec_cost    = float(np.sum(lambda_e * Pgrid)) * dt
-    boiler_cost  = float(np.sum(Pgas))  * c_boiler * dt
-    chp_gas_cost = float(np.sum(Fchp))  * cfg.gas_price_chp_eur_m3 * dt
-    return elec_cost + boiler_cost + chp_gas_cost
+    return float(compute_baseline_arrays(inputs, cfg, start_hour=start_hour)["total_cost"])
 
 
-def compute_baseline_arrays(inputs: MPCInputs, cfg: MPCConfig) -> dict:
+def compute_baseline_arrays(inputs: MPCInputs, cfg: MPCConfig, start_hour: float = 0.0) -> dict:
     """
     Same simulation as compute_baseline_cost() but returns per-asset arrays.
 
@@ -1467,7 +1289,7 @@ def compute_baseline_arrays(inputs: MPCInputs, cfg: MPCConfig) -> dict:
 
     COP      = compute_cop(inputs.Tamb_c[:H], cfg)
     lambda_e = inputs.price_eur_kwh[:H] + cfg.fee_eur_kwh
-    c_boiler = cfg.gas_price_boiler_eur_m3 / max(cfg.gas_HV_kwh_m3 * cfg.eta_boiler, 1e-9)
+    c_boiler = cfg.gas_price_boiler_eur_kwh / max(cfg.eta_boiler, 1e-9)
 
     Pgrid = np.zeros(H)
     Php   = np.zeros(H)
@@ -1495,6 +1317,7 @@ def compute_baseline_arrays(inputs: MPCInputs, cfg: MPCConfig) -> dict:
     # on_off baseline: always use the asset's full rated capacity (Php_max_kw /
     # Pgas_max_kw / Ptank_max_kw) — a real thermostat runs at full power.
     # constant baseline: use the user-configured fixed power level.
+    _php_bl   = cfg.hp_bl_power_kw      if cfg.hp_bl_power_kw      > 0 else cfg.Php_max_kw
     _pgas_bl  = cfg.boiler_bl_power_kw  if cfg.boiler_bl_power_kw  > 0 else cfg.Pgas_max_kw
     _phw_bl   = cfg.hw_bl_power_kw      if cfg.hw_bl_power_kw      > 0 else cfg.Ptank_max_kw
 
@@ -1530,7 +1353,14 @@ def compute_baseline_arrays(inputs: MPCInputs, cfg: MPCConfig) -> dict:
 
     chp_heat_demand = cfg.chp_enabled and cfg.chp_bl_mode == "heat_demand"
     chp_constant    = cfg.chp_enabled and cfg.chp_bl_mode == "constant"
-    heating_on = inputs.T_building_init_c < cfg.Tset_c
+    # Baseline follows configured day/night schedule, but uses the same lower
+    # comfort floor as the LP for turn-on decisions.
+    _Tset0_bl = _active_heat_setpoint(0, dt, cfg, start_hour=start_hour)
+    _T_heat_lb0_bl, _ = _active_comfort_bounds(0, dt, cfg, start_hour=start_hour)
+    heating_on = (
+        inputs.T_building_init_c < _Tset0_bl - 0.5
+        or inputs.T_building_init_c < _T_heat_lb0_bl
+    )
     hw_on      = inputs.T_tank_init_c     < cfg.hw_T_min_c
     Php_cool   = np.zeros(H)
 
@@ -1538,18 +1368,36 @@ def compute_baseline_arrays(inputs: MPCInputs, cfg: MPCConfig) -> dict:
         ta     = float(inputs.Tamb_c[k])
         T_prev = Tbuilding[k]
 
+        # Active thermostat targets for this wall-clock step.
+        _Tset_bl = _active_heat_setpoint(k, dt, cfg, start_hour=start_hour)
+        _T_heat_lb_bl, _T_cool_lim_bl = _active_comfort_bounds(
+            k, dt, cfg, start_hour=start_hour
+        )
+
         if chp_heat_demand:
-            Fchp[k] = cfg.Fchp_max_m3_h if T_prev < cfg.Tset_c else 0.0
+            Fchp[k] = cfg.Fchp_max_m3_h if T_prev < _Tset_bl else 0.0
         elif chp_constant:
             Fchp[k] = cfg.Fchp_max_m3_h
 
         Q_chp_k = float(Fchp[k]) * cfg.chp_gas_HV_kwh_m3 * cfg.chp_eta_heat
         Pchp_k  = float(Fchp[k]) * cfg.chp_gas_HV_kwh_m3 * cfg.chp_eta_elec
 
-        if T_prev <= cfg.Tmin_c:
+        # Keep baseline thermostat feasible vs LP: turn on at the same lower
+        # comfort floor the LP enforces, or at setpoint deadband if tighter.
+        if T_prev < max(_T_heat_lb_bl, _Tset_bl - 0.5):
             heating_on = True
-        elif T_prev >= cfg.Tmax_c:
+        elif T_prev > _Tset_bl + 0.5:
             heating_on = False
+
+        # Fair baseline vs MPC: if coasting would violate the active comfort floor
+        # next step, force heating ON now (MPC also enforces per-step floor bounds).
+        _T_next_idle = (
+            (1.0 - alpha) * T_prev
+            + beta * Q_chp_k
+            + alpha * ta
+        )
+        if _T_next_idle < _T_heat_lb_bl:
+            heating_on = True
 
         if heating_on:
             # Boiler-first (traditional building baseline): fire boiler as primary
@@ -1557,15 +1405,16 @@ def compute_baseline_arrays(inputs: MPCInputs, cfg: MPCConfig) -> dict:
                 Pgas[k] = min(_pgas_bl, cfg.Pgas_max_kw)
             elif cfg.boiler_bl_mode == "constant" and cfg.boiler_enabled:
                 Pgas[k] = min(cfg.boiler_bl_power_kw, cfg.Pgas_max_kw)
-            # HP supplements only if boiler alone cannot prevent T < Tmin
+            # HP supplements only if boiler alone cannot keep T above the
+            # baseline turn-on threshold used above.
             if cfg.hp_bl_mode == "on_off" and cfg.hp_enabled:
                 _T_next_boiler_only = (
                     (1.0 - alpha) * T_prev
                     + beta * (float(Pgas[k]) + Q_chp_k)
                     + alpha * ta
                 )
-                if _T_next_boiler_only < cfg.Tmin_c:
-                    Php[k] = cfg.Php_max_kw
+                if _T_next_boiler_only < max(_T_heat_lb_bl, _Tset_bl - 0.5):
+                    Php[k] = min(_php_bl, cfg.Php_max_kw)
             elif cfg.hp_bl_mode == "constant" and cfg.hp_enabled:
                 Php[k] = min(cfg.hp_bl_power_kw, cfg.Php_max_kw)
         else:
@@ -1581,11 +1430,8 @@ def compute_baseline_arrays(inputs: MPCInputs, cfg: MPCConfig) -> dict:
         )
         # Cooling baseline: on_off at comfort ceiling
         if cfg.cooling_enabled and cfg.hp_enabled:
-            _hour_bl = (k * dt) % 24.0
-            _is_night_bl = (cfg.use_night_setback and
-                            (_hour_bl >= cfg.night_start_h or _hour_bl < cfg.night_end_h))
-            _T_cool_lim_bl = cfg.T_cool_night_c if _is_night_bl else cfg.Tmax_c
-            if T_prev > _T_cool_lim_bl:
+            _T_next_no_cool = Tbuilding[k + 1]
+            if _T_next_no_cool > _T_cool_lim_bl:
                 Php_cool[k] = cfg.Php_cool_max_kw
             Tbuilding[k + 1] -= beta * Php_cool[k]
 
@@ -1619,6 +1465,10 @@ def compute_baseline_arrays(inputs: MPCInputs, cfg: MPCConfig) -> dict:
             - Pchp_k
         )
         Pgrid[k] = max(0.0, net)
+        # If PV exceeded demand, record only the actually-used portion.
+        # Excess cannot be exported (Pgrid ≥ 0), so it's curtailed.
+        if net < 0.0:
+            Ppv[k] = float(Ppv[k]) + net   # = min(Ppv[k], total_demand_k)
 
     Pchp_arr  = Fchp * cfg.chp_gas_HV_kwh_m3 * cfg.chp_eta_elec
     elec_cost    = float(np.sum(lambda_e * Pgrid)) * dt
@@ -1666,7 +1516,7 @@ def compute_asset_savings(
     dt = cfg.dt_hours
     lambda_e = inputs.price_eur_kwh[:H] + cfg.fee_eur_kwh
     COP      = compute_cop(inputs.Tamb_c[:H], cfg)
-    c_boiler = cfg.gas_price_boiler_eur_m3 / max(cfg.gas_HV_kwh_m3 * cfg.eta_boiler, 1e-9)
+    c_boiler = cfg.gas_price_boiler_eur_kwh / max(cfg.eta_boiler, 1e-9)
 
     def _plan(arr: np.ndarray) -> np.ndarray:
         a = np.asarray(arr, dtype=float).ravel()
@@ -1828,6 +1678,8 @@ def solve_mpc(inputs: MPCInputs, cfg: MPCConfig) -> MPCOutputs:
     t0 = time.perf_counter()
     H  = cfg.horizon_steps
     dt = cfg.dt_hours
+    _now = time.localtime()
+    start_hour = _now.tm_hour + (_now.tm_min / 60.0) + (_now.tm_sec / 3600.0)
 
     # ── Ensure all input arrays are padded/clipped to length H ────────────
     def _pad(arr: np.ndarray, fill: float = 0.0) -> np.ndarray:
@@ -1867,7 +1719,7 @@ def solve_mpc(inputs: MPCInputs, cfg: MPCConfig) -> MPCOutputs:
     sol = None
     if CVXPY_AVAILABLE:
         try:
-            sol = _solve_cvxpy(inp, cfg_use, COP, H, dt)
+            sol = _solve_cvxpy(inp, cfg_use, COP, H, dt, start_hour=start_hour)
         except Exception as exc:
             logger.warning("cvxpy solve failed (%s) — using heuristic", exc)
 
@@ -1878,12 +1730,12 @@ def solve_mpc(inputs: MPCInputs, cfg: MPCConfig) -> MPCOutputs:
             _cfg_lp = _dc.replace(cfg_use, chp_use_milp=False)
             logger.info("MILP failed — retrying with CHP LP relaxation to preserve ramp constraints")
             try:
-                sol = _solve_cvxpy(inp, _cfg_lp, COP, H, dt)
+                sol = _solve_cvxpy(inp, _cfg_lp, COP, H, dt, start_hour=start_hour)
             except Exception as exc2:
                 logger.warning("LP relaxation also failed (%s)", exc2)
 
     if sol is None:
-        sol = _solve_heuristic(inp, cfg_use, COP, H, dt)
+        sol = _solve_heuristic(inp, cfg_use, COP, H, dt, start_hour=start_hour)
 
     solve_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -1914,8 +1766,8 @@ def solve_mpc(inputs: MPCInputs, cfg: MPCConfig) -> MPCOutputs:
 
     # ── Cost KPIs ──────────────────────────────────────────────────────────
     lambda_e_0   = float(price[0]) + cfg_use.fee_eur_kwh  # [€/kWh]
-    c_boiler_kw  = cfg_use.gas_price_boiler_eur_m3 / max(
-        cfg_use.gas_HV_kwh_m3 * cfg_use.eta_boiler, 1e-9
+    c_boiler_kw  = cfg_use.gas_price_boiler_eur_kwh / max(
+        cfg_use.eta_boiler, 1e-9
     )  # €/kWh thermal
 
     # Full-horizon MPC cost from solution arrays (electricity + gas)
@@ -1925,7 +1777,7 @@ def solve_mpc(inputs: MPCInputs, cfg: MPCConfig) -> MPCOutputs:
         + float(np.sum(sol["Pgas"]))  * c_boiler_kw * dt
     )
     # Full-horizon baseline: rule-based simulation with same physics & forecasts
-    baseline_cost = compute_baseline_cost(inp, cfg_use)
+    baseline_cost = compute_baseline_cost(inp, cfg_use, start_hour=start_hour)
     saving        = baseline_cost - mpc_cost
 
     # ── Build plan arrays ──────────────────────────────────────────────────

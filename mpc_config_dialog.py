@@ -374,8 +374,7 @@ _TYPE_PARAM_SPECS: dict[str, list] = {
     "gas_boiler": [
         ("Pgas_max_kw",      "Max thermal output",  1.0, 9_999_999.0, 100.0, "kW",      1, 5.0),
         ("eta_boiler",       "Thermal efficiency",  0.5,     1.0,  0.92, "",         3, 0.01),
-        ("gas_price_eur_m3", "Gas price",           0.0,     5.0,  0.35, "\u20ac/m\u00b3", 4, 0.01),
-        ("gas_HV_kwh_m3",    "Calorific value HV",  5.0,    15.0,   9.8, "kWh/m\u00b3", 2, 0.1),
+        ("gas_price_eur_kwh", "Gas price",           0.0,     1.0,  0.035, "\u20ac/kWh", 4, 0.001),
         ("ramp_pct",         "Ramp up/down limit",  1.0,   100.0, 100.0, "%/step",   1, 5.0),
     ],
     "chp": [

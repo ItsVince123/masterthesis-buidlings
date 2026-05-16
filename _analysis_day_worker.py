@@ -90,6 +90,7 @@ if __name__ == "__main__":
                 "plan_Pgas":   sol.plan_Pgas.tolist(),
                 "plan_Ptank":  sol.plan_Ptank.tolist(),
                 "plan_Php_cool": sol.plan_Php_cool.tolist() if len(sol.plan_Php_cool) > 0 else [],
+                "plan_Tbuilding": sol.plan_Tbuilding[:H].tolist() if len(sol.plan_Tbuilding) > 0 else [],
                 # Baseline dispatch arrays
                 "bl_Pgrid":    bl["Pgrid"].tolist(),
                 "bl_Php":      bl["Php"].tolist(),
