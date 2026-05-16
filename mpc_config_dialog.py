@@ -44,7 +44,7 @@ QTabBar::tab {
     border-radius: 4px 4px 0 0; font-size: 9pt;
 }
 QTabBar::tab:selected { background: #7c3aed; color: white; font-weight: 700; }
-QLabel { color: #1f2937; font-family: 'Segoe UI'; font-size: 10pt; }
+QLabel { color: #1f2937; font-family: 'Calibri'; font-size: 10pt; }
 QDoubleSpinBox, QSpinBox {
     background-color: #ffffff; border: 1px solid #d6dfeb;
     border-radius: 6px; padding: 6px 10px; font-size: 10pt; min-height: 28px;
@@ -151,8 +151,8 @@ class MpcConfigDialog(QDialog):
             mpc.setdefault("grid", {}).update({
                 "Pgrid_max_kw":       self._Pgrid_max.value(),
                 "fee_eur_kwh":        self._fee.value(),
-                "cap_tariff_peak_kw": self._cap_peak.value(),
-                "cap_tariff_eur_mwh": self._cap_pen.value(),
+                "cap_tariff_Plim_kw":   self._cap_Plim.value(),
+                "cap_tariff_epsilon_l": self._cap_eps.value(),
             })
             mpc.setdefault("building", {}).update({
                 "Tset_c":        self._Tset.value(),
@@ -161,6 +161,11 @@ class MpcConfigDialog(QDialog):
                 "T_init_c":      self._Tinit_b.value(),
                 "Cth_kwh_per_c": self._Cth.value(),
                 "UA_kw_per_c":   self._UA.value(),
+                "use_night_setback": self._night_chk.isChecked(),
+                "T_set_night_c":     self._T_set_night.value(),
+                "T_cool_night_c":    self._T_cool_night.value(),
+                "night_start_h":     self._night_start.value(),
+                "night_end_h":       self._night_end.value(),
             })
             # base/peak load lives in smpc.building, not mpc.building
             raw.setdefault("smpc", {}).setdefault("building", {}).update({
@@ -185,8 +190,8 @@ class MpcConfigDialog(QDialog):
         self._dt.setValue(d.dt_hours)
         self._Pgrid_max.setValue(d.Pgrid_max_kw)
         self._fee.setValue(d.fee_eur_kwh)
-        self._cap_peak.setValue(d.cap_tariff_peak_kw)
-        self._cap_pen.setValue(d.cap_tariff_eur_mwh)
+        self._cap_Plim.setValue(d.cap_tariff_Plim_kw)
+        self._cap_eps.setValue(d.cap_tariff_epsilon_l)
         # reset base/peak load to smpc defaults
         self._base_load.setValue(80.0)
         self._peak_load.setValue(200.0)
@@ -196,6 +201,11 @@ class MpcConfigDialog(QDialog):
         self._Tinit_b.setValue(d.T_init_c)
         self._Cth.setValue(d.Cth_kwh_per_c)
         self._UA.setValue(d.UA_kw_per_c)
+        self._night_chk.setChecked(d.use_night_setback)
+        self._T_set_night.setValue(d.T_set_night_c)
+        self._T_cool_night.setValue(d.T_cool_night_c)
+        self._night_start.setValue(d.night_start_h)
+        self._night_end.setValue(d.night_end_h)
 
     # ── UI construction ─────────────────────────────────────────────────────
 
@@ -253,17 +263,18 @@ class MpcConfigDialog(QDialog):
         form.addRow("Fixed electricity cost:",  self._fee)
 
         form.addRow(_section("Capacity Tariff"))
-        self._cap_peak   = _dspin(0.0, 50000.0, self._cfg.cap_tariff_peak_kw, "kW",    1, 10.0)
-        self._cap_pen    = _dspin(0.0, 10000.0, self._cfg.cap_tariff_eur_mwh, "€/MWh", 1, 10.0)
+        self._cap_Plim = _dspin(0.0, 50000.0, self._cfg.cap_tariff_Plim_kw,   "kW",    1, 10.0)
+        self._cap_eps  = _dspin(0.0, 1e6,     self._cfg.cap_tariff_epsilon_l, "€/kW²",  4, 0.001)
         _cap_note = QLabel(
-            "Penalty charged when grid import exceeds the contracted peak. "
-            "Set peak to 0 to disable."
+            "Quadratic peak penalty: ε_L \u00b7 Σ(max(0, P_grid,k \u2212 P_lim))². "
+            "Discourages grid import above P_lim without a hard cut-off. "
+            "Set P_lim to 0 to disable."
         )
         _cap_note.setStyleSheet("color: #64748b; font-size: 9pt;")
         _cap_note.setWordWrap(True)
-        form.addRow("Contracted peak:",   self._cap_peak)
-        form.addRow("Penalty:",           self._cap_pen)
-        form.addRow("",                   _cap_note)
+        form.addRow("Power limit P_lim:",    self._cap_Plim)
+        form.addRow("Penalty ε_L:",         self._cap_eps)
+        form.addRow("",                       _cap_note)
         self._tabs.addTab(w, "Grid / Horizon")
 
     def _build_tab_building(self):
@@ -272,19 +283,12 @@ class MpcConfigDialog(QDialog):
         form.setSpacing(10)
 
         form.addRow(_section("Electrical Load Profile"))
-        _load_note = QLabel(
-            "When no real metering data is available the LP uses a synthetic "
-            "sinusoidal day/night profile to estimate building consumption."
-        )
-        _load_note.setStyleSheet("color: #64748b; font-size: 9pt;")
-        _load_note.setWordWrap(True)
-        form.addRow("", _load_note)
         raw = load_dashboard_config()
         _smpc_bld = raw.get("smpc", {}).get("building", {})
         self._base_load = _dspin(0.0, 100000.0, _smpc_bld.get("base_load_kw", 80.0), "kW", 1, 10.0)
         self._peak_load = _dspin(0.0, 100000.0, _smpc_bld.get("peak_load_kw", 200.0), "kW", 1, 10.0)
-        form.addRow("Night base load:", self._base_load)
-        form.addRow("Day peak load:",   self._peak_load)
+        form.addRow("Night load (22:00–07:00):", self._base_load)
+        form.addRow("Day load   (07:00–22:00):", self._peak_load)
 
         form.addRow(_section("Building Thermal Model"))
         self._Tset    = _dspin(10.0, 35.0,  self._cfg.Tset_c,        "°C",        1, 0.5)
@@ -299,6 +303,20 @@ class MpcConfigDialog(QDialog):
         form.addRow("Initial temperature:", self._Tinit_b)
         form.addRow("Thermal mass Cth:", self._Cth)
         form.addRow("Heat transfer coefficient UA:", self._UA)
+
+        form.addRow(_section("Night Setback"))
+        self._night_chk = QCheckBox("Enable night setback schedule")
+        self._night_chk.setChecked(self._cfg.use_night_setback)
+        form.addRow("", self._night_chk)
+        self._T_set_night  = _dspin(5.0,  30.0, self._cfg.T_set_night_c,  "\u00b0C", 1, 0.5)
+        self._T_cool_night = _dspin(15.0, 40.0, self._cfg.T_cool_night_c, "\u00b0C", 1, 0.5)
+        self._night_start  = _dspin(0.0,  23.0, self._cfg.night_start_h,  "h",       1, 0.5)
+        self._night_end    = _dspin(0.0,  23.0, self._cfg.night_end_h,    "h",       1, 0.5)
+        form.addRow("Night heating floor:",   self._T_set_night)
+        form.addRow("Night cooling ceiling:", self._T_cool_night)
+        form.addRow("Night starts at hour:",  self._night_start)
+        form.addRow("Night ends at hour:",    self._night_end)
+
         self._tabs.addTab(_tab_scroll(w), "Building")
 
 
@@ -318,7 +336,7 @@ _TYPE_ICONS = {
 
 _INSTANCE_STYLE = """
 QDialog { background-color: #eef3f9; }
-QLabel  { color: #1f2937; font-family: 'Segoe UI'; font-size: 10pt; }
+QLabel  { color: #1f2937; font-family: 'Calibri'; font-size: 10pt; }
 QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox, QTimeEdit {
     background: white; border: 1px solid #cbd5e1; border-radius: 5px;
     padding: 4px 8px; font-size: 10pt; color: #1f2937;
@@ -341,27 +359,32 @@ QPushButton#cancel:hover { background: #475569; }
 # Per-type parameter specs: (json_key, label, lo, hi, default, suffix, decimals, step)
 _TYPE_PARAM_SPECS: dict[str, list] = {
     "pv": [
-        ("capacity_kwp", "Installed capacity", 0.0, 10_000.0, 100.0, "kWp", 1, 10.0),
+        ("capacity_kwp", "Installed capacity", 0.0, 9_999_999.0, 100.0, "kWp", 1, 10.0),
     ],
     "heat_pump": [
-        ("Php_max_kw",    "Max thermal output",       1.0,  2_000.0,  50.0, "kW",   1,  5.0),
-        ("COP0",          "Nominal COP",               1.0,     10.0,   4.0, "",     2,  0.1),
-        ("T0_c",          "Reference temperature T0", -20.0,    30.0,   7.0, "\u00b0C", 1, 1.0),
-        ("cop_alpha",     "COP degradation \u03b1",    0.0,      0.1,  0.02, "/\u00b0C", 4, 0.001),
-        ("COP_min",       "Minimum COP",               0.5,      5.0,   1.0, "",     2,  0.1),
+        ("Php_max_kw",      "Max thermal output",        1.0, 99_999.0,  50.0, "kW",     1,  5.0),
+        ("COP0",            "Nominal COP (heating)",      1.0,     10.0,   4.0, "",       2,  0.1),
+        ("T0_c",            "Reference temperature T0", -20.0,    30.0,   7.0, "\u00b0C", 1,  1.0),
+        ("cop_alpha",       "COP degradation \u03b1",    0.0,      0.1,  0.02, "/\u00b0C", 4, 0.001),
+        ("COP_min",         "Minimum COP",                0.5,      5.0,   1.0, "",       2,  0.1),
+        ("ramp_pct",        "Ramp up/down limit",         1.0,    100.0, 100.0, "%/step", 1,  5.0),
+        ("Php_cool_max_kw", "Max cooling output",         0.0, 99_999.0,  50.0, "kW",     1,  5.0),
+        ("COP_cool",        "Cooling COP",                0.5,     10.0,   3.0, "",       2,  0.1),
     ],
     "gas_boiler": [
-        ("Pgas_max_kw",      "Max thermal output",  1.0, 5_000.0, 100.0, "kW",      1, 5.0),
+        ("Pgas_max_kw",      "Max thermal output",  1.0, 9_999_999.0, 100.0, "kW",      1, 5.0),
         ("eta_boiler",       "Thermal efficiency",  0.5,     1.0,  0.92, "",         3, 0.01),
         ("gas_price_eur_m3", "Gas price",           0.0,     5.0,  0.35, "\u20ac/m\u00b3", 4, 0.01),
         ("gas_HV_kwh_m3",    "Calorific value HV",  5.0,    15.0,   9.8, "kWh/m\u00b3", 2, 0.1),
+        ("ramp_pct",         "Ramp up/down limit",  1.0,   100.0, 100.0, "%/step",   1, 5.0),
     ],
     "chp": [
-        ("Fchp_max_m3_h",    "Max gas flow",            0.1,   500.0, 10.0, "m\u00b3/h", 2, 0.5),
-        ("eta_elec",         "Electrical efficiency",   0.1,     0.9,  0.40, "",   3, 0.01),
-        ("eta_heat",         "Thermal efficiency",      0.1,     0.9,  0.45, "",   3, 0.01),
-        ("startup_cost_eur", "Startup cost per event",  0.0, 1_000.0,   5.0, "\u20ac", 2, 0.5),
-        ("gas_price_eur_m3", "Gas price",               0.0,     5.0,  0.35, "\u20ac/m\u00b3", 4, 0.01),
+        ("Pchp_max_kw",      "Max elec. output",          1.0, 9_999_999.0, 39.2, "kW",           1, 5.0),
+        ("eta_elec",         "Electrical efficiency",      0.1,     0.9,  0.40, "",             3, 0.01),
+        ("eta_heat",         "Thermal efficiency",         0.1,     0.9,  0.45, "",             3, 0.01),
+        ("startup_cost_eur", "Startup cost per event",     0.0, 1_000.0,   5.0, "\u20ac",       2, 0.5),
+        ("gas_price_eur_m3", "Gas price",                  0.0,     5.0,  0.35, "\u20ac/m\u00b3", 4, 0.01),
+        ("ramp_pct",         "Ramp up/down limit",         1.0,   100.0, 100.0, "%/step",       1, 5.0),
     ],
     "battery": [
         ("SOC_cap_kwh",  "Capacity",               1.0, 100_000.0, 100.0, "kWh", 1, 10.0),
@@ -372,18 +395,45 @@ _TYPE_PARAM_SPECS: dict[str, list] = {
         ("Pdis_max_kw",  "Max discharge power",    0.1,  10_000.0,  25.0, "kW",  1,  5.0),
         ("eta_ch",       "Charge efficiency",      0.5,       1.0,  0.95, "",    3, 0.01),
         ("eta_dis",      "Discharge efficiency",   0.5,       1.0,  0.95, "",    3, 0.01),
+        ("ramp_pct",     "Ramp up/down limit",     1.0,     100.0, 100.0, "%/step", 1, 5.0),
     ],
     "hot_water": [
-        ("Ptank_max_kw", "Heater power",         0.1,   100.0,   3.0, "kW",  2, 0.5),
-        ("volume_l",     "Tank volume",          10.0, 5_000.0, 200.0, "L",   1, 10.0),
+        ("Ptank_max_kw", "Heater power",         0.1, 9_999_999.0,   3.0, "kW",  2, 0.5),
+        ("volume_l",     "Tank volume",          10.0, 9_999_999.0, 200.0, "L",   1, 10.0),
         ("T_min_c",      "Min temperature",      10.0,    80.0,  45.0, "\u00b0C", 1, 1.0),
         ("T_max_c",      "Max temperature",      10.0,    95.0,  60.0, "\u00b0C", 1, 1.0),
         ("T_init_c",     "Initial temperature",  10.0,    95.0,  55.0, "\u00b0C", 1, 1.0),
         ("heat_loss_w",  "Standby heat loss",     0.0,   500.0,  50.0, "W",   1, 5.0),
+        ("ramp_pct",     "Ramp up/down limit",    1.0,   100.0, 100.0, "%/step", 1, 5.0),
     ],
 }
 
-_BASELINE_MODES = ["always_off", "constant", "proportional"]
+# Per-type baseline mode options shown in the combo box.
+# Keys match the "type" field stored in asset instances.
+_BASELINE_MODES_BY_TYPE: dict[str, list[str]] = {
+    "pv":         ["always_off"],
+    "heat_pump":  ["on_off", "constant", "always_off"],
+    "gas_boiler": ["on_off", "constant", "always_off"],
+    "battery":    ["always_off"],
+    "chp":        ["always_off", "heat_demand", "constant"],
+    "hot_water":  ["on_off", "constant", "always_off"],
+    "flex":       ["fixed_window", "always_off"],
+}
+
+# Human-readable labels for raw mode keys (used in the combo box).
+_BL_MODE_DISPLAY: dict[str, str] = {
+    "on_off":       "On/off (bang-bang thermostat)",
+    "constant":     "Constant power",
+    "always_off":   "Always off (disabled)",
+    "heat_demand":  "Heat-demand led",
+    "fixed_window": "Fixed time window",
+}
+
+# Asset types whose baseline behaviour is fixed — no user configuration needed.
+_BL_FIXED_ASSET_NOTES: dict[str, str] = {
+    "pv":      "PV always uses all available generation in the baseline.",
+    "battery": "Battery is always idle in the baseline (no price arbitrage).",
+}
 
 
 class AssetInstanceDialog(QDialog):
@@ -396,6 +446,7 @@ class AssetInstanceDialog(QDialog):
         self.setMinimumWidth(420)
         self.setStyleSheet(_INSTANCE_STYLE)
         self._param_widgets: dict[str, QDoubleSpinBox | QTimeEdit] = {}
+        self._bool_widgets:  dict[str, QCheckBox] = {}
         self._build_ui()
 
     def _build_ui(self):
@@ -427,29 +478,82 @@ class AssetInstanceDialog(QDialog):
         form.addRow(div1)
         form.addRow(_section("Baseline comparison"))
 
-        hint = QLabel(
-            "The baseline models what the system would consume WITHOUT optimisation.\n"
-            "It is used to calculate the reported energy savings."
-        )
-        hint.setStyleSheet("color: #64748b; font-size: 9pt;")
-        hint.setWordWrap(True)
-        form.addRow(hint)
+        if itype in _BL_FIXED_ASSET_NOTES:
+            # PV / battery: baseline behaviour is fixed, nothing to configure.
+            _note = QLabel(_BL_FIXED_ASSET_NOTES[itype])
+            _note.setStyleSheet("color: #64748b; font-size: 9pt;")
+            _note.setWordWrap(True)
+            form.addRow(_note)
+            self._baseline_combo = None
+            self._baseline_power = None
+            self._bl_t_on  = None
+            self._bl_t_off = None
+        else:
+            hint = QLabel(
+                "The baseline models what the system would consume WITHOUT optimisation.\n"
+                "It is used to calculate the reported energy savings."
+            )
+            hint.setStyleSheet("color: #64748b; font-size: 9pt;")
+            hint.setWordWrap(True)
+            form.addRow(hint)
 
-        self._baseline_combo = QComboBox()
-        for m in _BASELINE_MODES:
-            self._baseline_combo.addItem(m)
-        cur = self._inst.get("baseline_mode", "always_off")
-        self._baseline_combo.setCurrentIndex(
-            _BASELINE_MODES.index(cur) if cur in _BASELINE_MODES else 0
-        )
-        form.addRow("Baseline mode:", self._baseline_combo)
+            # Mode combo — items store raw key as userData, show friendly display label.
+            self._baseline_combo = QComboBox()
+            _bl_modes = _BASELINE_MODES_BY_TYPE.get(itype, [])
+            for m in _bl_modes:
+                self._baseline_combo.addItem(_BL_MODE_DISPLAY.get(m, m), userData=m)
+            cur = self._inst.get("baseline_mode", _bl_modes[0] if _bl_modes else "")
+            idx = next(
+                (i for i in range(self._baseline_combo.count())
+                 if self._baseline_combo.itemData(i) == cur),
+                0,
+            )
+            self._baseline_combo.setCurrentIndex(idx)
+            form.addRow("Baseline mode:", self._baseline_combo)
 
-        self._baseline_power = QDoubleSpinBox()
-        self._baseline_power.setRange(0.0, 10_000.0)
-        self._baseline_power.setSuffix(" kW")
-        self._baseline_power.setDecimals(1)
-        self._baseline_power.setValue(float(self._inst.get("baseline_power_kw", 0.0)))
-        form.addRow("Baseline power:", self._baseline_power)
+            # Power spinbox — only meaningful for assets with a configurable run power.
+            # CHP always fires at its rated gas flow; no separate power setting needed.
+            if itype in {"heat_pump", "gas_boiler", "hot_water", "flex"}:
+                self._baseline_power = QDoubleSpinBox()
+                self._baseline_power.setRange(0.0, 10_000.0)
+                self._baseline_power.setSuffix(" kW")
+                self._baseline_power.setDecimals(1)
+                self._baseline_power.setValue(float(self._inst.get("baseline_power_kw", 0.0)))
+                form.addRow("Baseline power (0 = use max):", self._baseline_power)
+            else:
+                self._baseline_power = None
+                if itype == "chp":
+                    _chp_note = QLabel("When active, CHP always runs at its rated output.")
+                    _chp_note.setStyleSheet("color: #64748b; font-size: 9pt;")
+                    form.addRow(_chp_note)
+
+            # Flex-specific baseline time window ─────────────────────────────
+            if itype == "flex":
+                hint_bl = QLabel(
+                    "Baseline window: the hours during which the load runs without"
+                    " optimisation (independent from the MPC active window above)."
+                )
+                hint_bl.setStyleSheet("color: #64748b; font-size: 9pt;")
+                hint_bl.setWordWrap(True)
+                form.addRow(hint_bl)
+
+                def _te_bl(s: str) -> QTimeEdit:
+                    t = QTimeEdit()
+                    t.setDisplayFormat("HH:mm")
+                    try:
+                        h2, m2 = map(int, s.split(":"))
+                        t.setTime(QTime(h2, m2))
+                    except Exception:
+                        t.setTime(QTime(0, 0))
+                    return t
+
+                self._bl_t_on  = _te_bl(self._inst.get("baseline_time_start", "00:00"))
+                self._bl_t_off = _te_bl(self._inst.get("baseline_time_end",   "23:59"))
+                form.addRow("Baseline window start:", self._bl_t_on)
+                form.addRow("Baseline window end:",   self._bl_t_off)
+            else:
+                self._bl_t_on  = None
+                self._bl_t_off = None
 
         # ── Type-specific parameters ─────────────────────────────────────────
         if itype in _TYPE_PARAM_SPECS or itype == "flex":
@@ -463,6 +567,16 @@ class AssetInstanceDialog(QDialog):
                 w = _dspin(lo, hi, val, suffix, decimals, step)
                 form.addRow(f"{label}:", w)
                 self._param_widgets[key] = w
+
+            if itype == "heat_pump":
+                div_cool = QFrame(); div_cool.setFrameShape(QFrame.Shape.HLine)
+                form.addRow(div_cool)
+                form.addRow(_section("Cooling"))
+                cooling_chk = QCheckBox("Enable HP cooling (reverse-cycle)")
+                cooling_chk.setChecked(bool(self._inst.get("cooling_enabled", False)))
+                form.addRow("", cooling_chk)
+                self._bool_widgets["cooling_enabled"] = cooling_chk
+
 
         elif itype == "flex":
             # Flex power and energy budget
@@ -533,22 +647,31 @@ class AssetInstanceDialog(QDialog):
         outer.addLayout(btn_row)
 
     def _save(self):
-        self._inst["name"]              = self._name_edit.text().strip() or self._inst.get("name", "Asset")
-        self._inst["enabled"]           = self._enabled_chk.isChecked()
-        self._inst["baseline_mode"]     = self._baseline_combo.currentText()
-        self._inst["baseline_power_kw"] = self._baseline_power.value()
+        self._inst["name"]    = self._name_edit.text().strip() or self._inst.get("name", "Asset")
+        self._inst["enabled"] = self._enabled_chk.isChecked()
+        if self._baseline_combo is not None:
+            self._inst["baseline_mode"] = self._baseline_combo.currentData()
+        if self._baseline_power is not None:
+            self._inst["baseline_power_kw"] = self._baseline_power.value()
         # Generic spinbox params
         for key, widget in self._param_widgets.items():
             self._inst[key] = widget.value()
+        # Boolean params (checkboxes)
+        for key, widget in self._bool_widgets.items():
+            self._inst[key] = widget.isChecked()
         # Flex-specific
         itype = self._inst.get("type", "")
         if itype == "flex":
-            self._inst["Pflex_max_kw"]     = self._flex_max.value()
-            self._inst["daily_energy_kwh"] = self._flex_kwh.value()
-            self._inst["time_start"]       = self._flex_t_on.time().toString("HH:mm")
-            self._inst["time_end"]         = self._flex_t_off.time().toString("HH:mm")
-            self._inst["ramp_up_kw"]       = self._ramp_up.value()
-            self._inst["ramp_down_kw"]     = self._ramp_down.value()
+            self._inst["Pflex_max_kw"]          = self._flex_max.value()
+            self._inst["daily_energy_kwh"]       = self._flex_kwh.value()
+            self._inst["time_start"]             = self._flex_t_on.time().toString("HH:mm")
+            self._inst["time_end"]               = self._flex_t_off.time().toString("HH:mm")
+            self._inst["ramp_up_kw"]             = self._ramp_up.value()
+            self._inst["ramp_down_kw"]           = self._ramp_down.value()
+            if self._bl_t_on is not None:
+                self._inst["baseline_time_start"] = self._bl_t_on.time().toString("HH:mm")
+            if self._bl_t_off is not None:
+                self._inst["baseline_time_end"]   = self._bl_t_off.time().toString("HH:mm")
         self.accept()
 
     def result_instance(self) -> dict:
@@ -561,7 +684,7 @@ class AssetInstanceDialog(QDialog):
 
 _SELECTOR_STYLE = """
 QDialog { background-color: #eef3f9; }
-QLabel  { color: #1f2937; font-family: 'Segoe UI'; font-size: 10pt; }
+QLabel  { color: #1f2937; font-family: 'Calibri'; font-size: 10pt; }
 QScrollArea { background: transparent; border: none; }
 QFrame#InstanceRow {
     background: white; border: 1px solid #e2e8f0; border-radius: 8px;
@@ -795,9 +918,12 @@ class MPCAssetSelectorDialog(QDialog):
             "type":              type_key,
             "name":              _TYPE_ICONS.get(type_key, type_key).split("  ")[-1].strip(),
             "enabled":           True,
-            "baseline_mode":     "always_off",
+            "baseline_mode":     _BASELINE_MODES_BY_TYPE.get(type_key, ["always_off"])[0],
             "baseline_power_kw": 0.0,
         }
+        if type_key == "flex":
+            new_inst["baseline_time_start"] = "00:00"
+            new_inst["baseline_time_end"]   = "23:59"
         self._instances.append(new_inst)
         self._refresh_list()
 
@@ -807,7 +933,7 @@ class MPCAssetSelectorDialog(QDialog):
         mpc["asset_instances"] = self._instances
 
         # Keys that belong to the common instance header (not solver params)
-        _skip_keys = {"id", "type", "name", "enabled", "baseline_mode", "baseline_power_kw"}
+        _skip_keys = {"id", "type", "name", "enabled"}
 
         # For each asset type: sync enabled flag + propagate params from first
         # enabled instance of that type into the corresponding solver JSON section
@@ -820,6 +946,13 @@ class MPCAssetSelectorDialog(QDialog):
             for inst in self._instances:
                 if inst.get("type") == type_key and inst.get("enabled", True):
                     params = {k: v for k, v in inst.items() if k not in _skip_keys}
+                    # Remap flex baseline time keys: instance uses baseline_time_*,
+                    # section dict (and from_dict) expects bl_time_*
+                    if type_key == "flex":
+                        if "baseline_time_start" in params:
+                            params["bl_time_start"] = params.pop("baseline_time_start")
+                        if "baseline_time_end" in params:
+                            params["bl_time_end"] = params.pop("baseline_time_end")
                     mpc[json_section].update(params)
                     break
 

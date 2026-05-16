@@ -19,7 +19,7 @@ MAIN_WINDOW_STYLE = """
 QMainWindow, QWidget {
     background-color: #eef3f9;
     color: #1f2937;
-    font-family: 'Segoe UI';
+    font-family: 'Calibri';
     font-size: 11pt;
 }
 
@@ -83,7 +83,7 @@ QLabel#EnergyLabel {
 
 QLabel#EnergyValue {
     color: #0b7a75;
-    font-family: 'Consolas';
+    font-family: 'Calibri';
     font-size: 16pt;
     font-weight: 700;
 }
@@ -95,14 +95,16 @@ QFrame#TagRow {
 }
 
 QLabel#TagName {
+    background-color: transparent;
     color: #27364f;
     font-size: 10pt;
     font-weight: 600;
 }
 
 QLabel#TagValue {
+    background-color: transparent;
     color: #0f766e;
-    font-family: 'Consolas';
+    font-family: 'Calibri';
     font-size: 11pt;
     font-weight: 700;
 }
@@ -204,7 +206,7 @@ QPushButton:pressed { background-color: #14532d; }
 # ---------------------------------------------------------------------------
 HISTORICAL_DIALOG_STYLE = """
 QDialog { background-color: #eef3f9; }
-QLabel  { color: #1f2937; font-family: 'Segoe UI'; font-size: 10pt; }
+QLabel  { color: #1f2937; font-family: 'Calibri'; font-size: 10pt; }
 QDateEdit {
     background-color: #ffffff;
     border: 1px solid #d6dfeb;
@@ -231,8 +233,8 @@ QPushButton:hover { background-color: #1d4ed8; }
 # ---------------------------------------------------------------------------
 # Inline value colours (used by dashboard widget setStyleSheet calls)
 # ---------------------------------------------------------------------------
-VALUE_STYLE = "font-family: 'Consolas'; font-weight: 700;"
+VALUE_STYLE = "font-family: 'Calibri'; font-weight: 700;"
 
 def value_css(colour: str) -> str:
     """Return an inline style string for a tag-value label."""
-    return f"color: {colour}; {VALUE_STYLE}"
+    return f"color: {colour}; background-color: transparent; {VALUE_STYLE}"

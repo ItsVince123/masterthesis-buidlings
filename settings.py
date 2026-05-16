@@ -60,6 +60,6 @@ GRID_FEE_EUR_MWH = 50.0       # EUR/MWh = EXTRA_COST_EUR_MWH in energy_assets.py
 # ---------------------------------------------------------------------------
 DAILY_FETCH_HOUR = 14           # Local hour at which daily data refresh runs
                                 # (14:00 ensures tomorrow's DAM prices are available)
-SOLAR_CAPACITY_KWP = 1.525      # Installed PV capacity (kWp) — used by predict.py
+SOLAR_CAPACITY_KWP = 1.525      # Installed PV capacity (kWp) — fallback only
 INTERVAL_MINUTES = 15           # Time resolution used throughout the system
                                 # (must match ENTSO-E data resolution after Oct 2025)

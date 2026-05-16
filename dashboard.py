@@ -47,12 +47,11 @@ from PyQt6.QtWidgets import (
 from dashboard_config import load_dashboard_config
 from data_manager import DataManager, current_slot
 from graph_renderer import draw_price_graph, draw_solar_graph, draw_temperature_graph, draw_thermal_graph
-from future_dialog import FutureSimulationDialog
-from historical_dialog import HistoricalAnalysisDialog
+from analysis_dialog import AnalysisDialog
 from settings import INTERVAL_MINUTES, LOCAL_TZ
 from smpc_calculator import SMPCCalculator
 from styles import (
-    COLUMN_BUTTON_STYLE, FUTURE_BUTTON_STYLE, HISTORICAL_BUTTON_STYLE,
+    COLUMN_BUTTON_STYLE, HISTORICAL_BUTTON_STYLE,
     MAIN_WINDOW_STYLE, SLOT_SLIDER_STYLE, value_css,
 )
 
@@ -312,6 +311,14 @@ class ScadaWindow(QMainWindow):
             iid   = inst["id"]
             itype = inst.get("type", "")
             iname = inst.get("name", iid)
+            if itype == "battery":
+                input_tags.append({
+                    "id": f"{iid}_soc", "name": "Battery SOC", "icon": "battery",
+                    "section": "GENERATION",
+                    "simulation": {"mode": "mpc_scalar", "field": "battery_soc_kwh",
+                                   "plan_field": "plan_SOC",
+                                   "unit": "kWh", "decimals": 1, "color": "#0891b2"},
+                })
             if itype == "pv":
                 input_tags.append({
                     "id": f"{iid}_solar", "name": "Solar Predicted", "icon": "sun",
@@ -419,9 +426,16 @@ class ScadaWindow(QMainWindow):
             iname = inst.get("name", iid)
             if itype == "battery":
                 output_tags.append({
-                    "id": f"{iid}_status", "name": iname, "icon": "battery",
+                    "id": f"{iid}_charge_kw", "name": f"{iname} Charge", "icon": "battery",
                     "section": "STORAGE",
-                    "simulation": {"mode": "mpc_battery_status"},
+                    "simulation": {"mode": "asset_power", "uid": "battery_charge",
+                                   "unit": "kW", "decimals": 1, "color": "#0891b2"},
+                })
+                output_tags.append({
+                    "id": f"{iid}_discharge_kw", "name": f"{iname} Discharge", "icon": "lightning",
+                    "section": "STORAGE",
+                    "simulation": {"mode": "asset_power", "uid": "battery_discharge",
+                                   "unit": "kW", "decimals": 1, "color": "#f59e0b"},
                 })
 
         # ── OUTPUT: GRID ───────────────────────────────────────────────────
@@ -434,10 +448,22 @@ class ScadaWindow(QMainWindow):
                                "plan_field": "plan_pgrid_kw"},
             },
             {
-                "id": "cost_saving", "name": "Saving Today", "icon": "leaf",
+                "id": "mpc_cost", "name": "MPC Cost (horizon)", "icon": "coin",
+                "section": "GRID",
+                "simulation": {"mode": "mpc_scalar", "field": "smpc_cost_eur",
+                               "unit": "\u20ac", "decimals": 2, "color": "#0e7490"},
+            },
+            {
+                "id": "baseline_cost", "name": "Baseline Cost (horizon)", "icon": "scales",
+                "section": "GRID",
+                "simulation": {"mode": "mpc_scalar", "field": "baseline_cost_eur",
+                               "unit": "\u20ac", "decimals": 2, "color": "#64748b"},
+            },
+            {
+                "id": "cost_saving", "name": "MPC Saving (horizon)", "icon": "leaf",
                 "section": "GRID",
                 "simulation": {"mode": "mpc_scalar", "field": "cost_saving_eur",
-                               "unit": "\u20ac", "decimals": 3, "color": "#16a34a"},
+                               "unit": "\u20ac", "decimals": 2, "color": "#16a34a"},
             },
         ]
 
@@ -445,6 +471,22 @@ class ScadaWindow(QMainWindow):
         norm_out = self._normalise_tags(output_tags)
         self._register_definitions("input",  norm_in)
         self._register_definitions("output", norm_out)
+
+        # Force-recalc button — above local time
+        recalc_btn = QPushButton("\u21bb  Force LP Recalculation")
+        recalc_btn.setMinimumHeight(38)
+        recalc_btn.setStyleSheet(
+            "QPushButton { background-color: #b45309; color: white; "
+            "border: 1px solid #92400e; border-radius: 8px; "
+            "padding: 8px 14px; font-size: 10pt; font-weight: 700; outline: none; } "
+            "QPushButton:hover { background-color: #d97706; } "
+            "QPushButton:pressed { background-color: #92400e; } "
+            "QPushButton:focus { background-color: #b45309; } "
+            "QPushButton:disabled { background-color: #78716c; color: #d6d3d1; }"
+        )
+        recalc_btn.clicked.connect(self._force_lp_recalc)
+        self._recalc_btn = recalc_btn
+        self.input_content.layout().addWidget(recalc_btn)
 
         self._add_price_widgets(self.input_content)
         self._add_grouped_tags(
@@ -520,6 +562,7 @@ class ScadaWindow(QMainWindow):
         # Price graph card
         self.center_price_graph_label = self._graph_card(
             lay, "Price Graph (48h)", "Loading price graph\u2026",
+            height=240,
         )
         # Solar graph card
         self.center_solar_graph_label = self._graph_card(
@@ -584,19 +627,12 @@ class ScadaWindow(QMainWindow):
 
         lay.addWidget(slider_card)
 
-        # Historical analysis button
-        hist_btn = QPushButton("Historical LP Analysis")
-        hist_btn.setMinimumHeight(44)
-        hist_btn.setStyleSheet(HISTORICAL_BUTTON_STYLE)
-        hist_btn.clicked.connect(self._open_historical)
-        lay.addWidget(hist_btn)
-
-        # Future simulation button
-        future_btn = QPushButton("Future LP Simulation")
-        future_btn.setMinimumHeight(44)
-        future_btn.setStyleSheet(FUTURE_BUTTON_STYLE)
-        future_btn.clicked.connect(self._open_future)
-        lay.addWidget(future_btn)
+        # Unified analysis & simulation button
+        analysis_btn = QPushButton("Analysis & Simulation")
+        analysis_btn.setMinimumHeight(44)
+        analysis_btn.setStyleSheet(HISTORICAL_BUTTON_STYLE)
+        analysis_btn.clicked.connect(self._open_analysis)
+        lay.addWidget(analysis_btn)
 
         lay.addStretch()
 
@@ -930,7 +966,7 @@ class ScadaWindow(QMainWindow):
                     sel_idx = i
                     break
 
-        # Price graph — map price_rows onto the shared timeline
+        # Price graph — map price_rows onto the shared timeline, add overlays for asset schedules
         if self.center_price_graph_label is not None:
             price_map: dict = {}
             for ts, p, _ in dm.price_rows:
@@ -943,17 +979,53 @@ class ScadaWindow(QMainWindow):
                 if key in price_map:
                     last_p = price_map[key]
                 prices.append(last_p if last_p is not None else float("nan"))
+
+            # --- Build overlays for all major electric/flexible/thermal assets ---
+            H    = self.lp.mpc_cfg.horizon_steps  # typically 96
+            dt_h = self.lp.mpc_cfg.dt_hours        # step duration [h]
+            _n_sub = max(1, round(dt_h * 60 / INTERVAL_MINUTES))
+            n_steps = n_steps_48h
+            def _plan_48h_from_asset_sched(key, scale=1.0):
+                arr = [0.0] * n_steps
+                for offs, out in ((0, self.last_lp_outputs), (96, self.last_lp_next_day_outputs)):
+                    if out is None:
+                        continue
+                    sched = out.asset_schedules.get(key)
+                    if sched is None:
+                        continue
+                    for j, v in enumerate(sched):
+                        for s in range(_n_sub):
+                            idx = offs + j * _n_sub + s
+                            if idx < n_steps:
+                                arr[idx] = float(v) * scale
+                return arr
+
+            # Only electricity consumers (assets that draw grid/battery power)
+            # Convert kWh/step → kW (÷ dt_h)
+            _kw_factor = 1.0 / max(dt_h, 1e-9)
+            elec_asset_defs = [
+                {"key": "heat_pump",        "color": "#16a34a", "label": "Heat Pump"},
+                {"key": "battery_charge",   "color": "#0891b2", "label": "Battery Chg"},
+                {"key": "battery_discharge","color": "#f59e0b", "label": "Battery Dis"},
+                {"key": "flexible_load",    "color": "#7c3aed", "label": "Flex Load"},
+                {"key": "hot_water_tank",   "color": "#dc2626", "label": "Hot Water"},
+            ]
+            overlays = []
+            for aset in elec_asset_defs:
+                arr = _plan_48h_from_asset_sched(aset["key"], scale=_kw_factor)
+                overlays.append({"array": arr, "color": aset["color"], "label": aset["label"]})
+
             gw = max(self.center_price_graph_label.width(), 300)
-            gh = self.center_price_graph_label.height() or 200
+            gh = self.center_price_graph_label.height() or 240
             self.center_price_graph_label.setPixmap(
                 draw_price_graph(prices, start_label, end_label,
-                                 now_idx, sel_idx, gw, gh),
+                                 now_idx, sel_idx, gw, gh, overlays=overlays),
             )
             # Slider range: from midnight (negative) to end of tomorrow (positive)
             if now_idx is not None:
                 max_future = n_steps_48h - 1 - now_idx
                 min_past   = -now_idx
-                if self.slot_slider.maximum() != max_future:
+                if self.slot_slider.maximum() != max(max_future, 1):
                     self.slot_slider.setMaximum(max(max_future, 1))
                 if self.slot_slider.minimum() != min_past:
                     self.slot_slider.setMinimum(min_past)
@@ -1043,6 +1115,24 @@ class ScadaWindow(QMainWindow):
                 self.last_lp_outputs.building_setpoint_c
                 if self.last_lp_outputs is not None else 21.0
             )
+
+            # Per-step comfort-bound schedules (shows night setback transitions)
+            _mcfg = self.lp.mpc_cfg
+            tmin_sched: list[float] = []
+            tmax_sched: list[float] = []
+            for _i in range(n_steps_48h):
+                _hour = (_i * INTERVAL_MINUTES / 60.0) % 24.0
+                if _mcfg.use_night_setback and (
+                    _hour >= _mcfg.night_start_h or _hour < _mcfg.night_end_h
+                ):
+                    tmin_sched.append(_mcfg.T_set_night_c)
+                    tmax_sched.append(
+                        _mcfg.T_cool_night_c if _mcfg.cooling_enabled else _mcfg.Tmax_c
+                    )
+                else:
+                    tmin_sched.append(_mcfg.Tmin_c)
+                    tmax_sched.append(_mcfg.Tmax_c)
+
             gw = max(self.center_temp_graph_label.width(), 300)
             gh = self.center_temp_graph_label.height() or 280
             self.center_temp_graph_label.setPixmap(
@@ -1050,6 +1140,8 @@ class ScadaWindow(QMainWindow):
                     temp_values, bld_temps, setpoint,
                     heat_hp_kw, heat_boiler_kw, heat_chp_kw,
                     start_label, end_label, now_idx, sel_idx, gw, gh,
+                    tmin_schedule=tmin_sched,
+                    tmax_schedule=tmax_sched,
                 ),
             )
 
@@ -1065,6 +1157,23 @@ class ScadaWindow(QMainWindow):
                 self.center_solar_value_label.setText(
                     f"{dm.current_power_kw:.1f} kW",
                 )
+
+    # ------------------------------------------------------------------
+    # Force LP recalculation
+    # ------------------------------------------------------------------
+
+    def _force_lp_recalc(self):
+        """Reset the LP slot guard and re-submit a solve immediately."""
+        if getattr(self, "_lp_async_result", None) is not None:
+            # A solve is already in flight — ignore the click
+            return
+        self.lp_last_slot = None          # clear guard so _run_lp_if_needed proceeds
+        btn = getattr(self, "_recalc_btn", None)
+        if btn:
+            btn.setEnabled(False)
+            btn.setText("\u23f3  Solving\u2026")
+        self._run_lp_if_needed()
+        # Button is re-enabled inside _collect_lp_result after the result arrives
 
     # ------------------------------------------------------------------
     # Clock
@@ -1105,18 +1214,37 @@ class ScadaWindow(QMainWindow):
         try:
             result = self._lp_async_result.get()
             self.last_lp_outputs = result
+            # Advance tracked building/HW temperature to the current slot so
+            # the next LP call uses the correct receding-horizon initial state.
+            _plan_t = getattr(result, "plan_building_temp_c", None)
+            if _plan_t is not None and len(_plan_t) > self._lp_now_idx:
+                self._building_temp_c = float(_plan_t[self._lp_now_idx])
+            elif _plan_t is not None and len(_plan_t) > 0:
+                self._building_temp_c = float(_plan_t[-1])
+            _plan_hw = getattr(result, "plan_hw_temp_c", None)
+            if _plan_hw is not None and len(_plan_hw) > self._lp_now_idx:
+                self._hw_temp_c = float(_plan_hw[self._lp_now_idx])
+            elif _plan_hw is not None and len(_plan_hw) > 0:
+                self._hw_temp_c = float(_plan_hw[-1])
             # Reset next-day date guard so it re-solves with the updated
             # end-of-day temperature as the correct initial condition.
             self._nd_lp_last_date = None
             logger.info(
-                "LP result collected: status=%s solver=%s",
+                "LP result collected: status=%s solver=%s bld_temp=%.1f°C hw_temp=%.1f°C",
                 getattr(result, "solver_status", "?"),
                 getattr(result, "solver_used", "?"),
+                self._building_temp_c,
+                self._hw_temp_c,
             )
         except Exception as exc:
             logger.warning("LP result error: %s", exc)
         finally:
             self._lp_async_result = None
+            # Re-enable the force-recalc button now that the solve has finished
+            btn = getattr(self, "_recalc_btn", None)
+            if btn:
+                btn.setEnabled(True)
+                btn.setText("\u21bb  Force LP Recalculation")
 
     def _run_lp_if_needed(self):
         """Run the LP solver at the start of each new 15-minute interval.
@@ -1179,9 +1307,9 @@ class ScadaWindow(QMainWindow):
                 base_load,
                 solar_kwh,
                 month,
-                _cfg.T_init_c,
+                self._building_temp_c,   # receding-horizon: updated from last result
                 outside_temp,
-                _cfg.hw_T_init_c,
+                self._hw_temp_c,         # receding-horizon: updated from last result
             )
             self._lp_submit_time = __import__("time").monotonic()
             logger.info("LP worker subprocess started")
@@ -1565,11 +1693,8 @@ class ScadaWindow(QMainWindow):
     # Dialogs / popups
     # ------------------------------------------------------------------
 
-    def _open_historical(self):
-        HistoricalAnalysisDialog(self).exec()
-
-    def _open_future(self):
-        FutureSimulationDialog(self).exec()
+    def _open_analysis(self):
+        AnalysisDialog(self).exec()
 
     def _open_building_settings(self):
         """Open MPC Settings dialog for general building & solver configuration."""

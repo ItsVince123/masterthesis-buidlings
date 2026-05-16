@@ -35,10 +35,10 @@ import numpy as np
 import getPrice
 import getWeather
 import predict
+from dashboard_config import load_dashboard_config
 from settings import (
     DASHBOARD_DIR, DAILY_FETCH_HOUR, DEFAULT_LATITUDE, DEFAULT_LONGITUDE,
-    INTERVAL_MINUTES, LOCAL_TZ, PREDICT_CSV, SOLAR_CAPACITY_KWP,
-    WEATHER_CSV,
+    INTERVAL_MINUTES, LOCAL_TZ, PREDICT_CSV, WEATHER_CSV,
 )
 
 logger = logging.getLogger(__name__)
@@ -224,14 +224,11 @@ class DataManager:
 
         BASE LOAD MODEL
         ---------------
-        Building consumption is modelled as a flat constant at *base_kw* during
-        night hours (outside 06:00–18:00) and a sinusoidal ramp up to *peak_kw*
-        during daytime.  Both values are configured in the Building tab of the
-        MPC Settings dialog (smpc.building.base_load_kw / peak_load_kw).
-
-        Set base_load_kw = peak_load_kw to use a flat constant profile.
-        Set both to 0 if you have no load to model (optimiser only covers HVAC
-        and hot-water heating driven by the thermal sub-model).
+        Building consumption uses a fixed two-level profile:
+        - Day   (07:00–22:00): *peak_kw*
+        - Night (22:00–07:00): *base_kw*
+        Both values are configured in the Building tab of the MPC Settings dialog
+        (smpc.building.base_load_kw / peak_load_kw).
 
         SOLAR
         -----
@@ -242,22 +239,17 @@ class DataManager:
         """
         dt_min = dt_hours * 60.0                          # MPC step in minutes
         n_sub  = max(1, round(dt_min / INTERVAL_MINUTES)) # 15-min sub-slots per MPC step
-        start_h = slot.hour + slot.minute / 60.0
 
         base_load = np.zeros(horizon)
+        for t in range(horizon):
+            step_time = slot + timedelta(minutes=t * dt_min)
+            hour = step_time.hour + step_time.minute / 60.0
+            load_kw = peak_kw if 7.0 <= hour < 22.0 else base_kw
+            base_load[t] = load_kw * dt_hours
+
         solar = np.zeros(horizon)
 
         for t in range(horizon):
-            h = (start_h + t * dt_hours) % 24            # fractional hour at step start
-            if 6.0 <= h <= 18.0:
-                kw = base_kw + (peak_kw - base_kw) * max(
-                    0.0, np.sin(np.pi * (h - 6.0) / 12.0),
-                )
-            else:
-                kw = base_kw
-            base_load[t] = kw * dt_hours                 # kWh per MPC step
-
-            # Aggregate sub-slot solar kWh into one MPC-step total
             kwh_sum = 0.0
             for s in range(n_sub):
                 offset_min = int(t * dt_min + s * INTERVAL_MINUTES)
@@ -396,7 +388,9 @@ class DataManager:
         try:
             rows = predict.read_weather_csv(WEATHER_CSV)
             if rows:
-                predict.export_predictions(rows, PREDICT_CSV, SOLAR_CAPACITY_KWP)
+                _cfg = load_dashboard_config()
+                _cap = float(_cfg.get("mpc", {}).get("pv", {}).get("capacity_kwp", 1.0))
+                predict.export_predictions(rows, PREDICT_CSV, _cap)
         except Exception as exc:
             logger.warning("Predict pipeline: %s", exc)
 

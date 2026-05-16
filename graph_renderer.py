@@ -45,6 +45,7 @@ def draw_series_graph(
     line_color    – hex colour for the data line.
     current_index – if set, draws a vertical red "Now" marker at that index.
     """
+
     pixmap = QPixmap(width, height)
     pixmap.fill(QColor("#f8fbff"))
 
@@ -119,6 +120,7 @@ def draw_series_graph(
         arrow_w = fm.horizontalAdvance("\u25bc")
         painter.drawText(x_sel - arrow_w // 2, pad_t + 12, "\u25bc")
 
+
     # Axis labels
     text_pen = QPen(QColor("#334155"))
     painter.setPen(text_pen)
@@ -142,13 +144,153 @@ def draw_price_graph(
     current_index: int | None = None,
     selected_index: int | None = None,
     width: int = 420,
-    height: int = 200,
+    height: int = 240,
+    overlays: list[dict] = None,
 ) -> QPixmap:
-    """Line graph styled for electricity prices (blue)."""
-    return draw_series_graph(
-        prices, "EUR/MWh", start_label, end_label, "#1d4ed8", current_index,
-        selected_index, width, height,
-    )
+    """Dual-axis step-line price graph.
+
+    Left  Y-axis (EUR/MWh): electricity spot price (blue)
+    Right Y-axis (kW):      electrical asset loads from LP plan
+
+    overlays – list of dicts:  array (list[float] kW), color (str), label (str)
+    Only overlays with actual non-zero data are shown.
+    """
+    import math
+
+    def _clean(lst):
+        return [v if (v is not None and not math.isnan(v)) else None for v in lst]
+
+    n = max(len(prices), 1)
+    prices_c = _clean(prices)
+
+    # Keep only overlays that have at least one non-zero value
+    active_overlays = []
+    if overlays:
+        for ov in overlays:
+            arr = ov.get("array", [])
+            arr_c = _clean(arr)
+            if any(v is not None and v > 0.05 for v in arr_c):
+                active_overlays.append({**ov, "array": arr_c})
+
+    pixmap = QPixmap(width, height)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setBackgroundMode(Qt.BGMode.TransparentMode)
+
+    pad_l, pad_r, pad_t, pad_b = 54, 50, 22, 36
+    dw = width  - pad_l - pad_r
+    dh = height - pad_t - pad_b
+    slot_w = dw / max(n, 1)
+
+    # Left Y scale: EUR/MWh
+    all_p = [v for v in prices_c if v is not None]
+    p_min = (min(all_p) - 5.0) if all_p else 0.0
+    p_max = (max(all_p) + 5.0) if all_p else 100.0
+    p_span = max(p_max - p_min, 1e-6)
+
+    def ly_p(v: float) -> int:
+        return int(pad_t + dh - (v - p_min) / p_span * dh)
+
+    # Right Y scale: kW
+    all_kw = [v for ov in active_overlays for v in ov["array"] if v is not None]
+    kw_max = max(max(all_kw) * 1.15, 1.0) if all_kw else 1.0
+
+    def ry_kw(v: float) -> int:
+        return int(pad_t + dh - v / kw_max * dh)
+
+    # Grid lines
+    grid_pen = QPen(QColor("#e2ecf7"))
+    grid_pen.setWidth(1)
+    painter.setPen(grid_pen)
+    for i in range(5):
+        y = int(pad_t + i * dh / 4)
+        painter.drawLine(pad_l, y, width - pad_r, y)
+
+    # Step-line helper
+    def _draw_step_line(series, y_fn, pen):
+        painter.setPen(pen)
+        prev = None
+        for i in range(n):
+            v = series[i] if i < len(series) else None
+            x0 = int(pad_l + i * slot_w)
+            x1 = int(pad_l + (i + 1) * slot_w)
+            if v is not None:
+                y = y_fn(v)
+                painter.drawLine(x0, y, x1, y)
+                if prev is not None:
+                    painter.drawLine(x0, y_fn(prev), x0, y)
+            prev = v if v is not None else prev
+
+    # Draw electrical load lines (right axis) first (behind price)
+    for ov in active_overlays:
+        _draw_step_line(ov["array"], ry_kw, QPen(QColor(ov["color"]), 2))
+
+    # Draw price line (left axis) on top
+    _draw_step_line(prices_c, ly_p, QPen(QColor("#1d4ed8"), 2))
+
+    # Now marker
+    if current_index is not None and 0 <= current_index < n:
+        now_pen = QPen(QColor("#dc2626"), 2)
+        painter.setPen(now_pen)
+        x_now = int(pad_l + current_index * slot_w)
+        painter.drawLine(x_now, pad_t, x_now, height - pad_b)
+        painter.setPen(QPen(QColor("#dc2626")))
+        painter.drawText(x_now + 3, pad_t + 11, "Now")
+
+    # Selected-slot marker
+    if selected_index is not None and 0 <= selected_index < n:
+        sel_pen = QPen(QColor("#7c3aed"), 2)
+        sel_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(sel_pen)
+        x_sel = int(pad_l + selected_index * slot_w)
+        painter.drawLine(x_sel, pad_t, x_sel, height - pad_b)
+        painter.setPen(QPen(QColor("#7c3aed")))
+        fm = painter.fontMetrics()
+        painter.drawText(x_sel - fm.horizontalAdvance("\u25bc") // 2, pad_t + 11, "\u25bc")
+
+    # Axis tick labels
+    text_pen = QPen(QColor("#475569"))
+    painter.setPen(text_pen)
+    fm = painter.fontMetrics()
+    # Left: €/MWh unit label — drawn above top tick, right-aligned to axis
+    unit_txt = "\u20ac/MWh"
+    painter.drawText(pad_l - fm.horizontalAdvance(unit_txt) - 2, pad_t - 2, unit_txt)
+    for frac, val in ((0.0, p_max), (0.5, (p_max + p_min) / 2), (1.0, p_min)):
+        y = int(pad_t + frac * dh)
+        lbl = f"{val:.0f}"
+        painter.drawText(pad_l - fm.horizontalAdvance(lbl) - 3, y + 4, lbl)
+    # Right: kW
+    for frac, val in ((0.0, kw_max), (0.5, kw_max / 2), (1.0, 0.0)):
+        y = int(pad_t + frac * dh)
+        painter.drawText(width - pad_r + 3, y + 4, f"{val:.0f}kW")
+
+    # Border
+    border_pen = QPen(QColor("#cbd5e1"), 1)
+    painter.setPen(border_pen)
+    painter.drawLine(pad_l, pad_t, pad_l, height - pad_b)
+    painter.drawLine(pad_l, height - pad_b, width - pad_r, height - pad_b)
+    painter.drawLine(width - pad_r, pad_t, width - pad_r, height - pad_b)
+
+    # Legend
+    legend_items = [("#1d4ed8", "Price")] + [(ov["color"], ov["label"]) for ov in active_overlays]
+    painter.setPen(text_pen)
+    lx = pad_l
+    ly = height - 6
+    for col, label in legend_items:
+        painter.fillRect(lx, ly - 8, 14, 4, QColor(col))
+        painter.drawText(lx + 17, ly, label)
+        lx += 17 + fm.horizontalAdvance(label) + 10
+        if lx + 50 > width - pad_r:
+            break
+
+    # Time labels
+    painter.setPen(QPen(QColor("#94a3b8")))
+    painter.drawText(pad_l, height - pad_b + 12, start_label)
+    painter.drawText(width - pad_r - fm.horizontalAdvance(end_label), height - pad_b + 12, end_label)
+
+    painter.end()
+    return pixmap
 
 
 def draw_solar_graph(
@@ -196,6 +338,8 @@ def draw_thermal_graph(
     selected_index: int | None = None,
     width: int = 420,
     height: int = 280,
+    tmin_schedule: list[float] | None = None,
+    tmax_schedule: list[float] | None = None,
 ) -> QPixmap:
     """Dual-axis step-line graph: temperatures (left °C) + heating sources (right kW).
 
@@ -235,6 +379,10 @@ def draw_thermal_graph(
 
     # ── Left Y scale: °C ──────────────────────────────────────────────
     all_t = [v for v in out_t + bld_t if v is not None] + [setpoint_c]
+    if tmin_schedule:
+        all_t += [v for v in tmin_schedule if v is not None]
+    if tmax_schedule:
+        all_t += [v for v in tmax_schedule if v is not None]
     t_min = (min(all_t) - 2.0) if all_t else -5.0
     t_max = (max(all_t) + 2.0) if all_t else 30.0
     t_span = max(t_max - t_min, 1e-6)
@@ -273,13 +421,26 @@ def draw_thermal_graph(
                     painter.drawLine(x0, y_fn(prev), x0, y)  # vertical step
             prev = v if v is not None else prev          # forward-fill across gaps
 
-    # ── Setpoint dashed line ──────────────────────────────────────────
-    sp_pen = QPen(QColor("#94a3b8"))
-    sp_pen.setWidth(1)
-    sp_pen.setStyle(Qt.PenStyle.DashLine)
-    painter.setPen(sp_pen)
-    y_sp = ly_t(setpoint_c)
-    painter.drawLine(pad_l, y_sp, width - pad_r, y_sp)
+    # ── Setpoint dashed line (only when no per-step schedule provided) ─
+    if not tmin_schedule and not tmax_schedule:
+        sp_pen = QPen(QColor("#94a3b8"))
+        sp_pen.setWidth(1)
+        sp_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(sp_pen)
+        y_sp = ly_t(setpoint_c)
+        painter.drawLine(pad_l, y_sp, width - pad_r, y_sp)
+
+    # ── Comfort bound step-lines (night setback schedule) ────────────
+    if tmin_schedule:
+        _tmin_pen = QPen(QColor("#3b82f6"))
+        _tmin_pen.setWidth(1)
+        _tmin_pen.setStyle(Qt.PenStyle.DashLine)
+        _draw_step_line(tmin_schedule, ly_t, _tmin_pen)
+    if tmax_schedule:
+        _tmax_pen = QPen(QColor("#f43f5e"))
+        _tmax_pen.setWidth(1)
+        _tmax_pen.setStyle(Qt.PenStyle.DashLine)
+        _draw_step_line(tmax_schedule, ly_t, _tmax_pen)
 
     # ── Heating lines (right axis) ────────────────────────────────────
     _draw_step_line(chp_kw, ry_kw, QPen(QColor("#f59e0b"), 2))
@@ -333,7 +494,15 @@ def draw_thermal_graph(
     series_legend = [
         ("#0d9488", "Out °C"),
         ("#f97316", "Bld °C"),
-        ("#94a3b8", "Setpoint"),
+    ]
+    if tmin_schedule or tmax_schedule:
+        if tmin_schedule:
+            series_legend.append(("#3b82f6", "T\u2098\u1d35\u207f"))
+        if tmax_schedule:
+            series_legend.append(("#f43f5e", "T\u2098\u1d43\u02e3"))
+    else:
+        series_legend.append(("#94a3b8", "Setpoint"))
+    series_legend += [
         ("#16a34a", "HP"),
         ("#ef4444", "Boiler"),
         ("#f59e0b", "CHP"),

@@ -208,7 +208,7 @@ class FutureSimulationDialog(QDialog):
             name.setStyleSheet("font-weight: 600; border: none;")
             val = QLabel("--")
             val.setStyleSheet(
-                "font-family: 'Consolas'; font-weight: 700;"
+                "font-family: 'Calibri'; font-weight: 700;"
                 " color: #0f766e; border: none;"
             )
             row.addWidget(name)
@@ -406,7 +406,7 @@ class FutureSimulationDialog(QDialog):
         for lbl in self.kpi_labels.values():
             lbl.setText("--")
             lbl.setStyleSheet(
-                "font-family: 'Consolas'; font-weight: 700;"
+                "font-family: 'Calibri'; font-weight: 700;"
                 " color: #0f766e; border: none;"
             )
         self._remove_asset_kpi_widgets()
@@ -437,7 +437,7 @@ class FutureSimulationDialog(QDialog):
             name_lbl.setStyleSheet("font-weight: 600; border: none;")
             val_lbl = QLabel(value_text)
             val_lbl.setStyleSheet(
-                f"font-family: 'Consolas'; font-weight: 700;"
+                f"font-family: 'Calibri'; font-weight: 700;"
                 f" color: {colour}; border: none;"
             )
             row.addWidget(name_lbl)
@@ -523,7 +523,7 @@ class FutureSimulationDialog(QDialog):
 
         colour = "#16a34a" if saving >= 0 else "#dc2626"
         coloured = (
-            f"font-family: 'Consolas'; font-weight: 700;"
+            f"font-family: 'Calibri'; font-weight: 700;"
             f" color: {colour}; border: none;"
         )
 
@@ -539,7 +539,7 @@ class FutureSimulationDialog(QDialog):
         heat_pct  = results.get("heating_saving_pct", 0.0)
         heat_colour = "#16a34a" if heat_save >= 0 else "#dc2626"
         heat_coloured = (
-            f"font-family: 'Consolas'; font-weight: 700;"
+            f"font-family: 'Calibri'; font-weight: 700;"
             f" color: {heat_colour}; border: none;"
         )
         self.kpi_labels["heating_saving"].setText(f"\u20ac{heat_save:.2f}")
@@ -551,7 +551,7 @@ class FutureSimulationDialog(QDialog):
         hw_pct  = results.get("hw_saving_pct",  0.0)
         hw_colour = "#16a34a" if hw_save >= 0 else "#dc2626"
         hw_coloured = (
-            f"font-family: 'Consolas'; font-weight: 700;"
+            f"font-family: 'Calibri'; font-weight: 700;"
             f" color: {hw_colour}; border: none;"
         )
         self.kpi_labels["hw_saving"].setText(f"\u20ac{hw_save:.2f}")

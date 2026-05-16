@@ -218,7 +218,7 @@ class HistoricalAnalysisDialog(QDialog):
             name.setStyleSheet("font-weight: 600; border: none;")
             val = QLabel("--")
             val.setStyleSheet(
-                "font-family: 'Consolas'; font-weight: 700;"
+                "font-family: 'Calibri'; font-weight: 700;"
                 " color: #0f766e; border: none;"
             )
             row.addWidget(name)
@@ -362,7 +362,7 @@ class HistoricalAnalysisDialog(QDialog):
         for lbl in self.kpi_labels.values():
             lbl.setText("--")
             lbl.setStyleSheet(
-                "font-family: 'Consolas'; font-weight: 700;"
+                "font-family: 'Calibri'; font-weight: 700;"
                 " color: #0f766e; border: none;"
             )
         self._remove_asset_kpi_widgets()
@@ -571,7 +571,7 @@ class HistoricalAnalysisDialog(QDialog):
 
         colour = "#16a34a" if saving >= 0 else "#dc2626"
         coloured = (
-            f"font-family: 'Consolas'; font-weight: 700;"
+            f"font-family: 'Calibri'; font-weight: 700;"
             f" color: {colour}; border: none;"
         )
 
@@ -590,7 +590,7 @@ class HistoricalAnalysisDialog(QDialog):
         )
         co2_colour = "#16a34a" if co2_kg >= 0 else "#dc2626"
         co2_styled = (
-            f"font-family: 'Consolas'; font-weight: 700;"
+            f"font-family: 'Calibri'; font-weight: 700;"
             f" color: {co2_colour}; border: none;"
         )
         self.kpi_labels["co2_saved"].setText(f"{co2_kg:.2f} kg CO\u2082")
@@ -602,7 +602,7 @@ class HistoricalAnalysisDialog(QDialog):
         heat_pct  = results.get("heating_saving_pct", 0.0)
         heat_colour = "#16a34a" if heat_save >= 0 else "#dc2626"
         heat_styled = (
-            f"font-family: 'Consolas'; font-weight: 700;"
+            f"font-family: 'Calibri'; font-weight: 700;"
             f" color: {heat_colour}; border: none;"
         )
         self.kpi_labels["heating_saving"].setText(f"\u20ac{heat_save:.2f}")
@@ -614,7 +614,7 @@ class HistoricalAnalysisDialog(QDialog):
         hw_pct  = results.get("hw_saving_pct",  0.0)
         hw_colour = "#16a34a" if hw_save >= 0 else "#dc2626"
         hw_styled = (
-            f"font-family: 'Consolas'; font-weight: 700;"
+            f"font-family: 'Calibri'; font-weight: 700;"
             f" color: {hw_colour}; border: none;"
         )
         self.kpi_labels["hw_saving"].setText(f"\u20ac{hw_save:.2f}")
@@ -648,7 +648,7 @@ class HistoricalAnalysisDialog(QDialog):
             name_lbl.setStyleSheet("font-weight: 600; border: none;")
             val_lbl = QLabel(value_text)
             val_lbl.setStyleSheet(
-                f"font-family: 'Consolas'; font-weight: 700;"
+                f"font-family: 'Calibri'; font-weight: 700;"
                 f" color: {colour}; border: none;"
             )
             row.addWidget(name_lbl)
@@ -893,12 +893,12 @@ class HistoricalAnalysisDialog(QDialog):
 
         colour = "#16a34a" if saving >= 0 else "#dc2626"
         coloured = (
-            f"font-family: 'Consolas'; font-weight: 700;"
+            f"font-family: 'Calibri'; font-weight: 700;"
             f" color: {colour}; border: none;"
         )
         co2_colour = "#16a34a" if co2_saved_kg >= 0 else "#dc2626"
         co2_styled = (
-            f"font-family: 'Consolas'; font-weight: 700;"
+            f"font-family: 'Calibri'; font-weight: 700;"
             f" color: {co2_colour}; border: none;"
         )
 
@@ -916,7 +916,7 @@ class HistoricalAnalysisDialog(QDialog):
 
         heat_colour = "#16a34a" if total_heating_saving >= 0 else "#dc2626"
         heat_styled = (
-            f"font-family: 'Consolas'; font-weight: 700;"
+            f"font-family: 'Calibri'; font-weight: 700;"
             f" color: {heat_colour}; border: none;"
         )
         heat_pct = (
@@ -930,7 +930,7 @@ class HistoricalAnalysisDialog(QDialog):
 
         hw_colour = "#16a34a" if total_hw_saving >= 0 else "#dc2626"
         hw_styled = (
-            f"font-family: 'Consolas'; font-weight: 700;"
+            f"font-family: 'Calibri'; font-weight: 700;"
             f" color: {hw_colour}; border: none;"
         )
         hw_pct = (
