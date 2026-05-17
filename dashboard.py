@@ -1212,27 +1212,15 @@ class ScadaWindow(QMainWindow):
         try:
             result = self._lp_async_result.get()
             self.last_lp_outputs = result
-            # Advance tracked building/HW temperature to the current slot so
-            # the next LP call uses the correct receding-horizon initial state.
-            _plan_t = getattr(result, "plan_building_temp_c", None)
-            if _plan_t is not None and len(_plan_t) > self._lp_now_idx:
-                self._building_temp_c = float(_plan_t[self._lp_now_idx])
-            elif _plan_t is not None and len(_plan_t) > 0:
-                self._building_temp_c = float(_plan_t[-1])
-            _plan_hw = getattr(result, "plan_hw_temp_c", None)
-            if _plan_hw is not None and len(_plan_hw) > self._lp_now_idx:
-                self._hw_temp_c = float(_plan_hw[self._lp_now_idx])
-            elif _plan_hw is not None and len(_plan_hw) > 0:
-                self._hw_temp_c = float(_plan_hw[-1])
-            # Reset next-day date guard so it re-solves with the updated
-            # end-of-day temperature as the correct initial condition.
+            # Keep today's solve deterministic: the horizon starts at midnight,
+            # so forcing a recalculation should not overwrite midnight initial
+            # states with "current" temperatures from an already-solved plan.
+            # This avoids 00:00 temperature jumps and KPI sign flips on recalc.
             self._nd_lp_last_date = None
             logger.info(
-                "LP result collected: status=%s solver=%s bld_temp=%.1f°C hw_temp=%.1f°C",
+                "LP result collected: status=%s solver=%s",
                 getattr(result, "solver_status", "?"),
                 getattr(result, "solver_used", "?"),
-                self._building_temp_c,
-                self._hw_temp_c,
             )
         except Exception as exc:
             logger.warning("LP result error: %s", exc)
@@ -1305,9 +1293,9 @@ class ScadaWindow(QMainWindow):
                 base_load,
                 solar_kwh,
                 month,
-                self._building_temp_c,   # receding-horizon: updated from last result
+                _cfg.T_init_c,      # midnight-anchored plan uses midnight initial temp
                 outside_temp,
-                self._hw_temp_c,         # receding-horizon: updated from last result
+                _cfg.hw_T_init_c,   # midnight-anchored plan uses midnight HW temp
             )
             self._lp_submit_time = __import__("time").monotonic()
             logger.info("LP worker subprocess started")

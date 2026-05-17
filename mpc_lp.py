@@ -1103,7 +1103,7 @@ def _solve_cvxpy(
     _T_ub_k = np.empty(H)
     for _k in range(H):
         _T_lb_k[_k], _T_ub_k[_k] = _active_comfort_bounds(_k, dt, cfg, start_hour=start_hour)
-    _eff_lb = np.minimum(_T_lb_k, _T_max_r[1:])   # tightest lb still feasible
+    _eff_lb = np.maximum(_T_lb_k, _T_min_r[1:])   # enforce comfort floor unless physically impossible
     _eff_ub = np.maximum(_T_ub_k, _T_min_r[1:])   # tightest ub still feasible
     constraints.append(Tbuilding[1:] >= _eff_lb)
     constraints.append(Tbuilding[1:] <= _eff_ub)
@@ -1678,8 +1678,10 @@ def solve_mpc(inputs: MPCInputs, cfg: MPCConfig) -> MPCOutputs:
     t0 = time.perf_counter()
     H  = cfg.horizon_steps
     dt = cfg.dt_hours
-    _now = time.localtime()
-    start_hour = _now.tm_hour + (_now.tm_min / 60.0) + (_now.tm_sec / 3600.0)
+    # Dashboard and analysis workflows build horizons from local midnight.
+    # Keep setback schedule aligned to that shared timeline so graph overlays
+    # and comfort constraints reference the same wall-clock steps.
+    start_hour = 0.0
 
     # ── Ensure all input arrays are padded/clipped to length H ────────────
     def _pad(arr: np.ndarray, fill: float = 0.0) -> np.ndarray:

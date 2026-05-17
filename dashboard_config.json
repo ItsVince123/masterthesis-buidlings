@@ -176,7 +176,7 @@
       "Tset_c": 21.0,
       "Tmin_c": 21.0,
       "Tmax_c": 22.0,
-      "T_init_c": 21.0,
+      "T_init_c": 18.0,
       "Cth_kwh_per_c": 200.0,
       "UA_kw_per_c": 20.0,
       "use_night_setback": true,
