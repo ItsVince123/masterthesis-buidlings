@@ -1,12 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  BACKEND FILE — student is responsible for this module           ║
-║                                                                  ║
-║  THIS IS THE CORE THESIS ALGORITHM                               ║
-║  Stochastic Model Predictive Control (SMPC) optimiser for        ║
-║  building energy management.                                     ║
-╚══════════════════════════════════════════════════════════════════╝
-
 smpc_calculator.py — SMPC Live Calculator
 ==========================================
 Single-solve Stochastic MPC that the dashboard calls every control interval.
@@ -1126,6 +1118,10 @@ class SMPCCalculator:
         if cfg.hp_enabled:
             asset_power["heat_pump"]   = mpc.Php_kw
             asset_sched["heat_pump"]   = mpc.plan_Php * dt
+            # HP cooling (reverse-cycle). Exposed as a separate schedule so the
+            # dashboard thermal chart can plot it alongside heating sources.
+            if cfg.cooling_enabled and len(mpc.plan_Php_cool):
+                asset_sched["heat_pump_cool"] = mpc.plan_Php_cool * dt
         if cfg.boiler_enabled:
             asset_power["gas_boiler"]  = mpc.Pgas_kw
             asset_sched["gas_boiler"]  = mpc.plan_Pgas * dt
@@ -1140,6 +1136,12 @@ class SMPCCalculator:
         if cfg.flex_enabled:
             asset_power["flexible_load"] = mpc.Pflex_kw
             asset_sched["flexible_load"] = plan_flex
+            # Per-instance keys so the dashboard can render one overlay per
+            # flex load instead of collapsing them into a single purple line.
+            for _fid, _arr in (mpc.plan_Pflex_by_id or {}).items():
+                asset_sched[f"flexible_load:{_fid}"] = _arr * dt
+            for _fid, _kw in (mpc.Pflex_by_id_kw or {}).items():
+                asset_power[f"flexible_load:{_fid}"] = _kw
         if cfg.hw_enabled:
             asset_power["hot_water_tank"] = mpc.Ptank_kw
             asset_sched["hot_water_tank"] = mpc.plan_Ptank * dt

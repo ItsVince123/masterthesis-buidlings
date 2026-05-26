@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import logging
 
-from PyQt6.QtCore import Qt, QTime
+from PyQt6.QtCore import Qt, QTime, pyqtSignal
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QFrame,
+    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea,
     QSizePolicy, QSpinBox, QTabWidget, QTimeEdit, QVBoxLayout, QWidget,
 )
@@ -33,6 +33,13 @@ from dashboard_config import load_dashboard_config, save_dashboard_config
 from mpc_lp import MPCConfig
 
 logger = logging.getLogger(__name__)
+
+# Arrow asset paths for QSpinBox / QDoubleSpinBox / QTimeEdit subcontrols.
+# Qt QSS requires forward slashes regardless of OS.
+import os as _os
+_ASSETS_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "assets")
+_ARROW_UP   = _os.path.join(_ASSETS_DIR, "arrow_up.svg").replace("\\", "/")
+_ARROW_DOWN = _os.path.join(_ASSETS_DIR, "arrow_down.svg").replace("\\", "/")
 
 # ── Styles ─────────────────────────────────────────────────────────────────
 
@@ -47,7 +54,25 @@ QTabBar::tab:selected { background: #7c3aed; color: white; font-weight: 700; }
 QLabel { color: #1f2937; font-family: 'Calibri'; font-size: 10pt; }
 QDoubleSpinBox, QSpinBox {
     background-color: #ffffff; border: 1px solid #d6dfeb;
-    border-radius: 6px; padding: 6px 10px; font-size: 10pt; min-height: 28px;
+    border-radius: 6px; padding: 6px 22px 6px 10px; font-size: 10pt; min-height: 28px;
+}
+QDoubleSpinBox::up-button, QSpinBox::up-button {
+    subcontrol-origin: border; subcontrol-position: top right;
+    width: 18px; border-left: 1px solid #d6dfeb;
+    border-top-right-radius: 6px; background: #f1f5f9;
+}
+QDoubleSpinBox::down-button, QSpinBox::down-button {
+    subcontrol-origin: border; subcontrol-position: bottom right;
+    width: 18px; border-left: 1px solid #d6dfeb; border-top: 1px solid #d6dfeb;
+    border-bottom-right-radius: 6px; background: #f1f5f9;
+}
+QDoubleSpinBox::up-button:hover, QSpinBox::up-button:hover,
+QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover { background: #e2e8f0; }
+QDoubleSpinBox::up-arrow, QSpinBox::up-arrow {
+    image: url(__ARROW_UP__); width: 10px; height: 6px;
+}
+QDoubleSpinBox::down-arrow, QSpinBox::down-arrow {
+    image: url(__ARROW_DOWN__); width: 10px; height: 6px;
 }
 QCheckBox { font-size: 10pt; color: #1f2937; }
 """
@@ -114,6 +139,37 @@ def _tab_scroll(widget: QWidget) -> QWidget:
     return outer
 
 
+_DAY_ABBREV = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _day_selector(selected) -> tuple:
+    """Build a horizontal row of 7 day checkboxes (Mon..Sun).
+
+    `selected` is a list/tuple of ints in {0..6} (Mon=0). If None or empty,
+    all days are checked (every day is active). Returns (container, boxes).
+    """
+    if selected is None or not list(selected):
+        sel_set = {0, 1, 2, 3, 4, 5, 6}
+    else:
+        sel_set = {int(d) % 7 for d in selected}
+    boxes = []
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(6)
+    for i, lbl in enumerate(_DAY_ABBREV):
+        cb = QCheckBox(lbl)
+        cb.setChecked(i in sel_set)
+        # Weekend days get a subtle colour so they're easy to spot.
+        if i >= 5:
+            cb.setStyleSheet("color: #b45309;")
+        boxes.append(cb)
+        row.addWidget(cb)
+    row.addStretch(1)
+    container = QWidget()
+    container.setLayout(row)
+    return container, boxes
+
+
 # ===========================================================================
 # MPC Settings dialog
 # ===========================================================================
@@ -121,14 +177,21 @@ def _tab_scroll(widget: QWidget) -> QWidget:
 class MpcConfigDialog(QDialog):
     """Tabbed dialog for editing all MPC LP parameters."""
 
+    _test_result = pyqtSignal(bool, str)  # (ok, message) — emitted from background thread
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("⚙  MPC Settings")
-        self.setMinimumSize(520, 600)
-        self.setStyleSheet(_DIALOG_STYLE)
+        self.setMinimumSize(720, 600)
+        self.setStyleSheet(_DIALOG_STYLE.replace("__ARROW_UP__", _ARROW_UP).replace("__ARROW_DOWN__", _ARROW_DOWN))
 
         self._cfg = self._load_cfg()
+        self._test_result.connect(self._on_test_result)
         self._build_ui()
+        screen = QApplication.primaryScreen()
+        avail_h = screen.availableGeometry().height() if screen else 900
+        avail_w = screen.availableGeometry().width() if screen else 1400
+        self.resize(min(860, avail_w - 100), min(760, avail_h - 80))
 
     # ── Load / save ─────────────────────────────────────────────────────────
 
@@ -149,8 +212,8 @@ class MpcConfigDialog(QDialog):
                 "dt_hours": self._dt.value(),
             })
             mpc.setdefault("grid", {}).update({
-                "Pgrid_max_kw":       self._Pgrid_max.value(),
-                "fee_eur_kwh":        self._fee.value(),
+                "Pgrid_max_kw":         self._Pgrid_max.value(),
+                "fee_eur_kwh":          self._fee.value(),
                 "cap_tariff_Plim_kw":   self._cap_Plim.value(),
                 "cap_tariff_epsilon_l": self._cap_eps.value(),
             })
@@ -166,6 +229,10 @@ class MpcConfigDialog(QDialog):
                 "T_cool_night_c":    self._T_cool_night.value(),
                 "night_start_h":     self._night_start.value(),
                 "night_end_h":       self._night_end.value(),
+                "night_setback_days": [
+                    i for i, cb in enumerate(getattr(self, "_night_day_boxes", []) or [])
+                    if cb.isChecked()
+                ],
             })
             # base/peak load lives in smpc.building, not mpc.building
             raw.setdefault("smpc", {}).setdefault("building", {}).update({
@@ -179,6 +246,11 @@ class MpcConfigDialog(QDialog):
                 SMPCCalculator._reload_mpc_config()
             except Exception:
                 pass
+            # Persist API key
+            api_key = self._api_key_edit.text().strip()
+            raw2 = load_dashboard_config()
+            raw2.setdefault("api_keys", {})["entsoe_api_key"] = api_key
+            save_dashboard_config(raw2)
             self.accept()
         except Exception as exc:
             logger.error("Could not save MPC config: %s", exc)
@@ -206,6 +278,9 @@ class MpcConfigDialog(QDialog):
         self._T_cool_night.setValue(d.T_cool_night_c)
         self._night_start.setValue(d.night_start_h)
         self._night_end.setValue(d.night_end_h)
+        _default_ns_days = {int(x) % 7 for x in (d.night_setback_days or [])}
+        for i, cb in enumerate(getattr(self, "_night_day_boxes", []) or []):
+            cb.setChecked(i in _default_ns_days)
 
     # ── UI construction ─────────────────────────────────────────────────────
 
@@ -230,10 +305,11 @@ class MpcConfigDialog(QDialog):
 
         self._build_tab_horizon()
         self._build_tab_building()
+        self._build_tab_api_keys()
 
         # Buttons
         btn_row = QHBoxLayout()
-        save_btn = QPushButton("Save & Apply")
+        save_btn = QPushButton("Save && Apply")
         save_btn.setStyleSheet(_SAVE_STYLE)
         save_btn.clicked.connect(self._save)
         reset_btn = QPushButton("Reset Defaults")
@@ -257,24 +333,24 @@ class MpcConfigDialog(QDialog):
         form.addRow("Step duration dt:", self._dt)
 
         form.addRow(_section("Grid Connection"))
-        self._Pgrid_max  = _dspin(10.0, 50000.0, self._cfg.Pgrid_max_kw,  "kW",    1, 10.0)
-        self._fee        = _dspin(0.0,  2.0,     self._cfg.fee_eur_kwh,   "€/kWh", 4, 0.005)
-        form.addRow("Grid peak limit (hard):",  self._Pgrid_max)
-        form.addRow("Fixed electricity cost:",  self._fee)
+        self._Pgrid_max  = _dspin(10.0, 50000.0, self._cfg.Pgrid_max_kw,      "kW",    1, 10.0)
+        self._fee        = _dspin(0.0,  2.0,     self._cfg.fee_eur_kwh,       "€/kWh", 4, 0.005)
+        form.addRow("Grid peak limit (hard):",   self._Pgrid_max)
+        form.addRow("Fixed electricity cost:",   self._fee)
 
         form.addRow(_section("Capacity Tariff"))
         self._cap_Plim = _dspin(0.0, 50000.0, self._cfg.cap_tariff_Plim_kw,   "kW",    1, 10.0)
         self._cap_eps  = _dspin(0.0, 1e6,     self._cfg.cap_tariff_epsilon_l, "€/kW²",  4, 0.001)
         _cap_note = QLabel(
-            "Quadratic peak penalty: ε_L \u00b7 Σ(max(0, P_grid,k \u2212 P_lim))². "
-            "Discourages grid import above P_lim without a hard cut-off. "
-            "Set P_lim to 0 to disable."
+            "Soft peak penalty: adds a cost for every kW of grid import that exceeds "
+            "the power limit. Discourages high peaks without a hard cut-off. "
+            "Set power limit to 0 to disable."
         )
         _cap_note.setStyleSheet("color: #64748b; font-size: 9pt;")
         _cap_note.setWordWrap(True)
-        form.addRow("Power limit P_lim:",    self._cap_Plim)
-        form.addRow("Penalty ε_L:",         self._cap_eps)
-        form.addRow("",                       _cap_note)
+        form.addRow("Power limit:",       self._cap_Plim)
+        form.addRow("Peak penalty factor:", self._cap_eps)
+        form.addRow("",                   _cap_note)
         self._tabs.addTab(w, "Grid / Horizon")
 
     def _build_tab_building(self):
@@ -317,7 +393,136 @@ class MpcConfigDialog(QDialog):
         form.addRow("Night starts at hour:",  self._night_start)
         form.addRow("Night ends at hour:",    self._night_end)
 
+        # Full-day night-setback weekday picker. Ticked days are treated as
+        # fully night (T_set_night_c / T_cool_night_c apply 24/7) in both
+        # MPC and baseline. Useful for offices closed at weekends.
+        _ns_days_w, self._night_day_boxes = _day_selector(self._cfg.night_setback_days)
+        # Default selection from _day_selector is "all 7 ticked" when the list
+        # is empty, but for THIS picker the empty list means "no full-day
+        # setback" — flip the defaults so an empty list shows nothing ticked.
+        if not list(self._cfg.night_setback_days):
+            for cb in self._night_day_boxes:
+                cb.setChecked(False)
+        form.addRow("Full-day night days:", _ns_days_w)
+        _ns_hint = QLabel(
+            "Tick a day to apply night setback for the whole day "
+            "(e.g. Sat/Sun for a closed office). Applies to both MPC and baseline."
+        )
+        _ns_hint.setStyleSheet("color: #64748b; font-size: 9pt;")
+        _ns_hint.setWordWrap(True)
+        form.addRow("", _ns_hint)
+
         self._tabs.addTab(_tab_scroll(w), "Building")
+
+    def _build_tab_api_keys(self):
+        from settings import get_entsoe_api_key
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setSpacing(12)
+
+        form.addRow(_section("ENTSO-E Transparency Platform"))
+
+        note = QLabel(
+            "Required for fetching day-ahead electricity prices and CO\u2082 "
+            "intensity data.  Get a free key at "
+            "<a href='https://transparency.entsoe.eu/'>transparency.entsoe.eu</a>."
+        )
+        note.setOpenExternalLinks(True)
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #64748b; font-size: 9pt;")
+        form.addRow("", note)
+
+        self._api_key_edit = QLineEdit()
+        self._api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._api_key_edit.setPlaceholderText("Paste your ENTSO-E API key here…")
+        self._api_key_edit.setText(get_entsoe_api_key())
+        self._api_key_edit.setMinimumWidth(320)
+
+        show_btn = QPushButton("Show")
+        show_btn.setFixedWidth(60)
+        show_btn.setCheckable(True)
+        show_btn.setStyleSheet(
+            "QPushButton { background: #e2e8f0; color: #1f2937; border: 1px solid #cbd5e1;"
+            " border-radius: 5px; padding: 4px 8px; font-size: 9pt; font-weight: normal; }"
+            "QPushButton:checked { background: #7c3aed; color: white; border-color: #7c3aed; }"
+        )
+
+        def _toggle_visibility(checked):
+            self._api_key_edit.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+            show_btn.setText("Hide" if checked else "Show")
+
+        show_btn.toggled.connect(_toggle_visibility)
+
+        key_row = QHBoxLayout()
+        key_row.addWidget(self._api_key_edit, stretch=1)
+        key_row.addWidget(show_btn)
+        key_container = QWidget()
+        key_container.setLayout(key_row)
+        form.addRow("API key:", key_container)
+
+        self._api_test_lbl = QLabel("")
+        self._api_test_lbl.setWordWrap(True)
+        self._api_test_lbl.setStyleSheet("font-size: 9pt;")
+        test_btn = QPushButton("\u26a1  Test connection")
+        test_btn.setStyleSheet(
+            "QPushButton { background: #0f766e; color: white; border: none;"
+            " border-radius: 6px; padding: 6px 16px; font-size: 10pt; font-weight: 700; }"
+            "QPushButton:hover { background: #0d9488; }"
+        )
+        test_btn.clicked.connect(self._test_api_key)
+        form.addRow("", test_btn)
+        form.addRow("", self._api_test_lbl)
+
+        self._tabs.addTab(_tab_scroll(w), "\U0001f511  API Keys")
+
+    def _test_api_key(self):
+        """Try fetching one day of prices to validate the key."""
+        import threading
+        key = self._api_key_edit.text().strip()
+        if not key:
+            self._api_test_lbl.setStyleSheet("color: #dc2626; font-size: 9pt;")
+            self._api_test_lbl.setText("\u2717  Please enter an API key first.")
+            return
+        self._api_test_lbl.setStyleSheet("color: #64748b; font-size: 9pt;")
+        self._api_test_lbl.setText("Testing\u2026")
+
+        def _run():
+            import requests
+            from settings import ENTSOE_BASE_URL, ENTSOE_DOMAIN
+            from datetime import datetime, timezone
+            now = datetime.now(tz=timezone.utc)
+            ts = now.strftime("%Y%m%d%H00")
+            params = {
+                "securityToken": key,
+                "documentType": "A44",
+                "out_Domain": ENTSOE_DOMAIN,
+                "in_Domain": ENTSOE_DOMAIN,
+                "periodStart": ts,
+                "periodEnd": ts,
+                "contract_MarketAgreement.type": "A01",
+            }
+            try:
+                r = requests.get(ENTSOE_BASE_URL, params=params, timeout=10)
+                if r.status_code == 200:
+                    ok, msg = True, "\u2713  Connection successful!"
+                elif r.status_code == 401:
+                    ok, msg = False, "\u2717  Unauthorised — key invalid or not yet activated."
+                else:
+                    ok, msg = False, f"\u2717  HTTP {r.status_code}: {r.text[:120]}"
+            except Exception as exc:
+                ok, msg = False, f"\u2717  Error: {exc}"
+
+            self._test_result.emit(ok, msg)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_test_result(self, ok: bool, msg: str):
+        """Slot — runs on the main thread via the _test_result signal."""
+        colour = "#16a34a" if ok else "#dc2626"
+        self._api_test_lbl.setStyleSheet(f"color: {colour}; font-size: 9pt;")
+        self._api_test_lbl.setText(msg)
 
 
 # ===========================================================================
@@ -341,6 +546,25 @@ QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox, QTimeEdit {
     background: white; border: 1px solid #cbd5e1; border-radius: 5px;
     padding: 4px 8px; font-size: 10pt; color: #1f2937;
 }
+QDoubleSpinBox, QSpinBox, QTimeEdit { padding-right: 22px; }
+QDoubleSpinBox::up-button, QSpinBox::up-button, QTimeEdit::up-button {
+    subcontrol-origin: border; subcontrol-position: top right;
+    width: 18px; border-left: 1px solid #cbd5e1;
+    border-top-right-radius: 5px; background: #f1f5f9;
+}
+QDoubleSpinBox::down-button, QSpinBox::down-button, QTimeEdit::down-button {
+    subcontrol-origin: border; subcontrol-position: bottom right;
+    width: 18px; border-left: 1px solid #cbd5e1; border-top: 1px solid #cbd5e1;
+    border-bottom-right-radius: 5px; background: #f1f5f9;
+}
+QDoubleSpinBox::up-button:hover, QSpinBox::up-button:hover, QTimeEdit::up-button:hover,
+QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover, QTimeEdit::down-button:hover { background: #e2e8f0; }
+QDoubleSpinBox::up-arrow, QSpinBox::up-arrow, QTimeEdit::up-arrow {
+    image: url(__ARROW_UP__); width: 10px; height: 6px;
+}
+QDoubleSpinBox::down-arrow, QSpinBox::down-arrow, QTimeEdit::down-arrow {
+    image: url(__ARROW_DOWN__); width: 10px; height: 6px;
+}
 QCheckBox { font-size: 10pt; color: #1f2937; spacing: 8px; padding: 4px; }
 QCheckBox::indicator {
     width: 18px; height: 18px; border-radius: 4px;
@@ -363,13 +587,13 @@ _TYPE_PARAM_SPECS: dict[str, list] = {
     ],
     "heat_pump": [
         ("Php_max_kw",      "Max thermal output",        1.0, 99_999.0,  50.0, "kW",     1,  5.0),
-        ("COP0",            "Nominal COP (heating)",      1.0,     10.0,   4.0, "",       2,  0.1),
-        ("T0_c",            "Reference temperature T0", -20.0,    30.0,   7.0, "\u00b0C", 1,  1.0),
-        ("cop_alpha",       "COP degradation \u03b1",    0.0,      0.1,  0.02, "/\u00b0C", 4, 0.001),
-        ("COP_min",         "Minimum COP",                0.5,      5.0,   1.0, "",       2,  0.1),
+        ("COP0",            "Nominal heating COP (at T0)", 1.0,    10.0,   4.0, "",       2,  0.1),
+        ("T0_c",            "Heating COP ref. temperature T0", -20.0, 30.0,  7.0, "\u00b0C", 1,  1.0),
+        ("cop_alpha",       "Heating COP slope \u03b1 (vs Tamb)",  0.0,     0.1,  0.02, "/\u00b0C", 4, 0.001),
+        ("COP_min",         "Minimum heating COP (floor)", 0.5,     5.0,   1.0, "",       2,  0.1),
         ("ramp_pct",        "Ramp up/down limit",         1.0,    100.0, 100.0, "%/step", 1,  5.0),
         ("Php_cool_max_kw", "Max cooling output",         0.0, 99_999.0,  50.0, "kW",     1,  5.0),
-        ("COP_cool",        "Cooling COP",                0.5,     10.0,   3.0, "",       2,  0.1),
+        ("COP_cool",        "Cooling COP (fixed, used as-is)", 0.5, 10.0, 3.0, "",       2,  0.1),
     ],
     "gas_boiler": [
         ("Pgas_max_kw",      "Max thermal output",  1.0, 9_999_999.0, 100.0, "kW",      1, 5.0),
@@ -378,12 +602,14 @@ _TYPE_PARAM_SPECS: dict[str, list] = {
         ("ramp_pct",         "Ramp up/down limit",  1.0,   100.0, 100.0, "%/step",   1, 5.0),
     ],
     "chp": [
-        ("Pchp_max_kw",      "Max elec. output",          1.0, 9_999_999.0, 39.2, "kW",           1, 5.0),
-        ("eta_elec",         "Electrical efficiency",      0.1,     0.9,  0.40, "",             3, 0.01),
-        ("eta_heat",         "Thermal efficiency",         0.1,     0.9,  0.45, "",             3, 0.01),
-        ("startup_cost_eur", "Startup cost per event",     0.0, 1_000.0,   5.0, "\u20ac",       2, 0.5),
-        ("gas_price_eur_m3", "Gas price",                  0.0,     5.0,  0.35, "\u20ac/m\u00b3", 4, 0.01),
-        ("ramp_pct",         "Ramp up/down limit",         1.0,   100.0, 100.0, "%/step",       1, 5.0),
+        ("Pchp_max_kw",         "Max elec. output",          1.0, 9_999_999.0, 39.2, "kW",           1, 5.0),
+        ("eta_elec",            "Electrical efficiency",      0.1,     0.9,  0.40, "",             3, 0.01),
+        ("eta_heat",            "Thermal efficiency",         0.1,     0.9,  0.45, "",             3, 0.01),
+        ("gas_HV_kwh_m3",       "Gas heating value",          1.0,    50.0,  9.8, "kWh/m\u00b3",  2, 0.1),
+        ("startup_cost_eur",    "Startup cost per event",     0.0, 1_000.0,   5.0, "\u20ac",       2, 0.5),
+        ("gas_price_eur_kwh",   "Gas price",                  0.0,     1.0,  0.035, "\u20ac/kWh", 4, 0.001),
+        ("ramp_pct",            "Ramp up/down limit",         1.0,   100.0, 100.0, "%/step",       1, 5.0),
+        ("bl_Tamb_threshold_c", "Baseline: outdoor T threshold", -20.0,  40.0, 15.0, "\u00b0C",      1, 0.5),
     ],
     "battery": [
         ("SOC_cap_kwh",  "Capacity",               1.0, 100_000.0, 100.0, "kWh", 1, 10.0),
@@ -402,7 +628,9 @@ _TYPE_PARAM_SPECS: dict[str, list] = {
         ("T_min_c",      "Min temperature",      10.0,    80.0,  45.0, "\u00b0C", 1, 1.0),
         ("T_max_c",      "Max temperature",      10.0,    95.0,  60.0, "\u00b0C", 1, 1.0),
         ("T_init_c",     "Initial temperature",  10.0,    95.0,  55.0, "\u00b0C", 1, 1.0),
-        ("heat_loss_w",  "Standby heat loss",     0.0,   500.0,  50.0, "W",   1, 5.0),
+        ("heat_loss_w",  "Standby heat loss",     0.0, 100_000.0,  50.0, "W",   1, 25.0),
+        ("draw_kw",      "Daily-avg hot-water draw", 0.0, 9_999_999.0, 0.5, "kW",  2, 1.0),
+        ("indoor_amb_c", "Plant-room temperature", -10.0,  40.0, 18.0, "\u00b0C", 1, 1.0),
         ("ramp_pct",     "Ramp up/down limit",    1.0,   100.0, 100.0, "%/step", 1, 5.0),
     ],
 }
@@ -414,7 +642,7 @@ _BASELINE_MODES_BY_TYPE: dict[str, list[str]] = {
     "heat_pump":  ["on_off", "constant", "always_off"],
     "gas_boiler": ["on_off", "constant", "always_off"],
     "battery":    ["always_off"],
-    "chp":        ["always_off", "heat_demand", "constant"],
+    "chp":        ["always_off", "ambient_temp", "heat_demand", "constant"],
     "hot_water":  ["on_off", "constant", "always_off"],
     "flex":       ["fixed_window", "always_off"],
 }
@@ -424,7 +652,8 @@ _BL_MODE_DISPLAY: dict[str, str] = {
     "on_off":       "On/off (bang-bang thermostat)",
     "constant":     "Constant power",
     "always_off":   "Always off (disabled)",
-    "heat_demand":  "Heat-demand led",
+    "heat_demand":  "Heat-demand led (building T < setpoint)",
+    "ambient_temp": "Outdoor-temperature led (heating season)",
     "fixed_window": "Fixed time window",
 }
 
@@ -442,11 +671,19 @@ class AssetInstanceDialog(QDialog):
         super().__init__(parent)
         self._inst = dict(instance)
         self.setWindowTitle("Edit Asset")
-        self.setMinimumWidth(420)
-        self.setStyleSheet(_INSTANCE_STYLE)
+        # Flex / hot-water / HP rows have long labels + time-edit + day-of-week
+        # selector — they need more horizontal room than the 560-px baseline.
+        self.setMinimumSize(720, 500)
+        self.setStyleSheet(_INSTANCE_STYLE.replace("__ARROW_UP__", _ARROW_UP).replace("__ARROW_DOWN__", _ARROW_DOWN))
         self._param_widgets: dict[str, QDoubleSpinBox | QTimeEdit] = {}
         self._bool_widgets:  dict[str, QCheckBox] = {}
         self._build_ui()
+        # Fit to screen: use 70 % of available height, capped at 760 px.
+        screen = QApplication.primaryScreen()
+        avail_g = screen.availableGeometry() if screen else None
+        avail_w = avail_g.width() if avail_g else 1200
+        avail_h = avail_g.height() if avail_g else 900
+        self.resize(min(820, avail_w - 80), min(int(avail_h * 0.70), 760))
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
@@ -550,9 +787,21 @@ class AssetInstanceDialog(QDialog):
                 self._bl_t_off = _te_bl(self._inst.get("baseline_time_end",   "23:59"))
                 form.addRow("Baseline window start:", self._bl_t_on)
                 form.addRow("Baseline window end:",   self._bl_t_off)
+
+                # Day-of-week selector for the baseline window.
+                _bl_days = self._inst.get("baseline_active_days")
+                _bl_days_w, self._bl_day_boxes = _day_selector(_bl_days)
+                form.addRow("Baseline days:", _bl_days_w)
+                _bl_days_hint = QLabel(
+                    "Untick a day for the asset to be OFF (no flex load) in the baseline on that day."
+                )
+                _bl_days_hint.setStyleSheet("color: #64748b; font-size: 9pt;")
+                _bl_days_hint.setWordWrap(True)
+                form.addRow("", _bl_days_hint)
             else:
                 self._bl_t_on  = None
                 self._bl_t_off = None
+                self._bl_day_boxes = None
 
         # ── Type-specific parameters ─────────────────────────────────────────
         if itype in _TYPE_PARAM_SPECS or itype == "flex":
@@ -575,6 +824,40 @@ class AssetInstanceDialog(QDialog):
                 cooling_chk.setChecked(bool(self._inst.get("cooling_enabled", False)))
                 form.addRow("", cooling_chk)
                 self._bool_widgets["cooling_enabled"] = cooling_chk
+                _cool_hint = QLabel(
+                    "Cooling uses the fixed \"Cooling COP\" value above. "
+                    "The temperature-dependent COP curve (COP0, T0, \u03b1, COP_min) "
+                    "applies to HEATING mode only."
+                )
+                _cool_hint.setStyleSheet("color: #64748b; font-size: 9pt;")
+                _cool_hint.setWordWrap(True)
+                form.addRow(_cool_hint)
+
+            if itype == "chp":
+                milp_chk = QCheckBox("Use MILP (binary on/off + startup cost)")
+                milp_chk.setChecked(bool(self._inst.get("use_milp", True)))
+                form.addRow("", milp_chk)
+                self._bool_widgets["use_milp"] = milp_chk
+                _milp_hint = QLabel(
+                    "Off = LP relaxation (faster, allows partial loading)."
+                )
+                _milp_hint.setStyleSheet("color: #64748b; font-size: 9pt;")
+                form.addRow(_milp_hint)
+
+                dump_chk = QCheckBox("Allow CHP to vent excess heat (radiator dump)")
+                dump_chk.setChecked(bool(self._inst.get("heat_dump_enabled", True)))
+                form.addRow("", dump_chk)
+                self._bool_widgets["heat_dump_enabled"] = dump_chk
+                _dump_hint = QLabel(
+                    "On = CHP may run for electricity profit even when the building "
+                    "does not need the waste heat (modelled as an external radiator "
+                    "dump). Off = every kWh of CHP waste heat is forced into the "
+                    "building, which makes the CHP throttle off in summer."
+                )
+                _dump_hint.setStyleSheet("color: #64748b; font-size: 9pt;")
+                _dump_hint.setWordWrap(True)
+                form.addRow(_dump_hint)
+
 
 
         elif itype == "flex":
@@ -611,6 +894,17 @@ class AssetInstanceDialog(QDialog):
             self._flex_t_off = _te(self._inst.get("time_end",   "23:59"))
             form.addRow("Window start:", self._flex_t_on)
             form.addRow("Window end:",   self._flex_t_off)
+
+            # Day-of-week selector for the MPC active window.
+            _act_days = self._inst.get("active_days")
+            _act_days_w, self._flex_day_boxes = _day_selector(_act_days)
+            form.addRow("Active days:", _act_days_w)
+            _act_days_hint = QLabel(
+                "Untick a day to switch the asset OFF (no flex load) on that day."
+            )
+            _act_days_hint.setStyleSheet("color: #64748b; font-size: 9pt;")
+            _act_days_hint.setWordWrap(True)
+            form.addRow("", _act_days_hint)
 
             # Ramp rates
             form.addRow(_section("Ramp-rate limits"))
@@ -667,10 +961,22 @@ class AssetInstanceDialog(QDialog):
             self._inst["time_end"]               = self._flex_t_off.time().toString("HH:mm")
             self._inst["ramp_up_kw"]             = self._ramp_up.value()
             self._inst["ramp_down_kw"]           = self._ramp_down.value()
+            # Day-of-week gates. Empty list = all days (matches legacy default).
+            _act_days = [i for i, cb in enumerate(getattr(self, "_flex_day_boxes", []) or []) if cb.isChecked()]
+            if len(_act_days) == 7:
+                self._inst["active_days"] = []   # store [] when unrestricted
+            else:
+                self._inst["active_days"] = _act_days
             if self._bl_t_on is not None:
                 self._inst["baseline_time_start"] = self._bl_t_on.time().toString("HH:mm")
             if self._bl_t_off is not None:
                 self._inst["baseline_time_end"]   = self._bl_t_off.time().toString("HH:mm")
+            if getattr(self, "_bl_day_boxes", None) is not None:
+                _bl_days = [i for i, cb in enumerate(self._bl_day_boxes) if cb.isChecked()]
+                if len(_bl_days) == 7:
+                    self._inst["baseline_active_days"] = []
+                else:
+                    self._inst["baseline_active_days"] = _bl_days
         self.accept()
 
     def result_instance(self) -> dict:
@@ -686,8 +992,10 @@ QDialog { background-color: #eef3f9; }
 QLabel  { color: #1f2937; font-family: 'Calibri'; font-size: 10pt; }
 QScrollArea { background: transparent; border: none; }
 QFrame#InstanceRow {
-    background: white; border: 1px solid #e2e8f0; border-radius: 8px;
-    margin: 2px 0;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid #cbd5e1;
+    margin: 0;
 }
 """
 
@@ -753,11 +1061,13 @@ class MPCAssetSelectorDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("\u2295  Manage Assets")
-        self.setMinimumWidth(520)
-        self.setMinimumHeight(480)
+        self.setMinimumSize(540, 480)
         self.setStyleSheet(_SELECTOR_STYLE)
         self._instances: list[dict] = self._load_instances()
         self._build_ui()
+        screen = QApplication.primaryScreen()
+        avail_h = (screen.availableGeometry().height() if screen else 900)
+        self.resize(580, min(int(avail_h * 0.65), 700))
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -863,18 +1173,10 @@ class MPCAssetSelectorDialog(QDialog):
             icon_lbl.setStyleSheet("font-size: 16pt;")
             rl.addWidget(icon_lbl)
 
-            # Name + baseline info
-            info_col = QVBoxLayout()
-            info_col.setSpacing(2)
+            # Name
             name_lbl = QLabel(f"<b>{inst.get('name', inst.get('id', '?'))}</b>")
             name_lbl.setStyleSheet("color: #1f2937; font-size: 10pt;")
-            bmode = inst.get("baseline_mode", "always_off")
-            bkw   = inst.get("baseline_power_kw", 0.0)
-            baseline_lbl = QLabel(f"Baseline: {bmode}  ·  {bkw:.1f} kW")
-            baseline_lbl.setStyleSheet("color: #64748b; font-size: 8pt;")
-            info_col.addWidget(name_lbl)
-            info_col.addWidget(baseline_lbl)
-            rl.addLayout(info_col, stretch=1)
+            rl.addWidget(name_lbl, stretch=1)
 
             # Edit / Delete buttons
             edit_btn = QPushButton("Edit")

@@ -1,12 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  BACKEND FILE — student is responsible for this module           ║
-║                                                                  ║
-║  ENTSO-E day-ahead electricity price fetcher.                    ║
-║  Retrieves EUR/MWh prices for Belgium and caches them to         ║
-║  prices.csv so the dashboard can read them without network I/O.  ║
-╚══════════════════════════════════════════════════════════════════╝
-
 Fetch day-ahead electricity prices from ENTSO-E and export to CSV.
 
 Usage::
@@ -31,7 +23,7 @@ import requests
 import xmltodict
 
 from settings import (
-    DASHBOARD_DIR, ENTSOE_API_KEY, ENTSOE_BASE_URL, ENTSOE_DOMAIN, LOCAL_TZ,
+    DASHBOARD_DIR, ENTSOE_BASE_URL, ENTSOE_DOMAIN, LOCAL_TZ, get_entsoe_api_key,
 )
 
 logging.basicConfig(
@@ -51,7 +43,7 @@ _RESOLUTION_CHANGE = datetime(2025, 10, 1)
 def fetch_prices(domain: str, period_start: str, period_end: str) -> str:
     """Fetch day-ahead prices XML from the ENTSO-E Transparency Platform."""
     params = {
-        "securityToken": ENTSOE_API_KEY,
+        "securityToken": get_entsoe_api_key(),
         "documentType": "A44",
         "out_Domain": domain,
         "in_Domain": domain,

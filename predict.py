@@ -1,12 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  BACKEND FILE — student is responsible for this module           ║
-║                                                                  ║
-║  Solar yield prediction model.                                   ║
-║  Converts weather observations (UV index + temperature) into     ║
-║  PV power estimates using a physics-inspired proxy model.        ║
-╚══════════════════════════════════════════════════════════════════╝
-
 Predict solar yield from weather CSV and export to predict.csv.
 
 The model uses UV index as a proxy for irradiance and applies a temperature

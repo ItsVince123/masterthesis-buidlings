@@ -1,0 +1,11 @@
+PyQt6>=6.6.0
+numpy>=1.26.0
+pandas>=2.0.0
+cvxpy>=1.4.0
+highspy>=1.7.0
+openmeteo-requests>=1.2.0
+requests-cache>=1.1.0
+retry-requests>=2.0.0
+requests>=2.31.0
+xmltodict>=0.13.0
+matplotlib>=3.8.0

@@ -1,11 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  BACKEND FILE — student is responsible for this module           ║
-║                                                                  ║
-║  Unified MPC Analysis & Simulation dialog.                       ║
-║  Replaces both historical_dialog.py and future_dialog.py.        ║
-╚══════════════════════════════════════════════════════════════════╝
-
 Three analysis modes
 --------------------
 1. Date Range  — pick start/end dates; weather auto-fetched from Open-Meteo;
@@ -47,12 +40,13 @@ except ImportError:
 from PyQt6.QtCore import Qt, QDate, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QTabWidget, QWidget, QLabel, QPushButton, QDateEdit, QSpinBox,
     QProgressBar, QFileDialog, QScrollArea, QFrame, QDoubleSpinBox,
-    QSizePolicy, QMessageBox, QTextEdit,
+    QSizePolicy, QMessageBox, QTextEdit, QCheckBox,
 )
 
+from dashboard_config import load_dashboard_config, save_dashboard_config
 from mpc_lp import (
     MPCConfig, MPCInputs, MPCOutputs,
     load_mpc_config, solve_mpc,
@@ -221,6 +215,7 @@ def _parse_price_csv(filepath: str) -> "pd.DataFrame":
     # Try multiple formats
     parsed_ts = None
     for fmt in [
+        "%Y-%m-%d %H:%M:%S",   # ISO with seconds (e.g. prices_future.csv)
         "%d/%m/%Y %H:%M",
         "%-d/%-m/%Y %-H:%M",   # may not work on Windows
         "%m/%d/%Y %H:%M",
@@ -297,7 +292,6 @@ class _AnalysisWorker(QThread):
         self,
         days: list[dict],
         cfg: MPCConfig,
-        pload_kw: float,
     ):
         """
         Parameters
@@ -307,13 +301,11 @@ class _AnalysisWorker(QThread):
                      'price'       np.ndarray (96,) EUR/kWh
                      'temperature' np.ndarray (96,) °C
                      'uv_index'    np.ndarray (96,)
-        cfg      : MPCConfig
-        pload_kw : constant non-controllable load [kW]
+        cfg      : MPCConfig (day/night base load is read from cfg)
         """
         super().__init__()
         self.days     = days
         self.cfg      = cfg
-        self.pload_kw = pload_kw
         self._abort   = False
 
     # ------------------------------------------------------------------
@@ -355,7 +347,6 @@ class _AnalysisWorker(QThread):
                 "price":       price[:H].tolist(),
                 "ppv":         ppv,
                 "temperature": temps[:H].tolist(),
-                "pload_kw":    self.pload_kw,
             })
 
         if self._abort:
@@ -459,7 +450,8 @@ class _AnalysisWorker(QThread):
             ppv.append(predict_power_kw(row, self.cfg.pv_capacity_kwp))
         Ppv_forecast = np.array(ppv)
 
-        Pload = np.full(H, self.pload_kw)
+        from mpc_lp import build_pload_vector
+        Pload = build_pload_vector(self.cfg, 0.0, H)
 
         inputs = MPCInputs(
             price_eur_kwh     = price,
@@ -471,8 +463,17 @@ class _AnalysisWorker(QThread):
             T_tank_init_c     = self.cfg.hw_T_init_c,
         )
 
-        mpc_out = solve_mpc(inputs, self.cfg)
-        bl      = compute_baseline_arrays(inputs, self.cfg)
+        # Derive weekday from the simulated date so flex day-of-week gating
+        # uses the historical day, not "today" (Mon=0 … Sun=6).
+        _start_wd = None
+        try:
+            from datetime import datetime as _dtcls
+            _start_wd = _dtcls.strptime(str(day["date"]), "%Y-%m-%d").weekday()
+        except Exception:
+            _start_wd = None
+
+        mpc_out = solve_mpc(inputs, self.cfg, start_weekday=_start_wd)
+        bl      = compute_baseline_arrays(inputs, self.cfg, start_weekday=_start_wd)
         savings = compute_asset_savings(mpc_out, bl, inputs, self.cfg)
         dt      = self.cfg.dt_hours
 
@@ -481,18 +482,25 @@ class _AnalysisWorker(QThread):
             "baseline_cost_eur":  bl["total_cost"],
             "mpc_cost_eur":       mpc_out.mpc_cost_eur,
             "total_saving_eur":   bl["total_cost"] - mpc_out.mpc_cost_eur,
+            # Gross baseline cost (imports + gas, no export credit). Useful as
+            # a denominator for "% saving of the energy bill" because PV
+            # export revenue otherwise shrinks the denominator and inflates %.
+            "baseline_gross_eur": bl.get("gross_cost", bl["total_cost"]),
+            "baseline_export_revenue_eur": bl.get("export_revenue", 0.0),
             "savings":            savings,
             "dt":                 dt,
             # MPC dispatch arrays (kW, as plain lists for Qt signal safety)
             "plan_Pgrid":  mpc_out.plan_Pgrid.tolist(),
             "plan_Php":    mpc_out.plan_Php.tolist(),
-                "plan_Php_cool": mpc_out.plan_Php_cool.tolist() if len(mpc_out.plan_Php_cool) > 0 else [],
+            "plan_Php_cool": mpc_out.plan_Php_cool.tolist() if len(mpc_out.plan_Php_cool) > 0 else [],
             "plan_Ppv":    mpc_out.plan_Ppv.tolist(),
             "plan_Pflex":  mpc_out.plan_Pflex.tolist(),
             "plan_Pch":    mpc_out.plan_Pch.tolist(),
             "plan_Pdis":   mpc_out.plan_Pdis.tolist(),
             "plan_Pgas":   mpc_out.plan_Pgas.tolist(),
             "plan_Ptank":  mpc_out.plan_Ptank.tolist(),
+            "plan_Pchp":   mpc_out.plan_Pchp.tolist() if len(mpc_out.plan_Pchp) > 0 else [],
+            "plan_Qchp":   mpc_out.plan_Qchp.tolist() if len(mpc_out.plan_Qchp) > 0 else [],
             # Baseline dispatch arrays
             "bl_Pgrid":    bl["Pgrid"].tolist(),
             "bl_Php":      bl["Php"].tolist(),
@@ -601,7 +609,13 @@ class AnalysisDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("MPC Analysis & Simulation")
-        self.resize(1080, 820)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMaximizeButtonHint)
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        w = min(1080, avail.width() - 80) if avail else 1000
+        h = min(820, avail.height() - 80) if avail else 760
+        self.resize(w, h)
+        self.setMinimumWidth(780)
         self.setStyleSheet(_ANALYSIS_STYLE)
 
         # State
@@ -637,6 +651,9 @@ class AnalysisDialog(QDialog):
         # Settings + run button panel
         setup_row.addWidget(self._build_settings_panel(), 2)
         root.addLayout(setup_row)
+
+        # Restore last-used price CSV path silently
+        self._restore_price_csv()
 
         # ── Progress bar ───────────────────────────────────────────────────
         prog_row = QHBoxLayout()
@@ -677,11 +694,25 @@ class AnalysisDialog(QDialog):
         self._results_layout.addWidget(self._placeholder_lbl)
         self._results_layout.addStretch()
         self._results_outer.setWidget(self._results_container)
+        self._results_outer.setMinimumHeight(280)
         root.addWidget(self._results_outer, 1)
 
-        # ── Export button ─────────────────────────────────────────────────
+        # ── Export buttons ────────────────────────────────────────────────
         export_row = QHBoxLayout()
         export_row.addStretch()
+        self._export_summary_by_year_btn = QPushButton("Export Summary by Year as CSV")
+        self._export_summary_by_year_btn.setStyleSheet(_EXPORT_BTN_STYLE)
+        self._export_summary_by_year_btn.setMinimumHeight(36)
+        self._export_summary_by_year_btn.setEnabled(False)
+        self._export_summary_by_year_btn.setVisible(False)
+        self._export_summary_by_year_btn.clicked.connect(self._export_summary_by_year_csv)
+        export_row.addWidget(self._export_summary_by_year_btn)
+        self._export_summary_btn = QPushButton("Export Summary as CSV")
+        self._export_summary_btn.setStyleSheet(_EXPORT_BTN_STYLE)
+        self._export_summary_btn.setMinimumHeight(36)
+        self._export_summary_btn.setEnabled(False)
+        self._export_summary_btn.clicked.connect(self._export_summary_csv)
+        export_row.addWidget(self._export_summary_btn)
         self._export_btn = QPushButton("Export Results as CSV")
         self._export_btn.setStyleSheet(_EXPORT_BTN_STYLE)
         self._export_btn.setMinimumHeight(36)
@@ -781,39 +812,55 @@ class AnalysisDialog(QDialog):
         lay.setContentsMargins(10, 18, 10, 10)
 
         # Price CSV (shared by tabs 1 and 2)
-        lay.addWidget(_kpi_label("Price CSV (tabs 1 & 2):"), 0, 0, 1, 2)
+        lay.addWidget(_kpi_label("Price source:"), 0, 0, 1, 2)
+
+        lay.addWidget(_kpi_label("Price CSV (tabs 1 & 2):"), 1, 0, 1, 2)
         self._price_btn = QPushButton("Browse…")
         self._price_btn.clicked.connect(self._browse_price_csv)
-        lay.addWidget(self._price_btn, 1, 0)
+        lay.addWidget(self._price_btn, 2, 0)
         self._price_lbl = QLabel("No file")
         self._price_lbl.setStyleSheet("color: #64748b; font-size: 9pt;")
         self._price_lbl.setWordWrap(True)
-        lay.addWidget(self._price_lbl, 1, 1)
+        lay.addWidget(self._price_lbl, 2, 1)
 
-        # Base load
-        lay.addWidget(_kpi_label("Base elec. load [kW]:"), 2, 0)
-        self._pload_spin = QDoubleSpinBox()
-        self._pload_spin.setRange(0.0, 5000.0)
-        self._pload_spin.setDecimals(1)
-        self._pload_spin.setValue(5.0)
-        self._pload_spin.setSuffix(" kW")
-        lay.addWidget(self._pload_spin, 2, 1)
+        # Note: base electrical load is read from Solver Config
+        # (Manage Assets → Night load / Day load).  No manual input here.
+        _note = QLabel(
+            "Base electrical load is taken from Solver Config\n"
+            "(Manage Assets → Night load / Day load)."
+        )
+        _note.setStyleSheet("color: #64748b; font-size: 9pt;")
+        _note.setWordWrap(True)
+        lay.addWidget(_note, 3, 0, 1, 3)
 
-        lay.addWidget(QLabel(""), 3, 0)   # spacer row
+        lay.addWidget(QLabel(""), 4, 0)   # spacer row
 
         # Run button
         self._run_btn = QPushButton("Run Analysis")
         self._run_btn.setStyleSheet(RUN_ANALYSIS_BUTTON_STYLE)
         self._run_btn.setMinimumHeight(40)
         self._run_btn.clicked.connect(self._run)
-        lay.addWidget(self._run_btn, 4, 0, 1, 2)
+        lay.addWidget(self._run_btn, 5, 0, 1, 2)
 
-        lay.setRowStretch(5, 1)
+        lay.setRowStretch(6, 1)
         return grp
 
     # ======================================================================
     # Slots — file browsing
     # ======================================================================
+
+    def _restore_price_csv(self) -> None:
+        """Re-load the last-used price CSV from saved config (silent on failure)."""
+        try:
+            saved = load_dashboard_config().get("analysis_price_csv", "")
+            if saved and Path(saved).exists():
+                self._price_df   = _parse_price_csv(saved)
+                self._price_path = saved
+                fname  = Path(saved).name
+                n_days = len(set(self._price_df.index.date))
+                self._price_lbl.setText(f"{fname}\n({n_days} days)")
+        except Exception:
+            pass
 
     def _browse_price_csv(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -833,6 +880,13 @@ class AnalysisDialog(QDialog):
                 f"{self._price_df.index.min().date()} – "
                 f"{self._price_df.index.max().date()}"
             )
+            # Persist path so the next dialog open reloads it automatically
+            try:
+                _cfg = load_dashboard_config()
+                _cfg["analysis_price_csv"] = path
+                save_dashboard_config(_cfg)
+            except Exception:
+                pass
         except Exception as exc:
             QMessageBox.critical(self, "Parse error", f"Could not parse price CSV:\n{exc}")
 
@@ -891,8 +945,7 @@ class AnalysisDialog(QDialog):
         self._placeholder_lbl.hide()
 
         # Kick off worker
-        pload = self._pload_spin.value()
-        self._worker = _AnalysisWorker(days_data, self._cfg, pload)
+        self._worker = _AnalysisWorker(days_data, self._cfg)
         self._worker.progress_signal.connect(self._on_progress)
         self._worker.day_done_signal.connect(self._on_day_done)
         self._worker.error_signal.connect(lambda msg: self._status_lbl.setText(f"⚠ {msg}"))
@@ -911,21 +964,21 @@ class AnalysisDialog(QDialog):
     def _build_days_data(self, tab_index: int) -> list[dict]:
         """Collect all (date, price, temperature, uv_index) records to simulate."""
         if tab_index == 0:       # Date Range
-            price_df = self._require_price_df()
             qfrom = self._from_date.date().toPyDate()
             qto   = self._to_date.date().toPyDate()
             if qfrom > qto:
                 raise ValueError("'From' date must be ≤ 'To' date.")
             dates = [qfrom + datetime.timedelta(days=i) for i in range((qto - qfrom).days + 1)]
+            price_df = self._require_price_df()
 
         elif tab_index == 1:     # Full Year
-            price_df = self._require_price_df()
             yr = self._year_spin.value()
             dates = [
                 datetime.date(yr, 1, 1) + datetime.timedelta(days=i)
                 for i in range(366)
                 if (datetime.date(yr, 1, 1) + datetime.timedelta(days=i)).year == yr
             ]
+            price_df = self._require_price_df()
 
         else:                    # Custom CSV
             if self._custom_price_df is None:
@@ -1064,6 +1117,13 @@ class AnalysisDialog(QDialog):
 
         self._render_results()
         self._export_btn.setEnabled(True)
+        self._export_summary_btn.setEnabled(True)
+
+        # Show "Export Summary by Year" button only when results span multiple years
+        years = {r["date"][:4] for r in self._results}
+        multi_year = len(years) > 1
+        self._export_summary_by_year_btn.setVisible(multi_year)
+        self._export_summary_by_year_btn.setEnabled(multi_year)
 
     # ======================================================================
     # Results rendering
@@ -1088,6 +1148,14 @@ class AnalysisDialog(QDialog):
         total_mpc = sum(r["mpc_cost_eur"]      for r in results)
         total_sav = total_bl - total_mpc
         pct_sav   = 100.0 * total_sav / max(total_bl, 1e-9)
+        # Gross baseline (imports + gas, no PV export credit) gives a more
+        # conservative "% of energy bill" metric. Without this, PV export
+        # revenue shrinks the denominator and inflates the saving %.
+        total_bl_gross = sum(r.get("baseline_gross_eur", r["baseline_cost_eur"])
+                             for r in results)
+        total_bl_export_rev = sum(r.get("baseline_export_revenue_eur", 0.0)
+                                  for r in results)
+        pct_sav_gross = 100.0 * total_sav / max(total_bl_gross, 1e-9)
 
         # --- Summary KPI block -------------------------------------------
         kpi_grp = QGroupBox("Summary")
@@ -1108,6 +1176,7 @@ class AnalysisDialog(QDialog):
         # --- Per-asset savings breakdown ----------------------------------
         asset_keys = [
             ("hp_eur",      "Heat Pump"),
+            ("cooling_eur", "HP Cooling"),
             ("boiler_eur",  "Gas Boiler"),
             ("flex_eur",    "Flex Load"),
             ("battery_eur", "Battery"),
@@ -1118,6 +1187,8 @@ class AnalysisDialog(QDialog):
         asset_grp = QGroupBox("Savings by Asset")
         ag = QGridLayout(asset_grp)
         ag.setSpacing(6)
+        ag.setColumnStretch(1, 1)
+        ag.setColumnMinimumWidth(1, 200)
 
         for row_i, (key, label) in enumerate(asset_keys):
             val = sum(r["savings"].get(key, 0.0) for r in results)
@@ -1144,6 +1215,8 @@ class AnalysisDialog(QDialog):
         rule_grp = QGroupBox("Savings by Rule")
         rg = QGridLayout(rule_grp)
         rg.setSpacing(6)
+        rg.setColumnStretch(1, 1)
+        rg.setColumnMinimumWidth(1, 200)
 
         for row_i, (key, label, sub_row) in enumerate(rule_keys):
             val = sum(r["savings"].get(key, 0.0) for r in results)
@@ -1199,10 +1272,24 @@ class AnalysisDialog(QDialog):
             self._render_rt_graphs(results[0])
         elif n > 1:
             self._render_multi_day_chart(results)
-            # Asset breakdown for first day as a representative sample
+            # Asset breakdown aggregated across ALL days in the range, so the
+            # bar values match the "Savings by Asset" totals shown above.
+            agg_savings: dict[str, float] = {}
+            for r in results:
+                for k, v in (r.get("savings") or {}).items():
+                    try:
+                        agg_savings[k] = agg_savings.get(k, 0.0) + float(v)
+                    except (TypeError, ValueError):
+                        continue
+            agg_result = {
+                "date": f"{results[0]['date']} \u2192 {results[-1]['date']}",
+                "baseline_cost_eur": total_bl,
+                "mpc_cost_eur":      total_mpc,
+                "savings":           agg_savings,
+            }
             self._render_comparison_graphs(
-                results[0],
-                title_suffix=f" — {results[0]['date']} (first day sample)",
+                agg_result,
+                title_suffix=f" — {n} days (total)",
             )
 
         self._results_layout.addStretch()
@@ -1426,7 +1513,7 @@ class AnalysisDialog(QDialog):
 
             # (saving_key, bl_cost_key, label, color)
             asset_items = [
-                ("pv_eur",      "bl_pv_saving",    "PV curtailment (neg-price hrs)",     "#f59e0b"),
+                ("pv_eur",      "bl_pv_saving",    "PV self-consumption (load shifted to solar peak)", "#f59e0b"),
                 ("battery_eur", "bl_battery_cost", "Battery (buy low/sell high)",  "#0ea5e9"),
                 ("hp_eur",      "bl_hp_cost",      "Heat pump (run at right time)", "#f97316"),
                 ("cooling_eur", "bl_cooling_cost", "HP cooling (shift to off-peak)", "#38bdf8"),
@@ -1461,15 +1548,10 @@ class AnalysisDialog(QDialog):
 
             for bar, (sk, bk, _, _), val in zip(bars, asset_items, values):
                 if abs(val) > 0.001:
-                    # % relative to this asset's own baseline cost.
-                    # Fall back to % of total baseline when asset was idle in baseline.
-                    bl_ref = savings.get(bk, 0.0)
-                    if abs(bl_ref) > 0.001:
-                        pct = 100.0 * val / abs(bl_ref)
-                        pct_label = f"{pct:+.1f}% of asset bl."
-                    else:
-                        pct = 100.0 * val / total_bl
-                        pct_label = f"{pct:+.1f}% of total bl."
+                    # % relative to total baseline cost — gives a consistent
+                    # cross-asset comparison ("CHP earns X% of total bill", etc.)
+                    pct = 100.0 * val / total_bl
+                    pct_label = f"{pct:+.1f}% of bl."
                     ha  = "left"  if val >= 0 else "right"
                     off = 0.02 * max_abs
                     ax.text(
@@ -1496,7 +1578,7 @@ class AnalysisDialog(QDialog):
             fig.tight_layout(pad=0.9)
 
             buf = io.BytesIO()
-            FigureCanvasAgg(fig).print_png(buf)
+            fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
             plt.close(fig)
             buf.seek(0)
 
@@ -1530,13 +1612,14 @@ class AnalysisDialog(QDialog):
         cum      = np.cumsum(savings)
 
         asset_palette = [
-            ("pv_eur",      "PV",        "#f59e0b"),
-            ("battery_eur", "Battery",   "#0ea5e9"),
-            ("hp_eur",      "Heat pump", "#f97316"),
-            ("boiler_eur",  "Boiler",    "#a78bfa"),
-            ("flex_eur",    "Flex load", "#22c55e"),
-            ("hw_eur",      "HW tank",   "#06b6d4"),
-            ("chp_eur",     "CHP",       "#8b5cf6"),
+            ("pv_eur",      "PV",        "#f5c400"),   # golden yellow
+            ("battery_eur", "Battery",   "#0ea5e9"),   # sky blue
+            ("hp_eur",      "Heat pump", "#e63946"),   # red
+            ("cooling_eur", "HP cooling","#38bdf8"),   # light cyan
+            ("boiler_eur",  "Boiler",    "#ff7f0e"),   # vivid orange
+            ("flex_eur",    "Flex load", "#2ca02c"),   # forest green
+            ("hw_eur",      "HW tank",   "#17becf"),   # teal/cyan
+            ("chp_eur",     "CHP",       "#9467bd"),   # purple
         ]
 
         BG_FIG  = "#eef3f9"
@@ -1682,10 +1765,13 @@ class AnalysisDialog(QDialog):
         prices_mwh  = [p * 1000.0 for p in _a("prices")]   # EUR/kWh → EUR/MWh
         pgrid_mpc   = _a("plan_Pgrid")
         ppv_mpc     = _a("plan_Ppv")
+        pchp_mpc    = _a("plan_Pchp")
+        qchp_mpc    = _a("plan_Qchp")
         temps       = _a("temperature", 10.0)
         bld_temps   = _a("plan_Tbuilding", float("nan"))
         php_mpc     = _a("plan_Php")
         pgas_mpc    = _a("plan_Pgas")
+        pcool_mpc   = _a("plan_Php_cool")
 
         # Comfort-band schedules from MPC config
         cfg = self._cfg
@@ -1708,11 +1794,14 @@ class AnalysisDialog(QDialog):
         grp = QGroupBox(f"Real-time graphs — {result['date']}")
         grp_lay = QVBoxLayout(grp)
 
-        # Price + grid overlay
+        # Price + grid overlay (+ CHP electrical output)
         price_lbl = QLabel()
+        price_overlays = [{"array": pgrid_mpc, "color": "#f97316", "label": "MPC Grid [kW]"}]
+        if any(v > 0.1 for v in pchp_mpc):
+            price_overlays.append({"array": pchp_mpc, "color": "#8b5cf6", "label": "CHP Elec [kW]"})
         price_lbl.setPixmap(draw_price_graph(
             prices_mwh, start_label, end_label, None, None, W, 240,
-            overlays=[{"array": pgrid_mpc, "color": "#f97316", "label": "MPC Grid [kW]"}],
+            overlays=price_overlays,
         ))
         price_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         grp_lay.addWidget(price_lbl)
@@ -1723,14 +1812,15 @@ class AnalysisDialog(QDialog):
         solar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         grp_lay.addWidget(solar_lbl)
 
-        # Thermal: outdoor + building temp + comfort band + HP/boiler heat
+        # Thermal: outdoor + building temp + comfort band + HP/boiler/CHP heat
         thermal_lbl = QLabel()
         thermal_lbl.setPixmap(draw_thermal_graph(
             temps, bld_temps, setpoint,
-            php_mpc, pgas_mpc, [0.0] * H,
+            php_mpc, pgas_mpc, qchp_mpc,
             start_label, end_label, None, None, W, 280,
             tmin_schedule=tmin_sched,
             tmax_schedule=tmax_sched,
+            cool_hp_kw=pcool_mpc if any(v > 1e-6 for v in pcool_mpc) else None,
         ))
         thermal_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         grp_lay.addWidget(thermal_lbl)
@@ -1766,7 +1856,7 @@ class AnalysisDialog(QDialog):
                 writer.writerow([
                     "Date",
                     "Baseline cost (€)", "MPC cost (€)", "Total saving (€)", "Saving (%)",
-                    "HP saving (€)", "Boiler saving (€)", "Flex saving (€)",
+                    "HP saving (€)", "HP cooling saving (€)", "Boiler saving (€)", "Flex saving (€)",
                     "Battery saving (€)", "CHP saving (€)", "HW saving (€)", "PV saving (€)",
                     "Thermal building (€)", "Fuel switching (€)", "Thermal storage (€)",
                     "HW thermal (€)", "Flex shifting (€)",
@@ -1784,6 +1874,7 @@ class AnalysisDialog(QDialog):
                         _fmt(bl_r),  _fmt(mpc_r),
                         _fmt(sav_r), _fmt2(pct_r),
                         _fmt(s.get("hp_eur",      0.0)),
+                        _fmt(s.get("cooling_eur", 0.0)),
                         _fmt(s.get("boiler_eur",  0.0)),
                         _fmt(s.get("flex_eur",    0.0)),
                         _fmt(s.get("battery_eur", 0.0)),
@@ -1801,6 +1892,216 @@ class AnalysisDialog(QDialog):
                         _fmt(s.get("peak_shaving_eur",       0.0)),
                     ])
             self._status_lbl.setText(f"Exported to {Path(path).name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export error", f"Could not write CSV:\n{exc}")
+
+    def _export_summary_csv(self) -> None:
+        """Export aggregated summary, savings by asset, and savings by rule.
+
+        Mirrors the totals shown in the on-screen results panel — a compact
+        view suitable for pasting into reports / the thesis.
+        """
+        if not self._results:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Summary CSV", "mpc_analysis_summary.csv",
+            "CSV files (*.csv)",
+        )
+        if not path:
+            return
+
+        def _fmt(v: float) -> str:
+            return f"{v:.4f}".replace(".", ",")
+
+        def _fmt2(v: float) -> str:
+            return f"{v:.2f}".replace(".", ",")
+
+        results = self._results
+        n = len(results)
+        total_bl  = sum(r["baseline_cost_eur"] for r in results)
+        total_mpc = sum(r["mpc_cost_eur"]      for r in results)
+        total_sav = total_bl - total_mpc
+        pct_sav   = 100.0 * total_sav / max(total_bl, 1e-9)
+
+        asset_keys = [
+            ("hp_eur",      "Heat Pump"),
+            ("cooling_eur", "HP Cooling"),
+            ("boiler_eur",  "Gas Boiler"),
+            ("flex_eur",    "Flex Load"),
+            ("battery_eur", "Battery"),
+            ("chp_eur",     "CHP"),
+            ("hw_eur",      "Hot Water"),
+            ("pv_eur",      "PV"),
+        ]
+        rule_keys = [
+            ("thermal_building_eur",   "Thermal building (HP + boiler)"),
+            ("fuel_switching_eur",     "  Fuel switching (HP vs boiler)"),
+            ("thermal_storage_eur",    "  Thermal storage (pre-heat / coast)"),
+            ("hw_thermal_eur",         "Hot water pre-heating"),
+            ("flex_shifting_eur",      "Flex load shifting"),
+            ("battery_arbitrage_eur",  "Battery arbitrage"),
+            ("chp_spark_eur",          "CHP spark spread"),
+            ("pv_selfconsumption_eur", "Solar self-consumption"),
+            ("peak_shaving_eur",       "Capacity tariff / peak shaving"),
+        ]
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f, delimiter=";")
+
+                # ── Summary ─────────────────────────────────────────────
+                writer.writerow(["Summary"])
+                writer.writerow(["Metric", "Value"])
+                writer.writerow(["Days analysed", n])
+                writer.writerow(["Baseline cost (€)", _fmt2(total_bl)])
+                writer.writerow(["MPC cost (€)",      _fmt2(total_mpc)])
+                writer.writerow(["Total saving (€)",  _fmt2(total_sav)])
+                writer.writerow(["Saving (%)",        _fmt2(pct_sav)])
+                writer.writerow([])
+
+                # ── Savings by Asset ────────────────────────────────────
+                writer.writerow(["Savings by Asset"])
+                writer.writerow(["Asset", "Saving (€)", "Saving (% of baseline)"])
+                for key, label in asset_keys:
+                    val = sum(r["savings"].get(key, 0.0) for r in results)
+                    pct = 100.0 * val / max(total_bl, 1e-9)
+                    writer.writerow([label, _fmt(val), _fmt2(pct)])
+                writer.writerow([])
+
+                # ── Savings by Rule ─────────────────────────────────────
+                writer.writerow(["Savings by Rule"])
+                writer.writerow(["Rule", "Saving (€)", "Saving (% of baseline)"])
+                for key, label in rule_keys:
+                    val = sum(r["savings"].get(key, 0.0) for r in results)
+                    pct = 100.0 * val / max(total_bl, 1e-9)
+                    writer.writerow([label, _fmt(val), _fmt2(pct)])
+
+            self._status_lbl.setText(f"Exported summary to {Path(path).name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export error", f"Could not write CSV:\n{exc}")
+
+    # ======================================================================
+    # Abort
+    # ======================================================================
+
+    def _export_summary_by_year_csv(self) -> None:
+        """Export a side-by-side summary grouped by year.
+
+        Produces the same structure as the full-year summary but with one
+        column pair (Saving €, Saving %) per year, so years can be compared
+        directly in Excel / Calc.
+        """
+        if not self._results:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Summary by Year CSV", "mpc_summary_by_year.csv",
+            "CSV files (*.csv)",
+        )
+        if not path:
+            return
+
+        def _fmt(v: float) -> str:
+            return f"{v:.4f}".replace(".", ",")
+
+        def _fmt2(v: float) -> str:
+            return f"{v:.2f}".replace(".", ",")
+
+        # Group results by year (string key like "2020")
+        from collections import defaultdict
+        by_year: dict[str, list] = defaultdict(list)
+        for r in self._results:
+            by_year[r["date"][:4]].append(r)
+        years = sorted(by_year.keys())
+
+        asset_keys = [
+            ("hp_eur",      "Heat Pump"),
+            ("cooling_eur", "HP Cooling"),
+            ("boiler_eur",  "Gas Boiler"),
+            ("flex_eur",    "Flex Load"),
+            ("battery_eur", "Battery"),
+            ("chp_eur",     "CHP"),
+            ("hw_eur",      "Hot Water"),
+            ("pv_eur",      "PV"),
+        ]
+        rule_keys = [
+            ("thermal_building_eur",   "Thermal building (HP + boiler)"),
+            ("fuel_switching_eur",     "  Fuel switching (HP vs boiler)"),
+            ("thermal_storage_eur",    "  Thermal storage (pre-heat / coast)"),
+            ("hw_thermal_eur",         "Hot water pre-heating"),
+            ("flex_shifting_eur",      "Flex load shifting"),
+            ("battery_arbitrage_eur",  "Battery arbitrage"),
+            ("chp_spark_eur",          "CHP spark spread"),
+            ("pv_selfconsumption_eur", "Solar self-consumption"),
+            ("peak_shaving_eur",       "Capacity tariff / peak shaving"),
+        ]
+
+        # Pre-compute per-year totals
+        yr_n:    dict[str, int]   = {}
+        yr_bl:   dict[str, float] = {}
+        yr_mpc:  dict[str, float] = {}
+        yr_sav:  dict[str, float] = {}
+        yr_pct:  dict[str, float] = {}
+        for yr in years:
+            rr = by_year[yr]
+            bl  = sum(r["baseline_cost_eur"] for r in rr)
+            mpc = sum(r["mpc_cost_eur"]      for r in rr)
+            sav = bl - mpc
+            yr_n[yr]   = len(rr)
+            yr_bl[yr]  = bl
+            yr_mpc[yr] = mpc
+            yr_sav[yr] = sav
+            yr_pct[yr] = 100.0 * sav / max(bl, 1e-9)
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f, delimiter=";")
+
+                # ── Header row: year names (2 columns each) ─────────────
+                header = [""]
+                for yr in years:
+                    header += [yr, ""]
+                writer.writerow(header)
+
+                # ── Summary block ────────────────────────────────────────
+                def _summary_row(label: str, values: list[str]) -> list[str]:
+                    row = [label]
+                    for v in values:
+                        row += [v, ""]
+                    return row
+
+                writer.writerow(_summary_row("Days analysed",    [str(yr_n[yr])          for yr in years]))
+                writer.writerow(_summary_row("Baseline cost (€)", [_fmt2(yr_bl[yr])       for yr in years]))
+                writer.writerow(_summary_row("MPC cost (€)",      [_fmt2(yr_mpc[yr])      for yr in years]))
+                writer.writerow(_summary_row("Total saving (€)",  [_fmt2(yr_sav[yr])      for yr in years]))
+                writer.writerow(_summary_row("Saving (%)",        [_fmt2(yr_pct[yr])      for yr in years]))
+                writer.writerow([])
+
+                # ── Savings by Asset ─────────────────────────────────────
+                # Sub-header: "Saving (€)" / "Saving (%)" per year
+                sub_header = [""]
+                for yr in years:
+                    sub_header += ["Saving (€)", "Saving (%)"]
+                writer.writerow(sub_header)
+
+                for key, label in asset_keys:
+                    row = [label]
+                    for yr in years:
+                        val = sum(r["savings"].get(key, 0.0) for r in by_year[yr])
+                        pct = 100.0 * val / max(yr_bl[yr], 1e-9)
+                        row += [_fmt(val), _fmt2(pct)]
+                    writer.writerow(row)
+                writer.writerow([])
+
+                # ── Savings by Rule ──────────────────────────────────────
+                for key, label in rule_keys:
+                    row = [label]
+                    for yr in years:
+                        val = sum(r["savings"].get(key, 0.0) for r in by_year[yr])
+                        pct = 100.0 * val / max(yr_bl[yr], 1e-9)
+                        row += [_fmt(val), _fmt2(pct)]
+                    writer.writerow(row)
+
+            self._status_lbl.setText(f"Exported summary by year to {Path(path).name}")
         except Exception as exc:
             QMessageBox.critical(self, "Export error", f"Could not write CSV:\n{exc}")
 

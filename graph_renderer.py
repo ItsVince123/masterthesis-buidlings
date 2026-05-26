@@ -1,11 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  FRONTEND FILE — student is NOT responsible for this module      ║
-║                                                                  ║
-║  All graph rendering via QPainter on QPixmap.                    ║
-║  Pure display logic — no calculations here.                      ║
-╚══════════════════════════════════════════════════════════════════╝
-
 Graph rendering functions using QPainter on QPixmap.
 
 All functions are stateless: they accept data arrays and return a QPixmap
@@ -105,7 +98,7 @@ def draw_series_graph(
         painter.setPen(now_pen)
         x_now = int(pad_l + current_index * slot_w)
         painter.drawLine(x_now, pad_t, x_now, height - pad_b)
-        painter.drawText(x_now + 4, pad_t + 12, "Now")
+        painter.drawText(x_now + 4, pad_t - 3, "Now")
 
     # Selected slot marker (purple dashed line)
     if selected_index is not None and 0 <= selected_index < n:
@@ -118,7 +111,7 @@ def draw_series_graph(
         painter.setPen(QPen(QColor("#7c3aed")))
         fm = painter.fontMetrics()
         arrow_w = fm.horizontalAdvance("\u25bc")
-        painter.drawText(x_sel - arrow_w // 2, pad_t + 12, "\u25bc")
+        painter.drawText(x_sel - arrow_w // 2, pad_t - 3, "\u25bc")
 
 
     # Axis labels
@@ -177,7 +170,7 @@ def draw_price_graph(
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    pad_l, pad_r, pad_t, pad_b = 54, 50, 22, 36
+    pad_l, pad_r, pad_t, pad_b = 54, 50, 26, 36
     dw = width  - pad_l - pad_r
     dh = height - pad_t - pad_b
     slot_w = dw / max(n, 1)
@@ -235,7 +228,7 @@ def draw_price_graph(
         x_now = int(pad_l + current_index * slot_w)
         painter.drawLine(x_now, pad_t, x_now, height - pad_b)
         painter.setPen(QPen(QColor("#dc2626")))
-        painter.drawText(x_now + 3, pad_t + 11, "Now")
+        painter.drawText(x_now + 3, pad_t - 3, "Now")
 
     # Selected-slot marker
     if selected_index is not None and 0 <= selected_index < n:
@@ -246,15 +239,15 @@ def draw_price_graph(
         painter.drawLine(x_sel, pad_t, x_sel, height - pad_b)
         painter.setPen(QPen(QColor("#7c3aed")))
         fm = painter.fontMetrics()
-        painter.drawText(x_sel - fm.horizontalAdvance("\u25bc") // 2, pad_t + 11, "\u25bc")
+        painter.drawText(x_sel - fm.horizontalAdvance("\u25bc") // 2, pad_t - 3, "\u25bc")
 
     # Axis tick labels
     text_pen = QPen(QColor("#475569"))
     painter.setPen(text_pen)
     fm = painter.fontMetrics()
-    # Left: €/MWh unit label — drawn above top tick, right-aligned to axis
+    # Left: €/MWh unit label — drawn inside chart top-left (never clips)
     unit_txt = "\u20ac/MWh"
-    painter.drawText(pad_l - fm.horizontalAdvance(unit_txt) - 2, pad_t - 2, unit_txt)
+    painter.drawText(pad_l + 3, pad_t + fm.height() - 2, unit_txt)
     for frac, val in ((0.0, p_max), (0.5, (p_max + p_min) / 2), (1.0, p_min)):
         y = int(pad_t + frac * dh)
         lbl = f"{val:.0f}"
@@ -339,6 +332,7 @@ def draw_thermal_graph(
     height: int = 280,
     tmin_schedule: list[float] | None = None,
     tmax_schedule: list[float] | None = None,
+    cool_hp_kw: list[float] | None = None,
 ) -> QPixmap:
     """Dual-axis step-line graph: temperatures (left °C) + heating sources (right kW).
 
@@ -355,13 +349,15 @@ def draw_thermal_graph(
         return out
 
     n = max(len(outdoor_temps), len(building_temps),
-            len(heat_hp_kw), len(heat_boiler_kw), len(heat_chp_kw), 1)
+            len(heat_hp_kw), len(heat_boiler_kw), len(heat_chp_kw),
+            len(cool_hp_kw) if cool_hp_kw else 0, 1)
 
     out_t  = _clean(outdoor_temps)
     bld_t  = _clean(building_temps)
     hp_kw  = _clean(heat_hp_kw)
     bl_kw  = _clean(heat_boiler_kw)
     chp_kw = _clean(heat_chp_kw)
+    cool_kw = _clean(cool_hp_kw) if cool_hp_kw else []
 
     def _get(lst, i):
         return lst[i] if i < len(lst) else None
@@ -371,7 +367,7 @@ def draw_thermal_graph(
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    pad_l, pad_r, pad_t, pad_b = 46, 46, 14, 36
+    pad_l, pad_r, pad_t, pad_b = 46, 46, 20, 36
     dw = width  - pad_l - pad_r
     dh = height - pad_t - pad_b
     slot_w = dw / max(n, 1)
@@ -390,7 +386,7 @@ def draw_thermal_graph(
         return int(pad_t + dh - (v - t_min) / t_span * dh)
 
     # ── Right Y scale: kW ─────────────────────────────────────────────
-    all_kw = [v for v in hp_kw + bl_kw + chp_kw if v is not None]
+    all_kw = [v for v in hp_kw + bl_kw + chp_kw + cool_kw if v is not None]
     kw_max = max(max(all_kw) * 1.10, 1.0) if all_kw else 1.0
     kw_min = 0.0
 
@@ -444,8 +440,9 @@ def draw_thermal_graph(
     # ── Heating lines (right axis) ────────────────────────────────────
     _draw_step_line(chp_kw, ry_kw, QPen(QColor("#f59e0b"), 2))
     _draw_step_line(bl_kw,  ry_kw, QPen(QColor("#ef4444"), 2))
-    _draw_step_line(hp_kw,  ry_kw, QPen(QColor("#16a34a"), 2))
-
+    _draw_step_line(hp_kw,  ry_kw, QPen(QColor("#16a34a"), 2))    # HP cooling line (cyan) — shown only when cool_hp_kw was supplied.
+    if cool_kw:
+        _draw_step_line(cool_kw, ry_kw, QPen(QColor("#06b6d4"), 2))
     # ── Temperature lines (left axis) — drawn on top ──────────────────
     _draw_step_line(out_t, ly_t, QPen(QColor("#0d9488"), 2))
     _draw_step_line(bld_t, ly_t, QPen(QColor("#f97316"), 2))
@@ -457,7 +454,7 @@ def draw_thermal_graph(
         x_now = int(pad_l + current_index * slot_w)
         painter.drawLine(x_now, pad_t, x_now, height - pad_b)
         painter.setPen(QPen(QColor("#dc2626")))
-        painter.drawText(x_now + 3, pad_t + 11, "Now")
+        painter.drawText(x_now + 3, pad_t - 3, "Now")
 
     if selected_index is not None and 0 <= selected_index < n:
         sel_pen = QPen(QColor("#7c3aed"), 2)
@@ -467,7 +464,7 @@ def draw_thermal_graph(
         painter.drawLine(x_sel, pad_t, x_sel, height - pad_b)
         painter.setPen(QPen(QColor("#7c3aed")))
         fm = painter.fontMetrics()
-        painter.drawText(x_sel - fm.horizontalAdvance("▼") // 2, pad_t + 11, "▼")
+        painter.drawText(x_sel - fm.horizontalAdvance("▼") // 2, pad_t - 3, "▼")
 
     # ── Axis tick labels ──────────────────────────────────────────────
     text_pen = QPen(QColor("#475569"))
@@ -506,6 +503,8 @@ def draw_thermal_graph(
         ("#ef4444", "Boiler"),
         ("#f59e0b", "CHP"),
     ]
+    if cool_kw:
+        series_legend.append(("#06b6d4", "HP Cooling"))
     painter.setPen(text_pen)
     fm = painter.fontMetrics()
     lx = pad_l
@@ -610,11 +609,12 @@ def draw_comparison_graph(
             y_prev = int(y_pos(optimised[i - 1]))
             painter.drawLine(x0, y_prev, x0, y)
 
-    # Axis labels
+    # Axis labels — drawn inside chart so negative values don't clip left edge
     text_pen = QPen(QColor("#334155"))
     painter.setPen(text_pen)
-    painter.drawText(4, pad_t + 4, f"{max_val:.4f} \u20ac")
-    painter.drawText(4, height - pad_b + 4, f"{min_val:.4f} \u20ac")
+    fm = painter.fontMetrics()
+    painter.drawText(pad_l + 3, pad_t + fm.height(), f"{max_val:.4f} \u20ac")
+    painter.drawText(pad_l + 3, height - pad_b - 2, f"{min_val:.4f} \u20ac")
 
     # X-axis time labels
     step = max(1, n // 6)
@@ -647,18 +647,45 @@ def draw_power_comparison_graph(
     prices_eur_mwh: np.ndarray | None = None,
     width: int = 700,
     height: int = 260,
+    asset_loads: dict | None = None,
 ) -> QPixmap:
-    """Draw baseline load (red) vs SMPC load (green) as step blocks.
+    """Draw baseline load (red) vs LP-optimised load (green) as step blocks.
 
     If *prices_eur_mwh* is provided, an orange price curve is overlaid
     on a secondary Y axis (right side).
+
+    If *asset_loads* is provided (``{name: {"baseline": arr, "optimised": arr}}``),
+    each shiftable asset is drawn as a pair of step lines (dashed = baseline,
+    solid = LP) in a unique colour, with a second legend row labelling them.
+    This makes it clear which load shifted where when multiple flex assets exist.
     """
+    # ── Per-asset overlay setup ───────────────────────────────────────
+    _FLEX_COLORS = ["#7c3aed", "#ea580c", "#0891b2", "#db2777", "#65a30d"]
+    active_assets: list[dict] = []
+    if asset_loads:
+        for idx, (name, ad) in enumerate(asset_loads.items()):
+            bl = np.asarray(ad.get("baseline", []), dtype=float)
+            lp = np.asarray(ad.get("optimised", []), dtype=float)
+            # Only show assets that actually have some load
+            if float(np.sum(np.abs(bl))) > 0 or float(np.sum(np.abs(lp))) > 0:
+                active_assets.append({
+                    "name": name,
+                    "color": _FLEX_COLORS[idx % len(_FLEX_COLORS)],
+                    "baseline": bl,
+                    "optimised": lp,
+                })
+
+    has_assets = len(active_assets) > 0
+    # Extra top padding to fit a second legend row when per-asset data is present
+    extra_top = 14 if has_assets else 0
+
     pixmap = QPixmap(width, height)
     pixmap.fill(QColor("#f8fbff"))
 
     pad_l = 60
     pad_r = 60 if prices_eur_mwh is not None else 20
-    pad_t, pad_b = 24, 40
+    pad_t = 24 + extra_top
+    pad_b = 40
     draw_w = width - pad_l - pad_r
     draw_h = height - pad_t - pad_b
 
@@ -677,6 +704,7 @@ def draw_power_comparison_graph(
 
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    text_pen = QPen(QColor("#334155"))
 
     # Grid lines
     grid_pen = QPen(QColor("#dbe7f7"))
@@ -726,7 +754,31 @@ def draw_power_comparison_graph(
         painter.drawText(width - pad_r + 4, height - pad_b + 4, f"{p_min:.0f}")
         painter.drawText(width - pad_r + 4, pad_t + 16, "\u20ac/MWh")
 
-    # Baseline load step blocks (red)
+    # ── Per-asset step lines (drawn behind the totals) ────────────────
+    # Each asset: dashed thin line = baseline schedule, solid thin = LP schedule
+    def _draw_asset_steps(series: np.ndarray, pen: QPen, nn: int):
+        painter.setPen(pen)
+        for i in range(nn):
+            if i >= len(series):
+                break
+            x0 = int(x_pos(i))
+            x1 = int(x_pos(i + 1))
+            y = int(y_pos(series[i]))
+            painter.drawLine(x0, y, x1, y)
+            if i > 0 and series[i - 1] != series[i]:
+                painter.drawLine(x0, int(y_pos(series[i - 1])), x0, y)
+
+    for aset in active_assets:
+        col = QColor(aset["color"])
+        # Baseline: dashed, width 1
+        pen_bl = QPen(col, 1)
+        pen_bl.setStyle(Qt.PenStyle.DashLine)
+        _draw_asset_steps(aset["baseline"], pen_bl, n)
+        # LP: solid, width 2
+        pen_lp = QPen(col, 2)
+        _draw_asset_steps(aset["optimised"], pen_lp, n)
+
+    # Baseline load step blocks (red, total)
     pen_base = QPen(QColor("#dc2626"))
     pen_base.setWidth(2)
     painter.setPen(pen_base)
@@ -739,7 +791,7 @@ def draw_power_comparison_graph(
             y_prev = int(y_pos(baseline_kwh[i - 1]))
             painter.drawLine(x0, y_prev, x0, y)
 
-    # SMPC load step blocks (green)
+    # SMPC load step blocks (green, total)
     pen_smpc = QPen(QColor("#16a34a"))
     pen_smpc.setWidth(2)
     painter.setPen(pen_smpc)
@@ -752,18 +804,18 @@ def draw_power_comparison_graph(
             y_prev = int(y_pos(smpc_kwh[i - 1]))
             painter.drawLine(x0, y_prev, x0, y)
 
-    # Left axis labels (kWh)
-    text_pen = QPen(QColor("#334155"))
+    # Left axis labels (kWh) — drawn inside chart so negative values don't clip
     painter.setPen(text_pen)
-    painter.drawText(4, pad_t + 4, f"{max_val:.0f} kWh")
-    painter.drawText(4, height - pad_b + 4, f"{min_val:.0f} kWh")
+    fm2 = painter.fontMetrics()
+    painter.drawText(pad_l + 3, pad_t + fm2.height(), f"{max_val:.0f} kWh")
+    painter.drawText(pad_l + 3, height - pad_b - 2, f"{min_val:.0f} kWh")
 
     # X-axis time labels
     step = max(1, n // 6)
     for i in range(0, n, step):
         painter.drawText(int(x_pos(i)) - 14, height - 8, x_labels[i])
 
-    # Legend
+    # ── Legend row 1: totals ──────────────────────────────────────────
     legend_y = pad_t - 6
     painter.setPen(pen_base)
     painter.drawLine(pad_l + 10, legend_y, pad_l + 30, legend_y)
@@ -780,6 +832,30 @@ def draw_power_comparison_graph(
         painter.drawLine(pad_l + 270, legend_y, pad_l + 290, legend_y)
         painter.setPen(text_pen)
         painter.drawText(pad_l + 294, legend_y + 4, "Price")
+
+    # ── Legend row 2: per-asset (only when multiple flex loads present) ──
+    if has_assets:
+        fm = painter.fontMetrics()
+        asset_legend_y = legend_y - 14   # row above row 1
+        lx = pad_l + 10
+        painter.setPen(text_pen)
+        for aset in active_assets:
+            col = QColor(aset["color"])
+            # Solid swatch = LP schedule colour
+            solid_pen = QPen(col, 2)
+            painter.setPen(solid_pen)
+            painter.drawLine(lx, asset_legend_y, lx + 18, asset_legend_y)
+            # Small dashed segment to indicate "also dashed = baseline"
+            dash_pen = QPen(col, 1)
+            dash_pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(dash_pen)
+            painter.drawLine(lx + 22, asset_legend_y, lx + 34, asset_legend_y)
+            painter.setPen(text_pen)
+            label = aset["name"]
+            painter.drawText(lx + 37, asset_legend_y + 4, label)
+            lx += 37 + fm.horizontalAdvance(label) + 14
+            if lx > width - pad_r - 40:
+                break   # don't overflow the right edge
 
     painter.end()
     return pixmap

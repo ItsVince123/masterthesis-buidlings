@@ -1,12 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  BACKEND FILE — student is responsible for this module           ║
-║                                                                  ║
-║  Data layer — fetches, caches, and schedules all external data.  ║
-║  The UI (dashboard.py) only reads from DataManager; it never     ║
-║  touches the network or CSV files directly.                      ║
-╚══════════════════════════════════════════════════════════════════╝
-
 Data layer — fetching, caching, and scheduled refresh of live data.
 
 All external I/O (weather, price, prediction, UV) is handled here so that

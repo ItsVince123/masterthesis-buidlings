@@ -1,8 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  BACKEND FILE — student is responsible for this module           ║
-╚══════════════════════════════════════════════════════════════════╝
-
 Load and save dashboard_config.json.
 
 This module is the single entry point for reading/writing the JSON
@@ -27,7 +23,7 @@ def load_dashboard_config(config_path: str | Path | None = None) -> dict[str, An
     the primary expected sections.
     """
     path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
-    with path.open("r", encoding="utf-8") as config_file:
+    with path.open("r", encoding="utf-8-sig") as config_file:
         data = json.load(config_file)
 
     if not isinstance(data, dict):

@@ -1,8 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  BACKEND FILE — student is responsible for this module           ║
-╚══════════════════════════════════════════════════════════════════╝
-
 Shared energy-asset definitions used by the dashboard UI and LP solver.
 
 Asset categories

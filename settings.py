@@ -1,8 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  BACKEND FILE — student is responsible for this module           ║
-╚══════════════════════════════════════════════════════════════════╝
-
 Central configuration constants for the Dashboard application.
 
 All hardcoded values (paths, coordinates, API config) live here so they
@@ -37,12 +33,24 @@ DEFAULT_LONGITUDE = 4.34878
 # ---------------------------------------------------------------------------
 # ENTSO-E transparency platform
 # ---------------------------------------------------------------------------
-# Prefer setting the ENTSOE_API_KEY environment variable.
-# If unset, the fallback value below is used (rotate if compromised).
-ENTSOE_API_KEY = os.environ.get(
-    "ENTSOE_API_KEY",
-    "a13c900f-96f6-4fdf-ba15-4ce38bdd651b",
-)
+def get_entsoe_api_key() -> str:
+    """Return the ENTSO-E API key.
+
+    Priority: dashboard_config.json > ENTSOE_API_KEY env var > built-in fallback.
+    """
+    import json
+    try:
+        with open(CONFIG_JSON, "r", encoding="utf-8") as _f:
+            _key = json.load(_f).get("api_keys", {}).get("entsoe_api_key", "").strip()
+        if _key:
+            return _key
+    except Exception:
+        pass
+    return os.environ.get("ENTSOE_API_KEY", "a13c900f-96f6-4fdf-ba15-4ce38bdd651b")
+
+
+# Set at import time so modules that do `from settings import ENTSOE_API_KEY` work.
+ENTSOE_API_KEY = get_entsoe_api_key()
 ENTSOE_BASE_URL = "https://web-api.tp.entsoe.eu/api"
 ENTSOE_DOMAIN = "10YBE----------2"  # Belgium bidding zone
 

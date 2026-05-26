@@ -1,12 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  BACKEND FILE — student is responsible for this module           ║
-║                                                                  ║
-║  THIS IS A CORE THESIS ALGORITHM                                 ║
-║  Deterministic greedy LP scheduler used for historical           ║
-║  analysis and as the baseline reference in the SMPC module.      ║
-╚══════════════════════════════════════════════════════════════════╝
-
 LP solver — shared greedy optimisation and day simulation.
 
 This module contains:
@@ -160,6 +152,8 @@ def greedy_lp(
     for t in np.argsort(total_price):
         if remaining <= 0:
             break
+        if not np.isfinite(total_price[t]):
+            break  # remaining slots all have inf price (outside flex window)
         amount = min(max_per_step, remaining)
         schedule[t] = amount
         remaining -= amount
@@ -923,6 +917,14 @@ def simulate_slots(
                 h = int((start_hour + t * dt_hours)) % 24
                 if not _in_window(h, fs, fe):
                     sched_prices[t] = np.inf
+            # Cap daily_sum to what physically fits in the restricted flex window.
+            # Without this, greedy_lp overflows energy into inf-priced slots
+            # (outside the window) when the window is too small.
+            n_window_slots = sum(
+                1 for _t in range(n)
+                if _in_window(int((start_hour + _t * dt_hours)) % 24, fs, fe)
+            )
+            daily_sum = min(daily_sum, float(n_window_slots) * hourly_max)
 
         lp_sched = greedy_lp_ramped(
             n, sched_prices, daily_sum, hourly_max,
@@ -1237,4 +1239,39 @@ def simulate_day(
         baseline_load_override=blo,
         thermal_params=thermal_params,
     )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Parallel full-year worker (used by historical_dialog._do_year_analysis)
+# ────────────────────────────────────────────────────────────────────
+# Module-level state set by the pool initializer so we don't re-pickle
+# the (possibly large) asset list + solar_hours dict for every day.
+_YEAR_WORKER_ASSETS: list | None = None
+_YEAR_WORKER_SOLAR: dict | None = None
+_YEAR_WORKER_THERMAL: dict | None = None
+
+
+def _year_worker_init(assets, solar_hours, thermal_params=None):
+    """ProcessPoolExecutor initializer — store shared inputs as globals."""
+    global _YEAR_WORKER_ASSETS, _YEAR_WORKER_SOLAR, _YEAR_WORKER_THERMAL
+    _YEAR_WORKER_ASSETS = assets
+    _YEAR_WORKER_SOLAR = solar_hours
+    _YEAR_WORKER_THERMAL = thermal_params
+    # Avoid HIGHS / BLAS oversubscription when many workers run in parallel.
+    import os
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+
+def _year_worker_task(day_iso: str, day_rows: list[dict], day_keys: list[str]) -> tuple[str, dict]:
+    """Solve one historical day in a worker process; return (day_iso, results)."""
+    res = simulate_day(
+        day_rows,
+        _YEAR_WORKER_ASSETS or [],
+        _YEAR_WORKER_SOLAR or {},
+        day_keys,
+        thermal_params=_YEAR_WORKER_THERMAL,
+    )
+    return day_iso, res
 

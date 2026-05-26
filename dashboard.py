@@ -1,11 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  FRONTEND FILE — student is NOT responsible for this module      ║
-║                                                                  ║
-║  Main PyQt6 window.  Contains only UI layout, widget wiring,    ║
-║  and display logic.  All calculations happen in the backend.     ║
-╚══════════════════════════════════════════════════════════════════╝
-
 Main Dashboard window — Building Management System.
 
 Run with::
@@ -191,20 +184,11 @@ class ScadaWindow(QMainWindow):
         self._nd_lp_last_date: str | None = None # date string "YYYY-MM-DD" already solved
 
     def _init_data(self):
-        """Create the DataManager (handles all fetching and caching).
-
-        BACKEND CALL: DataManager lives in data_manager.py (backend).
-        The dashboard never fetches data directly — it only reads from this object.
-        """
+        """Create the DataManager (handles all fetching and caching)."""
         self.data = DataManager()
 
     def _init_lp(self):
-        """Create the LP calculator and load building parameters.
-
-        BACKEND CALL: SMPCCalculator lives in smpc_calculator.py (backend).
-        base_load_kw / peak_load_kw stay in 'smpc.building' for DataManager
-        compatibility.  Building thermal + HW state come from the 'mpc' block.
-        """
+        """Create the LP calculator and load building parameters."""
         raw = load_dashboard_config()
         building_smpc = raw.get("smpc", {}).get("building", {})
         self.base_load_kw = building_smpc.get("base_load_kw", 80)
@@ -262,7 +246,7 @@ class ScadaWindow(QMainWindow):
 
         # "⊕ Manage Assets" buttons (one per column, both open same dialog)
         for container in (self.input_col, self.output_col):
-            btn = QPushButton("⊕  Manage Assets")
+            btn = QPushButton("⚙️  Manage Assets")
             btn.setMinimumHeight(52)
             btn.setMinimumWidth(50)
             btn.setStyleSheet(COLUMN_BUTTON_STYLE)
@@ -348,12 +332,21 @@ class ScadaWindow(QMainWindow):
             itype = inst.get("type", "")
             if itype == "heat_pump":
                 input_tags.append({
-                    "id": f"{iid}_cop", "name": "Heat Pump COP", "icon": "gear",
+                    "id": f"{iid}_cop", "name": "HP COP – Heating", "icon": "gear",
                     "section": "HEATING",
                     "simulation": {"mode": "mpc_scalar", "field": "cop_now",
                                    "unit": "", "decimals": 2, "color": "#16a34a",
                                    "plan_field": "plan_COP"},
                 })
+                if bool(inst.get("cooling_enabled", False)):
+                    input_tags.append({
+                        "id": f"{iid}_cop_cool", "name": "HP COP – Cooling",
+                        "icon": "gear", "section": "HEATING",
+                        "simulation": {"mode": "fixed",
+                                       "value": float(inst.get("COP_cool", 3.0)),
+                                       "unit": "", "decimals": 2,
+                                       "color": "#0891b2"},
+                    })
 
         # Building temperature always shown in HEATING
         input_tags.append({
@@ -415,7 +408,7 @@ class ScadaWindow(QMainWindow):
                 output_tags.append({
                     "id": f"{iid}_kw", "name": iname, "icon": "lightning",
                     "section": "FLEX",
-                    "simulation": {"mode": "asset_power", "uid": "flexible_load",
+                    "simulation": {"mode": "asset_power", "uid": f"flexible_load:{iid}",
                                    "unit": "kW", "decimals": 1, "color": "#0891b2"},
                 })
 
@@ -559,48 +552,31 @@ class ScadaWindow(QMainWindow):
         title.setObjectName("CenterTitle")
         lay.addWidget(title)
 
-        # Price graph card
-        self.center_price_graph_label = self._graph_card(
-            lay, "Price Graph (48h)", "Loading price graph\u2026",
-            height=240,
-        )
-        # Solar graph card
-        self.center_solar_graph_label = self._graph_card(
-            lay, "Predicted Solar Graph", "Loading solar graph\u2026",
-        )
-        # Temperature / thermal graph card (taller to fit heating bars)
-        self.center_temp_graph_label = self._graph_card(
-            lay, "Outside Temperature (48h)", "Loading temperature graph\u2026",
-            height=280,
-        )
-
-        # Metrics card
-        metrics = QFrame()
-        metrics.setObjectName("TagRow")
-        ml = QVBoxLayout(metrics)
-        ml.setContentsMargins(12, 10, 12, 10)
-        ml.setSpacing(8)
-        self.center_uv_value_label = self._metric_row(ml, "UV Index", "--")
-        self.center_solar_value_label = self._metric_row(
-            ml, "Estimated Solar", "-- kW",
-        )
-        lay.addWidget(metrics)
-
-        # ── Time-slot preview slider ──────────────────────────────
+        # ── Time-slot preview slider — pinned above the graphs ───────────
         slider_card = QFrame()
         slider_card.setObjectName("TagRow")
         sl = QVBoxLayout(slider_card)
-        sl.setContentsMargins(12, 10, 12, 10)
-        sl.setSpacing(6)
+        sl.setContentsMargins(12, 6, 12, 6)
+        sl.setSpacing(3)
 
         slider_header = QHBoxLayout()
+        slider_header.setSpacing(8)
         slider_title = QLabel("\U0001f55b  Preview time slot")
         slider_title.setObjectName("TagName")
         self.slot_label = QLabel("Now")
         self.slot_label.setObjectName("TagValue")
+        reset_btn = QPushButton("Reset")
+        reset_btn.setFixedHeight(22)
+        reset_btn.setStyleSheet(
+            "QPushButton { background: #475569; color: white; border: none; "
+            "border-radius: 4px; padding: 2px 8px; font-size: 8pt; } "
+            "QPushButton:hover { background: #334155; }"
+        )
+        reset_btn.clicked.connect(lambda: self.slot_slider.setValue(0))
         slider_header.addWidget(slider_title)
         slider_header.addStretch()
         slider_header.addWidget(self.slot_label)
+        slider_header.addWidget(reset_btn)
         sl.addLayout(slider_header)
 
         self.slot_slider = QSlider(Qt.Orientation.Horizontal)
@@ -610,34 +586,49 @@ class ScadaWindow(QMainWindow):
         self.slot_slider.setMaximum(_max)
         self.slot_slider.setValue(0)
         self.slot_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.slot_slider.setTickInterval(4)  # tick every hour
+        self.slot_slider.setTickInterval(4)
         self.slot_slider.setStyleSheet(SLOT_SLIDER_STYLE)
         self.slot_slider.valueChanged.connect(self._on_slot_slider_changed)
         sl.addWidget(self.slot_slider)
 
-        reset_btn = QPushButton("Reset to Now")
-        reset_btn.setMinimumHeight(28)
-        reset_btn.setStyleSheet(
-            "QPushButton { background: #475569; color: white; border: none; "
-            "border-radius: 4px; padding: 4px 12px; font-size: 9pt; } "
-            "QPushButton:hover { background: #334155; }"
-        )
-        reset_btn.clicked.connect(lambda: self.slot_slider.setValue(0))
-        sl.addWidget(reset_btn)
-
         lay.addWidget(slider_card)
 
-        # Unified analysis & simulation button
-        analysis_btn = QPushButton("Analysis & Simulation")
-        analysis_btn.setMinimumHeight(44)
-        analysis_btn.setStyleSheet(HISTORICAL_BUTTON_STYLE)
-        analysis_btn.clicked.connect(self._open_analysis)
-        lay.addWidget(analysis_btn)
+        # Price graph card
+        self.center_price_graph_label = self._graph_card(
+            lay, "Price Graph (48h)", "Loading price graph\u2026",
+            height=220,
+        )
+        # Solar graph card
+        self.center_solar_graph_label = self._graph_card(
+            lay, "Predicted Solar Graph", "Loading solar graph\u2026",
+            height=190,
+        )
+        # Temperature / thermal graph card (taller to fit heating bars)
+        self.center_temp_graph_label = self._graph_card(
+            lay, "Outside Temperature (48h)", "Loading temperature graph\u2026",
+            height=250,
+        )
 
         lay.addStretch()
 
         scroll.setWidget(content)
         outer_lay.addWidget(scroll)
+
+        # Subtle divider between scrollable content and pinned button
+        _div = QFrame()
+        _div.setFrameShape(QFrame.Shape.HLine)
+        _div.setStyleSheet("QFrame { color: #d6dfeb; max-height: 1px; background: #d6dfeb; }")
+        outer_lay.addWidget(_div)
+
+        # Analysis button pinned OUTSIDE scroll so it is always visible
+        _btn_row = QHBoxLayout()
+        _btn_row.setContentsMargins(20, 6, 20, 10)
+        analysis_btn = QPushButton("Analysis && Simulation")
+        analysis_btn.setMinimumHeight(44)
+        analysis_btn.setStyleSheet(HISTORICAL_BUTTON_STYLE)
+        analysis_btn.clicked.connect(self._open_analysis)
+        _btn_row.addWidget(analysis_btn)
+        outer_lay.addLayout(_btn_row)
         return panel
 
     def _on_slot_slider_changed(self, value: int):
@@ -833,6 +824,22 @@ class ScadaWindow(QMainWindow):
             hdr = QLabel(section)
             hdr.setObjectName("SectionHeader")
             container.layout().addWidget(hdr)
+            # Solver row shown above the GRID cost tags on the output column
+            if tag_type == "output" and section == "GRID":
+                srow = QFrame()
+                srow.setObjectName("TagRow")
+                srow.setMinimumHeight(42)
+                srl = QHBoxLayout(srow)
+                srl.setContentsMargins(12, 8, 12, 8)
+                sn = QLabel("\u2699\ufe0f  Solver")
+                sn.setObjectName("TagName")
+                sv = QLabel("\u2014")
+                sv.setObjectName("TagValue")
+                srl.addWidget(sn)
+                srl.addStretch()
+                srl.addWidget(sv)
+                container.layout().addWidget(srow)
+                self.solver_pill_label = sv
             self._add_tags_to_column(container, tags, tag_type)
             first = False
 
@@ -877,6 +884,15 @@ class ScadaWindow(QMainWindow):
         self._update_predict_labels()
         self._update_center()
         self._update_tag_labels()
+        self._update_solver_pill()
+
+    def _update_solver_pill(self):
+        pill = getattr(self, "solver_pill_label", None)
+        if pill is None:
+            return
+        result = getattr(self, "last_lp_outputs", None)
+        name = getattr(result, "solver_used", None) if result is not None else None
+        pill.setText(str(name).upper() if name else "—")
 
     def _update_price_labels(self):
         dm = self.data
@@ -1005,15 +1021,31 @@ class ScadaWindow(QMainWindow):
             _kw_factor = 1.0 / max(dt_h, 1e-9)
             elec_asset_defs = [
                 {"key": "heat_pump",        "color": "#16a34a", "label": "Heat Pump"},
+                {"key": "heat_pump_cool",   "color": "#06b6d4", "label": "HP Cooling"},
                 {"key": "battery_charge",   "color": "#0891b2", "label": "Battery Chg"},
                 {"key": "battery_discharge","color": "#f59e0b", "label": "Battery Dis"},
-                {"key": "flexible_load",    "color": "#7c3aed", "label": "Flex Load"},
                 {"key": "hot_water_tank",   "color": "#dc2626", "label": "Hot Water"},
             ]
             overlays = []
             for aset in elec_asset_defs:
                 arr = _plan_48h_from_asset_sched(aset["key"], scale=_kw_factor)
                 overlays.append({"array": arr, "color": aset["color"], "label": aset["label"]})
+
+            # One overlay per configured flex load — distinct color + label so
+            # users can tell which shiftable asset is which on the price graph.
+            _FLEX_OVERLAY_COLORS = ["#7c3aed", "#ea580c", "#db2777", "#65a30d", "#0d9488", "#b91c1c"]
+            _flex_loads = list(getattr(self.lp.mpc_cfg, "flex_loads", []) or [])
+            if _flex_loads:
+                for _idx, _fl in enumerate(_flex_loads):
+                    _fid   = str(_fl.get("id", f"flex_{_idx}"))
+                    _label = str(_fl.get("name", _fid))
+                    _color = _FLEX_OVERLAY_COLORS[_idx % len(_FLEX_OVERLAY_COLORS)]
+                    arr = _plan_48h_from_asset_sched(f"flexible_load:{_fid}", scale=_kw_factor)
+                    overlays.append({"array": arr, "color": _color, "label": _label})
+            else:
+                # Legacy fallback: single combined flex overlay
+                arr = _plan_48h_from_asset_sched("flexible_load", scale=_kw_factor)
+                overlays.append({"array": arr, "color": "#7c3aed", "label": "Flex Load"})
 
             gw = max(self.center_price_graph_label.width(), 300)
             gh = self.center_price_graph_label.height() or 240
@@ -1092,6 +1124,7 @@ class ScadaWindow(QMainWindow):
             # asset_schedules is a dict, not a plain array — handle separately
             heat_hp_kw     = [float("nan")] * n_steps_48h
             heat_boiler_kw = [float("nan")] * n_steps_48h
+            cool_hp_kw     = [float("nan")] * n_steps_48h
             for offs, out in (
                 (0,  self.last_lp_outputs),
                 (96, self.last_lp_next_day_outputs),
@@ -1101,6 +1134,7 @@ class ScadaWindow(QMainWindow):
                 for result_list, sched_key in (
                     (heat_hp_kw,     "heat_pump"),
                     (heat_boiler_kw, "gas_boiler"),
+                    (cool_hp_kw,     "heat_pump_cool"),
                 ):
                     sched = out.asset_schedules.get(sched_key)
                     if sched is None:
@@ -1140,6 +1174,10 @@ class ScadaWindow(QMainWindow):
                     start_label, end_label, now_idx, sel_idx, gw, gh,
                     tmin_schedule=tmin_sched,
                     tmax_schedule=tmax_sched,
+                    cool_hp_kw=(cool_hp_kw if any(
+                        (v is not None and not (isinstance(v, float) and v != v) and v > 1e-6)
+                        for v in cool_hp_kw
+                    ) else None),
                 ),
             )
 
@@ -1234,8 +1272,6 @@ class ScadaWindow(QMainWindow):
 
     def _run_lp_if_needed(self):
         """Run the LP solver at the start of each new 15-minute interval.
-
-        BACKEND CALL: SMPCCalculator.solve_lp() in smpc_calculator.py.
 
         This implements the RECEDING HORIZON principle of MPC:
           - At every 15-min slot boundary, re-solve the full 24 h problem.
@@ -1471,6 +1507,16 @@ class ScadaWindow(QMainWindow):
             return self._sim_mpc_building_temp(sim)
         if mode == "mpc_text":
             return self._sim_mpc_text(sim)
+        if mode == "fixed":
+            try:
+                val = float(sim.get("value", 0.0))
+            except (TypeError, ValueError):
+                val = 0.0
+            unit = sim.get("unit", "")
+            dec  = int(sim.get("decimals", 2))
+            col  = sim.get("color", "#64748b")
+            txt  = f"{val:.{dec}f}{(' ' + unit) if unit else ''}"
+            return txt, col
         return "--", "#64748b"
 
     def _sim_predicted_solar(self, sim):

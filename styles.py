@@ -1,11 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  FRONTEND FILE — student is NOT responsible for this module      ║
-║                                                                  ║
-║  QSS stylesheet strings.  All visual appearance is defined here  ║
-║  (colours, fonts, border-radius, spacing).                       ║
-╚══════════════════════════════════════════════════════════════════╝
-
 QSS stylesheet definitions for the Dashboard UI.
 
 Keeping all styling in one place makes it easy to adjust colours, fonts, and

@@ -1,12 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  BACKEND FILE — student is responsible for this module           ║
-║                                                                  ║
-║  Weather data fetcher (Open-Meteo API).                          ║
-║  Retrieves 48h of temperature, UV index, and wind speed at       ║
-║  15-minute resolution and caches to weather.csv.                 ║
-╚══════════════════════════════════════════════════════════════════╝
-
 Fetch 48 h weather data (temperature, UV index, wind speed) from Open-Meteo.
 
 Exports a semicolon-delimited CSV with 15-minute resolution.

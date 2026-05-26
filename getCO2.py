@@ -1,12 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  BACKEND FILE — student is responsible for this module           ║
-║                                                                  ║
-║  Grid CO2 intensity calculator.                                  ║
-║  Fetches actual generation mix per fuel type from ENTSO-E and   ║
-║  converts to CO2 intensity using IPCC lifecycle emission factors.║
-╚══════════════════════════════════════════════════════════════════╝
-
 Fetch grid CO2 intensity (gCO2eq/kWh) for the Belgian zone.
 
 Data source: ENTSO-E Transparency Platform — Actual Generation per Type
@@ -36,10 +28,10 @@ import xmltodict
 
 from settings import (
     DASHBOARD_DIR,
-    ENTSOE_API_KEY,
     ENTSOE_BASE_URL,
     ENTSOE_DOMAIN,
     LOCAL_TZ,
+    get_entsoe_api_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,7 +85,7 @@ def _fetch_generation_xml(
 ) -> str:
     """Fetch Actual Generation Per Type (A75) from ENTSO-E."""
     params = {
-        "securityToken": ENTSOE_API_KEY,
+        "securityToken": get_entsoe_api_key(),
         "documentType": "A75",
         "processType": "A16",  # Realised
         "in_Domain": domain,

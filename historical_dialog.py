@@ -1,12 +1,4 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  FRONTEND FILE — student is NOT responsible for this module      ║
-║                                                                  ║
-║  Historical analysis dialog.  UI glue only: date picker,        ║
-║  graph display, KPI table.  All simulation logic is in           ║
-║  lp_solver.simulate_day() (backend).                             ║
-╚══════════════════════════════════════════════════════════════════╝
-
 Historical LP cost-analysis dialog.
 
 Loads hourly building data from ``DATA.csv`` and runs a deterministic LP
@@ -42,6 +34,7 @@ from graph_renderer import draw_comparison_graph, draw_power_comparison_graph
 from lp_solver import (
     day_key_candidates, find_day_rows, load_historical_csv,
     load_solar_csv, simulate_day,
+    _year_worker_init, _year_worker_task,
 )
 from settings import DASHBOARD_DIR, HISTORICAL_CSV
 from styles import HISTORICAL_DIALOG_STYLE, RUN_ANALYSIS_BUTTON_STYLE
@@ -287,11 +280,6 @@ class HistoricalAnalysisDialog(QDialog):
             return
 
         # 3. Run LP optimisation
-        # ── BACKEND CALL: lp_solver.simulate_day() ──────────────────
-        # This is where the actual optimisation happens.
-        # simulate_day() runs greedy_lp() for each shiftable load and
-        # compares the rescheduled cost to the historical (baseline) cost.
-        # The dialog only displays the results — it contains no calculations.
         self.status_label.setText(
             f"Running LP optimisation ({len(day_rows)} hourly slots)\u2026"
         )
@@ -343,6 +331,7 @@ class HistoricalAnalysisDialog(QDialog):
                 results["baseline_load_kwh"], results["optimised_load_kwh"],
                 labels, results["prices_elec"],
                 width=gw, height=270,
+                asset_loads=results.get("asset_loads", {}),
             )
         )
         self._display_kpis_csv(day_str, results)
@@ -800,27 +789,42 @@ class HistoricalAnalysisDialog(QDialog):
         year_asset_generators: dict[str, dict] = {}  # name → {gen_kwh, cost_saving_eur, co2_saving_kg}
         year_asset_loads: dict[str, dict] = {}        # name → {baseline_total, optimised_total, cost_saving_eur}
 
-        # Iterate every day in the year
+        # Iterate every day in the year — solve in parallel across CPU cores
+        import os
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        # Pre-collect day tasks (skip days with no CSV rows)
         day = date(year, 1, 1)
         end = date(year + 1, 1, 1)
+        tasks: list[tuple[str, list[dict], list[str]]] = []
         while day < end:
-            if days_processed % 30 == 0:
-                self.status_label.setText(
-                    f"Processing {year}\u2026 {day.strftime('%b %d')} "
-                    f"({days_processed} days done)"
-                )
-                QApplication.processEvents()
-
             day_rows = find_day_rows(self._csv_data, day)
-            if not day_rows:
-                day += timedelta(days=1)
-                continue
+            if day_rows:
+                tasks.append((day.isoformat(), day_rows, day_key_candidates(day)))
+            day += timedelta(days=1)
 
-            keys = day_key_candidates(day)
-            results = simulate_day(day_rows, enabled_assets, solar_hours, keys)
+        total_tasks = len(tasks)
+        if total_tasks == 0:
+            self.status_label.setText(f"No data found for {year}.")
+            return
 
-            # CO2 per day
-            n = len(day_rows)
+        # Worker count: leave one core free, cap at 8 to limit RAM/HIGHS overhead
+        max_workers = min(8, max(1, (os.cpu_count() or 2) - 1))
+        self.status_label.setText(
+            f"Processing {year}\u2026 0 / {total_tasks} days "
+            f"(parallel: {max_workers} workers)"
+        )
+        QApplication.processEvents()
+
+        # Cache CO2 hours per day_keys tuple — computed in the main thread
+        # (small numpy work, not worth shipping to workers)
+        def _process_result(day_iso: str, results: dict, keys: list[str]):
+            nonlocal total_baseline_cost, total_optimised_cost
+            nonlocal total_co2_baseline_g, total_co2_optimised_g
+            nonlocal total_heating_saving, total_heating_baseline
+            nonlocal total_hw_saving, total_hw_baseline, total_slots
+
+            n = int(results["n_slots"])
             co2_hourly = self._get_co2_hours(keys, n)
             co2_arr = np.array(co2_hourly[:n])
 
@@ -861,18 +865,57 @@ class HistoricalAnalysisDialog(QDialog):
                 acc["cost_saving_eur"] += ad.get("cost_saving_eur", 0.0)
 
             # Cost accumulators
-            total_baseline_cost  += float(results["baseline"].sum())
-            total_optimised_cost += float(results["optimised"].sum())
-            total_slots          += results["n_slots"]
-            total_co2_baseline_g += float(np.sum(results["baseline_grid_kwh"] * co2_arr))
+            total_baseline_cost   += float(results["baseline"].sum())
+            total_optimised_cost  += float(results["optimised"].sum())
+            total_slots           += results["n_slots"]
+            total_co2_baseline_g  += float(np.sum(results["baseline_grid_kwh"] * co2_arr))
             total_co2_optimised_g += float(np.sum(results["optimised_grid_kwh"] * co2_arr))
             total_heating_saving  += results.get("heating_saving_eur", 0.0)
             total_heating_baseline += results.get("heating_baseline_cost_eur", 0.0)
-            total_hw_saving   += results.get("hw_saving_eur", 0.0)
-            total_hw_baseline += results.get("hw_baseline_cost_eur", 0.0)
+            total_hw_saving       += results.get("hw_saving_eur", 0.0)
+            total_hw_baseline     += results.get("hw_baseline_cost_eur", 0.0)
 
-            days_processed += 1
-            day += timedelta(days=1)
+        # Map day_iso → keys (so we can recover keys after pool returns)
+        keys_lookup = {day_iso: keys for (day_iso, _rows, keys) in tasks}
+
+        # Try parallel execution; fall back to sequential on failure
+        try:
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_year_worker_init,
+                initargs=(enabled_assets, solar_hours, None),
+            ) as pool:
+                futures = [
+                    pool.submit(_year_worker_task, day_iso, day_rows, keys)
+                    for (day_iso, day_rows, keys) in tasks
+                ]
+                for fut in as_completed(futures):
+                    try:
+                        day_iso, results = fut.result()
+                    except Exception:
+                        logger.exception("Year-worker task failed; skipping day")
+                        continue
+                    _process_result(day_iso, results, keys_lookup[day_iso])
+                    days_processed += 1
+                    if days_processed % 10 == 0 or days_processed == total_tasks:
+                        self.status_label.setText(
+                            f"Processing {year}\u2026 {days_processed} / {total_tasks} days "
+                            f"(parallel: {max_workers} workers)"
+                        )
+                        QApplication.processEvents()
+        except Exception:
+            logger.exception("Parallel year solve failed; falling back to sequential")
+            # Sequential fallback
+            for (day_iso, day_rows, keys) in tasks:
+                results = simulate_day(day_rows, enabled_assets, solar_hours, keys)
+                _process_result(day_iso, results, keys)
+                days_processed += 1
+                if days_processed % 30 == 0:
+                    self.status_label.setText(
+                        f"Processing {year}\u2026 (seq fallback) "
+                        f"{days_processed} / {total_tasks} days"
+                    )
+                    QApplication.processEvents()
 
         if days_processed == 0:
             self.status_label.setText(f"No data found for {year}.")
